@@ -3,7 +3,8 @@
 Date: 2026-08-04  
 Host: Linux x86_64  
 Codex CLI: v0.146.0  
-Status: Codex default sandbox denied; exact-socket permission-profile validation and Claude reciprocal probe remain
+Claude Code: v2.1.221  
+Status: Codex default sandbox denied; Claude session sandbox passed every probe; exact-socket Codex permission-profile validation remains
 
 ## Question
 
@@ -56,6 +57,23 @@ A disposable nested `codex sandbox` invocation using the installed v0.146.0 CLI,
 
 Reference: [official Codex manual](https://developers.openai.com/codex/codex-manual.md), sections “Permissions / Unix sockets” and “Agent approvals & security / Network isolation.”
 
+## Claude observations
+
+The reciprocal probe ran from the live Claude Code v2.1.221 session in this repository, using `python3` socket scripts issued through the session's ordinary Bash tool mode. The "approved host access" row used the session's explicit sandbox-disable option for the listener only, matching the deployment shape (Scribe as an ordinary user process, agent as sandboxed client). `XDG_RUNTIME_DIR=/run/user/1000/`; the `abacus/` runtime directory did not exist before the probe.
+
+| Probe | Listener | Client | Result |
+|---|---|---|---|
+| Unix bind+listen+connect+payload under `/tmp` | ordinary session mode | ordinary session mode | success |
+| Directory create `0700` + same probe at `$XDG_RUNTIME_DIR/abacus/` | ordinary session mode | ordinary session mode | success |
+| Unix socket at `$XDG_RUNTIME_DIR/abacus/` | approved host access | ordinary session mode | success; payload arrived intact |
+| Loopback TCP | ordinary session mode | ordinary session mode | success |
+
+The operative Claude session therefore needs no additional grant to reach the proposed Scribe socket, including the cross-boundary direction that matters for deployment.
+
+Scope caveat, mirroring the Codex fresh-session caveat in the opposite direction: Claude Code sandbox behavior is configuration-dependent, and this session's operative profile is permissive (it also allows user-home writes). This result certifies the current profile on this host, not every Claude configuration. If the operator later tightens the Claude sandbox, the ordinary-mode rows must be re-run before relying on socket reachability, and a denied result would put Claude in the same exact-grant posture as Codex.
+
+Cleanup: every probe socket was unlinked by its script and the probe-created `$XDG_RUNTIME_DIR/abacus/` directory was removed after verifying it was empty. No global Claude, Codex, shell, hook, or provider configuration changed.
+
 ## Proposed transport decision
 
 Keep the versioned Scribe client/server seam and the user-only Unix socket. Do not replace it with loopback TCP, workspace request files, polling, or a second resident bridge:
@@ -71,5 +89,5 @@ If exact socket allowlisting cannot be demonstrated in both supported agent sand
 ## Remaining checks
 
 - repeat the payload probe from a fresh Codex session launched with the exact permission profile;
-- run the ordinary and explicitly granted probes inside the Claude sandbox;
-- once one path passes, record the exact launch/configuration surface and add a fail-loud diagnostic contract for a missing grant.
+- ~~run the ordinary and explicitly granted probes inside the Claude sandbox~~ — done above; the current Claude profile passes with no grant needed, with the re-validation caveat recorded in the Claude observations;
+- once one path passes, record the exact launch/configuration surface and add a fail-loud diagnostic contract for a missing grant (for Claude the current surface is "no grant required under the operative profile"; the diagnostic contract still applies so a future tightened profile fails loud).
