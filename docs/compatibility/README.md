@@ -15,3 +15,4 @@ Current records:
 
 - [`2026-08-04-br-bv.md`](2026-08-04-br-bv.md)
 - [`2026-08-04-herdr.md`](2026-08-04-herdr.md)
+- [`2026-08-04-scribe-socket.md`](2026-08-04-scribe-socket.md)
