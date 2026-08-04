@@ -1,0 +1,70 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "scope_label_encoding_constraints",
+  "equals_delimiter": {
+    "command": {
+      "argv": [
+        "br",
+        "label",
+        "add",
+        "abacus-0nc",
+        "--label",
+        "area=a",
+        "--actor",
+        "spike",
+        "--json"
+      ]
+    },
+    "process": {
+      "exit_code": 4,
+      "stdout": {
+        "error": {
+          "code": "VALIDATION_FAILED",
+          "message": "Validation failed: label: invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
+          "hint": null,
+          "retryable": true,
+          "context": {
+            "field": "label",
+            "reason": "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)"
+          }
+        }
+      }
+    }
+  },
+  "colon_delimiter": {
+    "first_add_exit_code": 0,
+    "second_add_exit_code": 0,
+    "labels_after": [
+      "area:a",
+      "area:b"
+    ]
+  },
+  "length_limit": {
+    "fifty_character_label_exit_code": 0,
+    "fifty_one_character_label": {
+      "exit_code": 4,
+      "stdout": {
+        "error": {
+          "code": "VALIDATION_FAILED",
+          "message": "Validation failed: label: exceeds 50 characters",
+          "hint": null,
+          "retryable": true,
+          "context": {
+            "field": "label",
+            "reason": "exceeds 50 characters"
+          }
+        }
+      }
+    }
+  },
+  "expected_adapter": {
+    "equals_encoding_supported": false,
+    "encoded_label_max_characters": 50,
+    "provider_enforces_single_value_per_key": false,
+    "declared_scope_key_cardinality_must_be_validated_before_authorization": true
+  }
+}

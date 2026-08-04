@@ -1,0 +1,52 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "database_busy_under_external_writer",
+  "setup": {
+    "writer": "sqlite BEGIN EXCLUSIVE",
+    "database_issue_count": 2
+  },
+  "command": {
+    "argv": [
+      "br",
+      "create",
+      "lock-contender-two",
+      "--actor",
+      "spike",
+      "--lock-timeout",
+      "100",
+      "--no-auto-import",
+      "--json"
+    ],
+    "working_directory": "<repo>"
+  },
+  "process": {
+    "exit_code": 2,
+    "observed_elapsed_ms": 15881,
+    "stdout": {
+      "error": {
+        "code": "DATABASE_ERROR",
+        "message": "Database error: database is busy",
+        "hint": null,
+        "retryable": false,
+        "context": null
+      }
+    },
+    "stderr": ""
+  },
+  "verified_postcondition": {
+    "database_issue_count_before": 2,
+    "database_issue_count_after": 2,
+    "contender_created": false,
+    "mutation": "not_applied"
+  },
+  "expected_adapter": {
+    "category": "busy",
+    "retryable": false,
+    "mutation": "not_applied",
+    "requires_serialized_writer": true
+  }
+}

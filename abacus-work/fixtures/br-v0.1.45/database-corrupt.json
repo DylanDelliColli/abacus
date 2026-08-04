@@ -1,0 +1,87 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "corrupt_database",
+  "setup": {
+    "corruption": "database truncated to 17 bytes after WAL checkpoint",
+    "jsonl_records": 2
+  },
+  "without_recovery_source": {
+    "command": {
+      "argv": [
+        "br",
+        "list",
+        "--no-auto-import",
+        "--no-auto-flush",
+        "--json"
+      ],
+      "working_directory": "<repo>"
+    },
+    "process": {
+      "exit_code": 2,
+      "stdout": {
+        "error": {
+          "code": "DATABASE_ERROR",
+          "message": "Database error: database disk image is malformed: database file too small for header: 17 bytes (< 100)",
+          "hint": null,
+          "retryable": false,
+          "context": null
+        }
+      },
+      "stderr": ""
+    },
+    "expected_adapter": {
+      "category": "corrupt",
+      "retryable": false,
+      "mutation": "not_applied",
+      "requires_explicit_recovery": true
+    }
+  },
+  "with_intact_jsonl": {
+    "ordinary_read_exit_code": 0,
+    "ordinary_read_issue_count": 2,
+    "provider_recovery": "automatic",
+    "preserved_corrupt_backup_bytes": 17,
+    "doctor_excerpt": {
+      "ok": true,
+      "checks": [
+        {
+          "name": "db.recovery_artifacts",
+          "status": "warn",
+          "message": "Preserved recovery artifacts remain for this database family (1 item(s))"
+        },
+        {
+          "name": "counts.db_vs_jsonl",
+          "status": "ok",
+          "message": "Both have 2 records"
+        },
+        {
+          "name": "sqlite.integrity_check",
+          "status": "ok"
+        }
+      ]
+    },
+    "explicit_rebuild": {
+      "exit_code": 0,
+      "stdout": {
+        "created": 2,
+        "updated": 0,
+        "skipped": 0,
+        "tombstone_skipped": 0,
+        "orphans_removed": 0,
+        "blocked_cache_rebuilt": true
+      }
+    },
+    "expected_adapter": {
+      "category": "recovery_anomaly",
+      "ordinary_read_data_available": true,
+      "operator_diagnostic_required": true,
+      "raw_doctor_ok_is_not_sufficient": true,
+      "new_artifact_detection_requires_pre_operation_context": true,
+      "artifact_presence_alone_does_not_prove_corruption": true
+    }
+  }
+}

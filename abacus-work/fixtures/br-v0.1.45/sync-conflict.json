@@ -1,0 +1,47 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "sync_conflict_markers",
+  "command": {
+    "argv": [
+      "br",
+      "sync",
+      "--import-only",
+      "--no-auto-import",
+      "--no-auto-flush",
+      "--json"
+    ],
+    "working_directory": "<repo>"
+  },
+  "process": {
+    "exit_code": 7,
+    "stdout": {
+      "error": {
+        "code": "CONFIG_ERROR",
+        "message": "Configuration error: Merge conflict markers detected in <repo>/.beads/issues.jsonl.\n<repo>/.beads/issues.jsonl:1 Start (HEAD)\n<repo>/.beads/issues.jsonl:3 Separator\n<repo>/.beads/issues.jsonl:5 End (remote)\nResolve conflicts before importing.",
+        "hint": null,
+        "retryable": false,
+        "context": null
+      }
+    },
+    "stderr": ""
+  },
+  "force_control": {
+    "exit_code": 7,
+    "same_error_code": true
+  },
+  "verified_postcondition": {
+    "database_issue_count_before": 2,
+    "database_issue_count_after": 2,
+    "mutation": "not_applied"
+  },
+  "expected_adapter": {
+    "category": "sync_conflict",
+    "retryable": false,
+    "mutation": "not_applied",
+    "diagnostic_detail": "bounded"
+  }
+}

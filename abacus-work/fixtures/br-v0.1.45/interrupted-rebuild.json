@@ -1,0 +1,60 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "interrupted_rebuild",
+  "setup": {
+    "database_issue_count_before": 2,
+    "replacement_jsonl_records": 1000,
+    "replacement_jsonl_bytes": 33031000,
+    "replacement_jsonl_sha256": "7e59986c243c56d2b023835170f84ea421093d51f3c251e6bd8b57167f9f3345"
+  },
+  "command": {
+    "argv": [
+      "br",
+      "sync",
+      "--import-only",
+      "--rebuild",
+      "--no-auto-import",
+      "--no-auto-flush",
+      "--json"
+    ],
+    "working_directory": "<repo>"
+  },
+  "interruption": {
+    "trigger": "new provider recovery artifact observed",
+    "signal": "SIGKILL",
+    "exit_code": 137,
+    "stdout": "",
+    "stderr": ""
+  },
+  "verified_postcondition": {
+    "canonical_jsonl_sha256": "7e59986c243c56d2b023835170f84ea421093d51f3c251e6bd8b57167f9f3345",
+    "canonical_jsonl_valid": true,
+    "canonical_jsonl_records": 1000,
+    "active_database_exists": false,
+    "original_database_family_preserved_in_recovery_directory": true
+  },
+  "retry": {
+    "exit_code": 0,
+    "stdout": {
+      "created": 1000,
+      "updated": 0,
+      "skipped": 0,
+      "tombstone_skipped": 0,
+      "orphans_removed": 0,
+      "blocked_cache_rebuilt": true
+    },
+    "database_integrity": "ok",
+    "database_issue_count": 1000,
+    "jsonl_hash_unchanged": true
+  },
+  "expected_adapter": {
+    "category": "interrupted_mutation",
+    "outcome": "requires_reconciliation",
+    "work_reads_allowed_before_rebuild": false,
+    "safe_retry_after_jsonl_validation": true
+  }
+}

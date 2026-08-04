@@ -1,0 +1,65 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "interrupted_flush",
+  "setup": {
+    "database_issue_count": 1000,
+    "dirty_count": 1,
+    "canonical_jsonl_bytes": 33029020,
+    "canonical_jsonl_records": 1000,
+    "canonical_jsonl_sha256": "d411137de88853f631168966c4db2da110c8d2a5e7c640f7507cf19609134d45"
+  },
+  "command": {
+    "argv": [
+      "br",
+      "sync",
+      "--flush-only",
+      "--force",
+      "--no-auto-import",
+      "--no-auto-flush",
+      "--json"
+    ],
+    "working_directory": "<repo>"
+  },
+  "interruption": {
+    "trigger": "provider-created <repo>/.beads/issues.jsonl.3.tmp observed",
+    "signal": "SIGKILL",
+    "exit_code": 137,
+    "stdout": "",
+    "stderr": ""
+  },
+  "verified_postcondition": {
+    "canonical_jsonl_sha256": "d411137de88853f631168966c4db2da110c8d2a5e7c640f7507cf19609134d45",
+    "canonical_jsonl_valid": true,
+    "canonical_jsonl_records": 1000,
+    "partial_temp_bytes": 33038,
+    "partial_temp_complete_records": 0,
+    "dirty_count": 1
+  },
+  "retry": {
+    "exit_code": 0,
+    "stdout": {
+      "exported_issues": 1000,
+      "exported_dependencies": 0,
+      "exported_labels": 0,
+      "exported_comments": 0,
+      "content_hash": "e8fb1001e33998199a8e6734cec3e37ce1e0b6dca5b6a60c366424d575e8ea37",
+      "cleared_dirty": 1,
+      "policy": "strict",
+      "success_rate": 1.0,
+      "errors": []
+    },
+    "dirty_count_after": 0,
+    "partial_temp_remained": true
+  },
+  "expected_adapter": {
+    "category": "interrupted_mutation",
+    "outcome": "requires_reconciliation",
+    "canonical_jsonl_only": true,
+    "numbered_temp_files_are_never_inputs": true,
+    "safe_retry_after_status_inspection": true
+  }
+}
