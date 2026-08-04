@@ -109,6 +109,14 @@ Five small mechanisms from legacy `sable-potential-improvements.md` are adopted 
 4. **Curated close reasons** written to `br` on every close, keeping the closed graph legible to humans and `bv`.
 5. **Module-extraction criteria.** Extraction or independent versioning of a module is *earned, never scheduled*: a module qualifies when it has zero sibling-module imports, a stable CLI/JSON contract, fully isolated tests, and versioned checksummed consumption. Until all four hold, it stays in the workspace (Decision §1).
 
+### 10. Red-green evidence pairs: the default unsupervised acceptance form (operator, 2026-08-04)
+
+A vacuous test — one that cannot fail — defeats outcome-bound evidence while satisfying any "run this suite" policy. The closure costs no new machinery: an acceptance policy may require a **red-green evidence pair** — the specified verification *failing* at the declared base commit (red) and *passing* at the handoff commit (green), both recorded through the standard evidence wrapper with commit bindings and workspace digests. A test that cannot fail cannot produce the red half. This is an acceptance-policy *form*, not a universal gate: assignments choose it per policy (downstream verification choice remains a non-goal), and the orchestrator role card makes it the **default for unsupervised autonomous runs**. Mechanics reuse existing classes — core policy vocabulary plus ordinary evidence records; no new record types, no coverage machinery.
+
+### 11. Planning machinery: deferred, with its hooks already in place
+
+SABLE's complementary planning layer (test-contract interviews, backlog-freshness sweeps, audit-driven decomposition) will eventually have an ABACUS analog. It is deliberately **not designed now**: planning tooling consumes the facade and the bead corpus, so designing it before the loop exists would be speculative interface-making. What Phases 2–5 must guarantee — and already do — is that nothing forecloses it: bead-content hashes (§9.1) give sweeps a stable "has this contract changed since assessment" anchor; revisioned work reads and per-bead content hashes are in the work facade contract; evidence, decisions, and audit are queryable through Scribe. Future planning machinery arrives as authored skills or optional Phase 7 modules over those surfaces, and never as a gate inside the core loop. Anything found missing from those surfaces during planning-tool development is an ordinary C1 seam extension, not a redesign.
+
 ## Consequences
 
 **Positive**

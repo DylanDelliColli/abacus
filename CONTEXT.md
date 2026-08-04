@@ -74,7 +74,7 @@ I2. **One write path per store.** `br` is mutated only by `abacus-work`. The Led
 
 I3. **Authority is split by store; decisions gate status.** `br` is canonical for work-graph content, dependencies, and work status; the Ledger is canonical for assignment, attempt, lease, Envelope, evidence, handoff, decision, and application lifecycle. A facade-mediated status change happens only after its authorizing decision has committed to the Ledger (§3). `abacus-work` returns revisioned provider observations/anomaly signals; the core use case correlates those with Ledger decisions through ports. Out-of-band `br` mutations are surfaced, never silently adopted or repaired, and `abacus-work` never reads the Ledger directly.
 
-I4. **Evidence records outcomes bound to artifacts.** Command, exit code, commit identity — captured by the facade wrapper at execution time. Prose claims, file existence, and intent records are not evidence. A verdict or receipt must be derivable and checkable; the presence of a file is never proof.
+I4. **Evidence records outcomes bound to artifacts.** Command, exit code, commit identity — captured by the facade wrapper at execution time. Prose claims, file existence, and intent records are not evidence. A verdict or receipt must be derivable and checkable; the presence of a file is never proof. An acceptance policy may require a **red-green evidence pair** — the specified verification failing at the declared base commit and passing at the handoff commit — as the structural counter to tests that cannot fail; unsupervised autonomous runs default to this form.
 
 I5. **Completion is an accepted Handoff.** Clean commit, matching bound evidence, passing outcome. Completion never implies Publication.
 
