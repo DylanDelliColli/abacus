@@ -9,12 +9,27 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assignment;
 pub mod authority;
+pub mod content;
+pub mod edit_scope;
+pub mod evidence;
 pub mod id;
+pub mod lease;
 pub mod lifecycle;
 
+pub use assignment::{
+    next_attempt_allowed, recheck_bead_hash, AttemptSequenceError, BeadHashMismatch, DecisionActor,
+};
 pub use authority::AuthorityClass;
+pub use content::{CommitId, ContentError, ContentHash, WorkspaceDigest};
+pub use edit_scope::{EditScope, EditScopeError, PathError, WorkPath};
+pub use evidence::{
+    evaluate_red_green_pair, Evidence, OverlayCapture, OverlayFile, PairRefusal, RedGreenPolicy,
+    VerificationOutcome,
+};
 pub use id::{ActorId, AssignmentId, AttemptId, BeadId, IdError, ProfileName};
+pub use lease::{validate_fencing, FencingError, FencingToken, Lease, Timestamp};
 pub use lifecycle::{
     assignment_transition, attempt_transition, AssignmentAction, AssignmentState, AttemptAction,
     AttemptState, TransitionError,
