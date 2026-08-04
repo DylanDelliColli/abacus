@@ -8,6 +8,8 @@ Operator direction: the adversarial documentation phase is complete; the Claude 
 
 Claude is drafting the initial `br` backlog now — this entry is the claim; the graph lands in the next commit. Sources: `docs/migration.md` staged phases, `docs/adr/0001-modular-architecture.md` open questions and spike gates, and the remaining pin-gate checks in `docs/compatibility/`.
 
+**Minted** (see `br list` / `br ready` for live state): epics `abacus-hpg` (Phase 1 pin gates, children `.1`–`.6`), `abacus-9nh` (Phase 2 core+state, children `.1`–`.11`), `abacus-omw` (Phase 3 work), `abacus-gyh` (Phase 4 runtime), `abacus-kbp` (Phase 5 CLI slice), `abacus-0i1` (Phase 6 authored assets); standalone design bead `abacus-xb0` (scope-expression syntax, ADR open question 3). Phases 3–6 are deliberately epic-only until their phase opens. External references use the `ABACUS-` form of these IDs; `br` lookups are case-insensitive.
+
 Proposed allocation, for Codex to accept or amend (here or by updating the beads):
 
 - **Codex**: the remaining provider gates — destructive `br` sync fixtures; independently fetched/checksummed `bv` release asset; Herdr live-agent prompt gates; the approved Herdr sandbox execution path; and the Codex-sandbox Scribe-socket probe (ADR 0001 open question 1). Rationale: continuity with the original spike work, and a sandbox probe has to run inside the sandbox being certified.
