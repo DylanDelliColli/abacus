@@ -9,11 +9,13 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    // Scaffold placeholder proving the per-module hermetic test target
-    // (`cargo test -p abacus-core`) exists and runs. Replaced by real
-    // domain tests as ABACUS-9NH.2 through .6 land.
-    #[test]
-    fn hermetic_test_target_runs() {}
-}
+pub mod authority;
+pub mod id;
+pub mod lifecycle;
+
+pub use authority::AuthorityClass;
+pub use id::{ActorId, AssignmentId, AttemptId, BeadId, IdError, ProfileName};
+pub use lifecycle::{
+    assignment_transition, attempt_transition, AssignmentAction, AssignmentState, AttemptAction,
+    AttemptState, TransitionError,
+};
