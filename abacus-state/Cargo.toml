@@ -1,0 +1,6 @@
+[package]
+name = "abacus-state"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

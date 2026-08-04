@@ -1,0 +1,5 @@
+/target
+
+# br-generated local runtime state not covered by .beads/.gitignore
+.beads/backup/
+.beads/embeddeddolt/

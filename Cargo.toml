@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["abacus-core", "abacus-state"]
+
+# abacus-work, abacus-runtime, and abacus-cli join the workspace when
+# their phases open (docs/migration.md, Phases 3-5).
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
