@@ -92,8 +92,10 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 
 ### Evidence and decisions
 
-- append structured evidence/artifact references;
+- append ordinary structured Evidence records with the normalized verification command set, honest raw command/exit details, the closed normalized outcome (`pass`, `assert-fail`, or `execution-error`), exact commit binding, and artifact references;
 - persist verification-command before/after workspace digests and final changed-path evidence;
+- persist optional red-overlay metadata on that same Evidence value: declared-base binding, exact overlaid path set, and per-file content digests;
+- query Evidence by Assignment/Attempt, verification set, commit, and overlay metadata so core can validate a required red-green pair without a pair row or new record class;
 - audit a Submission refusal without creating a Handoff or ending the active Attempt;
 - submit an immutable Handoff;
 - record an authorized accept/reject/revoke/cancel decision;
@@ -145,11 +147,14 @@ The conceptual schema contains:
 - runtime-handle associations and explicitly reported observation audit events;
 - evidence items and artifact digests;
 - verification before/after workspace digests and changed-path evidence;
+- normalized verification outcomes and optional red-overlay path/digest metadata on ordinary Evidence;
 - Submission-refusal audit events, Handoff submissions, decisions, application attempts, and application receipts;
 - idempotency results;
 - append-only audit events.
 
 This is not permission to expose each table through the client. Tables are implementation; domain outcomes are interface.
+
+Red-green pairing does not add a table, record kind, mutable pair status, coverage field, or threshold. The existing immutable Evidence value is extended with the closed normalized outcome and optional overlay metadata: the declared base commit, exact overlaid path set, and per-file content digests. Core derives red only from `assert-fail` produced against the declared-base implementation, validates that overlay paths are policy-scoped and their digests match the same files in the Handoff commit, and derives green from `pass` for the same verification set at that commit. `execution-error` remains an honest non-red outcome. “Red” and “green” are query/policy roles, not persistence classes.
 
 Canonical `br` fields are not copied into mutable state. An audit record may store a provider-revision-tagged bead snapshot used for a decision.
 
@@ -196,6 +201,7 @@ Default tests use temporary Git common directories, sockets, and SQLite files. T
 - amend/pause Handoff refusal and abort-consistent mutation gating;
 - structured Reports and linked Directive/decision resolution integrity;
 - actor-to-actor Request authorization and linked fenced-decision resolution;
+- red-green candidate derivation from ordinary Evidence, including matching verification sets, wrong-commit red, passing “red,” green-only submission, `execution-error` rejected as red, overlay-digest mismatch rejected, digest match accepted, and an overlay path outside the policy verification set rejected;
 - Acceptance decision/application-attempt/application-receipt recovery across every interruption point;
 - explicit fenced Attempt retry, optional per-Assignment attempt caps, and audited refusal/attempt churn;
 - profile snapshots and decision-authority transfer;
@@ -214,6 +220,7 @@ Warm hermetic target: under fifteen seconds on the baseline development machine.
 - No fenced worker response omits a current binding Directive, and no incompatible consequential mutation can bypass an unread Directive.
 - Two managers cannot both decide the same handoff.
 - Signal unresolved queries derive only from immutable records and typed responding actions; no `read_at` column, per-Directive acknowledgement state, or mutable inbox exists anywhere in the schema or public interface.
+- A required red-green pair, including overlay path/digest validation and the closed outcome taxonomy, can be evaluated from ordinary Evidence records after restart; no red/green/pair record class or mutable satisfaction flag exists.
 - A watchdog without workflow-mutation authority can inspect audit and explicitly reported runtime observations after Scribe restarts.
 - Moving an existing capability between profiles requires no schema migration.
 - All durable transitions have one transactionally linked audit event.

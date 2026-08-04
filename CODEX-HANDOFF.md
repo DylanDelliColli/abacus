@@ -13,9 +13,9 @@ The operator wants ABACUS implemented. The architecture documentation and first 
 
 ## Current state
 
-- It is not currently a Git repository.
+- It is a Git repository on `main`, tracking `origin/main` at the operator's personal [`DylanDelliColli/abacus`](https://github.com/DylanDelliColli/abacus) remote. Phase 0 was committed and pushed as `4e4bb60` (`Phase 0: architecture documentation and module contracts`).
 - The documentation pass exists: root purpose/context/handoff files, architecture/migration/ADR documents, one contract in each of the five module folders, and initial provider compatibility records.
-- No implementation code, Cargo workspace, commits, remotes, or GitHub repositories have been created yet.
+- Repo-local Git identity is configured for Dylan Delli Colli. No implementation code or Cargo workspace exists yet.
 - No upstream projects have been forked or vendored.
 - Claude and Codex completed an adversarial documentation review in the ABACUS directory. The lifecycle, Scribe/Herdr ownership, typed Signal design, test-locality, and change-topology findings were reconciled before this update.
 - Phase 1 has begun with bounded `br`/`bv` and Herdr mechanics spikes under `docs/compatibility/`. Remaining hard gates include Scribe socket access from a sandboxed agent, Herdr control access/live Claude+Codex prompting, destructive `br` sync fixtures, and the concrete scope-expression syntax.
@@ -89,6 +89,7 @@ Preserve these unless the operator explicitly changes them:
    - Exposure and discharge derive from immutable call ordering and responding workflow actions. No `read_at` columns, per-Directive acknowledgement state, or client-asserted Directive head exists.
    - Progress is queried from Ledger state, work-shaped blockers become `br` dependency edges, decision-shaped asks become Requests, and everything else is transient Herdr chatter. Unresolved Signals are derived from missing typed responding actions; no inbox, acknowledgement, retry, or escalation-on-silence machinery exists.
    - Assignments bind the authorizing bead-content hash. Acceptance also enforces edit-scope conformance and verification-command before/after workspace digests, and `br` closure uses a bounded curated reason.
+   - An Assignment may select a red-green evidence-pair policy: ordinary wrapper-captured Evidence must show `assert-fail` against the declared-base implementation using only policy-named verification files overlaid from current work, then `pass` for the same verification set at the Handoff commit. The red record binds the declared base plus per-file overlay digests that must match those files in the Handoff commit; `execution-error` and stale overlays produce the distinct `red-errored` and `red-stale` refusals. Outcomes and before/after digests remain honest. This is never a universal gate or coverage threshold; the Phase 6 orchestrator role card—not Rust—defaults unsupervised autonomous runs to this form.
    - Completion does not inherently include push, pull request creation, merge, or deployment.
    - External publication is an explicit separate action.
 
@@ -174,8 +175,8 @@ The documentation should define a minimal end-to-end path without inventing elab
 3. The orchestrator records an assignment through Scribe.
 4. `abacus-runtime` asks Herdr to start a worker with an ABACUS-generated context envelope.
 5. The worker operates in its assigned worktree and mutates workflow only through the ABACUS facade. Reports persist through Scribe; every fenced response mechanically surfaces current binding Directives; Herdr carries only live conversation/content-free doorbells; managers use Requests for decision-shaped cross-manager asks.
-6. The worker runs relevant verification, records before/after workspace digests, creates a clean local commit, and records structured evidence plus the commit identity.
-7. The orchestrator rechecks the bead-content hash, current binding Directive constraints, evidence, and edit scope, then advances the bead through `abacus-work` with a curated close reason.
+6. The worker runs policy-named verification through the standard wrapper, records honest outcomes plus before/after workspace digests, creates a clean local commit, and records structured evidence plus the commit identity. When the Assignment requires red-green evidence, the ordinary red record captures assertion-level failure by overlaying the policy-named verification files onto the declared-base implementation and records per-file digests that must later match the Handoff commit; the ordinary green record is bound to the Handoff commit. Execution errors never satisfy red, and acceptance refuses stale overlay digests.
+7. The orchestrator rechecks the bead-content hash, current binding Directive constraints, evidence policy—including any required red-green pair—and edit scope, then advances the bead through `abacus-work` with a curated close reason.
 8. Push/PR/merge/deploy remain separate, explicitly authorized workflows.
 
 Specify failure behavior for at least: Scribe unavailable, stale lease, worker death, malformed provider output, optional advisor unavailable, dirty handoff, missing evidence, and provider version mismatch.
@@ -231,10 +232,9 @@ A fresh session rooted correctly in ABACUS should remove the immediate `ENOENT`.
 ## Git and GitHub constraints
 
 - Do not push anything merely because implementation work has begun.
-- If publication is later requested, verify that authentication and repository ownership resolve to the operator’s personal GitHub account: **`DylanDelliColli`**.
-- Do not create a repository under an organization or another identity.
-- Before initializing Git or choosing a remote, report the intended action if it would create external state.
-- Preserve a clean, reviewable commit history once the repository is initialized.
+- The existing remote is the operator's personal repository, **`DylanDelliColli/abacus`**; verify authentication still resolves to that identity before any later publication.
+- Do not replace the remote with an organization or another identity.
+- Preserve the repo-local identity and a clean, reviewable commit history.
 
 ## First-session checklist
 
@@ -247,7 +247,7 @@ A fresh session rooted correctly in ABACUS should remove the immediate `ENOENT`.
 7. Record sanitized provider fixtures/compatibility evidence in the owning module only.
 8. Re-run a Codex–Claude adversarial review if a spike changes a public seam or contradicts the accepted ADR.
 9. Scaffold Rust only after the relevant spike gate passes, beginning with the smallest vertical slice described in `docs/migration.md`.
-10. Do not initialize/publish a GitHub repository without confirming the operator's requested personal account and external-state action.
+10. Do not push or otherwise publish without explicit authorization; when authorized, preserve the existing `DylanDelliColli/abacus` target.
 
 ## Review standard
 

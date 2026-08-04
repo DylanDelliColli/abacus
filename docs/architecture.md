@@ -44,6 +44,7 @@ These are architectural rules, not implementation suggestions.
 15. **Hermetic default tests.** The default workspace suite cannot require installed providers, a live multiplexer, GitHub, network access, user home configuration, or real agent sessions.
 16. **Structural growth is visible.** A new cross-module dependency, breaking interface change, live test in a default lane, or material increase in the hermetic test budget requires an ADR.
 17. **Coordination is typed and durable before notification.** Decision-shaped coordination is an immutable, subject-bound Signal (`Directive`, `Report`, or `Request`) in the Ledger. Herdr can announce it, but notification success never owns, acknowledges, or resolves it.
+18. **Verification policy is Assignment-local.** A policy may require a red-green pair from ordinary Evidence records: assertion-level red against the declared-base implementation using digest-bound verification overlays, then green at the Handoff commit. No universal red-green gate, coverage machinery, or threshold exists. An authored role card may choose that form by default; Rust never does.
 
 ## System context
 
@@ -241,7 +242,7 @@ Exact Rust names may evolve, but these concepts and distinctions must remain.
 - **Directive** — an orchestrator-to-Attempt Signal containing amended instructions, pause, abort, or an answer to a Report. It requires the Assignment's exact decision authority and binds the current Attempt from commit, unread included.
 - **Report** — a worker-to-decision-actor Signal recording structured progress or blocked-with-reason state from the current Attempt under its current lease/fencing token. A linked responding Directive or fenced decision resolves it.
 - **Request** — an actor-to-actor Signal carrying a bounded decision-shaped ask, initially arbitration, authority transfer, or reconciliation. It is the orchestrator channel and only a linked responding fenced decision, including refusal, resolves it.
-- **Evidence bundle** — structured verification commands, outcomes, relevant artifacts, and environment facts.
+- **Evidence bundle** — ordinary structured verification commands, actual outcomes, exact commit bindings, before/after workspace digests, relevant artifacts, and environment facts. “Red” and “green” are policy-derived roles for these same records, never separate evidence classes.
 - **Commit handoff** — commit identity, base identity, worktree cleanliness proof, evidence identity, and worker attestation.
 - **Submission refusal** — an audited failed precondition before a Handoff is recorded; the Attempt remains active.
 - **Rejection** — an immutable orchestrator decision on a recorded Handoff; terminal for that Attempt but not its Assignment.
@@ -297,6 +298,8 @@ A watchdog is a spawned orchestrator-class agent profile, not another daemon or 
 
 Authored orchestrator policy follows two routing rules: progress is queried, never copied into messages; and cross-scope blockers become `br` dependencies when work-shaped or Requests when decision-shaped. These rules keep the Signal family small enough to remain typed workflow state.
 
+When the Phase 6 authored assets land, the orchestrator role card defaults unsupervised autonomous Assignments to the red-green evidence-pair policy form. The card explicitly selects that policy when creating each Assignment. This is an authored orchestration default, not a CLI/core default: supervised and downstream workflows choose their own per-Assignment verification policy.
+
 ## Interfaces at seams
 
 Interfaces belong to the use cases that consume them. Do not create a generic provider framework.
@@ -337,7 +340,7 @@ Required behavior:
 - append actor-to-actor Requests and validate their responding fenced-decision links;
 - query per-actor and global unresolved sets derived from immutable Signals lacking their typed responding actions;
 - preserve immutable per-Attempt fenced call/response ordering from which Directive exposure and discharge are derived;
-- append and inspect evidence;
+- append and inspect ordinary Evidence records and query them by Assignment/Attempt, normalized verification set, commit binding, closed normalized outcome, and optional overlay path/digest metadata;
 - submit and decide handoffs;
 - record immutable work-status application attempts/receipts and derive decisions lacking a successful receipt;
 - append/query audit events;
@@ -390,7 +393,7 @@ The operation is idempotent and supports a dry-run/plan mode suitable for automa
 1. The orchestrator asks `abacus-work` for a normalized ready set and graph revision.
 2. If configured, `bv` advice is requested with a deadline.
 3. Advice is accepted only if it refers to the current graph revision and passes schema validation; otherwise deterministic ordering is used.
-4. Core policy validates that the bead can be assigned; one Scribe transaction records the Assignment, the exact bead-content hash/revision that authorized it, first Attempt, authorizing decision, and work-status operation identity.
+4. Core policy validates that the bead can be assigned; one Scribe transaction records the Assignment, its explicit acceptance-policy form and named verification set, the exact bead-content hash/revision and declared base commit that authorized it, first Attempt, authorizing decision, and work-status operation identity. A worker cannot later select or weaken that policy.
 5. The work facade marks the bead in progress through `br` using that operation identity.
 6. Scribe records the normalized application attempt and, on confirmed success, its receipt. Failure or ambiguity after step 4 is derived as a decision lacking a successful receipt; reconciliation is explicit and idempotent.
 
@@ -429,12 +432,15 @@ The worker submits:
 - current fencing token;
 - commit object ID and expected base;
 - proof that the worker worktree is clean;
-- structured commands and exit outcomes required by the assignment policy, each with before/after workspace digests;
+- structured commands, raw exit details, and normalized outcomes required by the assignment policy, each with before/after workspace digests;
+- when the Assignment requires the red-green form, a reference to the ordinary `assert-fail` Evidence for the same verification set against the declared-base implementation, including its exact overlay path set and per-file digests;
 - the normalized changed-path set for edit-scope validation;
 - evidence/artifact digests where applicable;
 - an attestation binding the evidence to the handed-off commit.
 
-If a precondition fails before recording, Scribe audits the Submission refusal and the Attempt remains `active`; no Handoff or decision is created. A valid submission records an immutable Handoff and moves the Attempt—not the Assignment—to `submitted`. It does not close the bead.
+Both red and green runs use the standard wrapper and the existing Evidence record shape. At the wrapper boundary, framework results normalize into the closed set `pass`, `assert-fail`, and `execution-error`; the raw command/exit details remain honest. For red, the wrapper constructs an isolated checkout of the declared-base implementation and overlays only policy-named verification files from the worker's current work. The Evidence binds the base commit, exact overlay path set, each overlaid file's content digest, and the composed tree's before/after workspace digests. Green runs the same verification set natively at the Handoff commit. An `expect-fail` capture mode affects only later policy interpretation and never suppresses, inverts, or manufactures an outcome.
+
+If a precondition fails before recording—including a policy-required red half that is missing, bound to the wrong commit, actually passing, errored before completing verification, or stale against the Handoff commit—Scribe audits a Submission refusal with the appropriate distinct reason and the Attempt remains `active`; no Handoff or decision is created. An overlay path outside the policy's verification file set is refused as malformed evidence. A valid submission records an immutable Handoff and moves the Attempt—not the Assignment—to `submitted`. It does not close the bead.
 
 ### 6. Validate and accept
 
@@ -442,11 +448,12 @@ If a precondition fails before recording, Scribe audits the Submission refusal a
 2. Core policy verifies that the deciding actor has the assignment's explicit decision authority.
 3. The work facade reads the authoritative bead and confirms its current content hash matches the hash bound into the Assignment. A changed task must be explicitly re-authorized; it is never silently accepted against stale requirements.
 4. Git verification confirms that the commit exists, is based on an allowed base, corresponds to the submitted worktree/evidence identity, and changes no path outside the Assignment's normalized edit scope.
-5. Acceptance policy evaluates the evidence, including before/after workspace digests that expose verification commands which mutated the tree. Any mutation must be explicitly allowed, incorporated, and followed by a clean final proof; pane text never substitutes for this check.
-6. On rejection, Scribe records the immutable Rejection, ends that Attempt, and leaves the Assignment active and the bead open/in progress. Only the Assignment's authorized decision actor may explicitly retry by appending a new fenced Attempt, possibly for the same worker.
-7. On acceptance, one Scribe transaction records the immutable Acceptance decision, a bounded curated close reason, and operation identity and moves the Assignment/Attempt to terminal `accepted`.
-8. `abacus-work` attempts to close the bead in `br` using the decision's operation identity and curated `accepted_handoff` close-reason code, and returns a normalized outcome.
-9. Scribe records the immutable application attempt and, on confirmed success, a receipt with the work revision. These records describe the step-7 decision's projection; they are not another decision or lifecycle transition.
+5. Acceptance policy evaluates the ordinary Evidence records, including before/after workspace digests that expose verification commands which mutated the tree. Any mutation must be explicitly allowed, incorporated, and followed by a clean final proof; pane text never substitutes for this check.
+6. If the Assignment selected the red-green form, core derives a pair for the policy-named verification set. Red must record `assert-fail` against the declared-base implementation, its overlay paths must be a subset of the policy verification files, and every per-file overlay digest must equal that file's digest in the Handoff commit. Green must record `pass` for the same verification set run natively at the Handoff commit. Missing red, wrong-commit red, passing red, `execution-error` red (`red-errored`), and a digest mismatch or missing overlaid file (`red-stale`) are distinct refusal/rejection reasons; stale red must be recaptured. The existing missing/failing-green reasons apply to green. Pairing and overlay validation create no record or mutable status.
+7. On rejection, Scribe records the immutable Rejection, ends that Attempt, and leaves the Assignment active and the bead open/in progress. Only the Assignment's authorized decision actor may explicitly retry by appending a new fenced Attempt, possibly for the same worker.
+8. On acceptance, one Scribe transaction records the immutable Acceptance decision, a bounded curated close reason, and operation identity and moves the Assignment/Attempt to terminal `accepted`.
+9. `abacus-work` attempts to close the bead in `br` using the decision's operation identity and curated `accepted_handoff` close-reason code, and returns a normalized outcome.
+10. Scribe records the immutable application attempt and, on confirmed success, a receipt with the work revision. These records describe the step-8 decision's projection; they are not another decision or lifecycle transition.
 
 Push, PR creation, merge, deployment, and cleanup are explicit later actions.
 
@@ -514,6 +521,7 @@ Clock-dependent decisions use the Scribe clock. Worker clocks are evidence only.
 | Binding Directive conflicts with requested action | Reject before mutation and surface the current binding Directive set; exposure/discharge remains derived from immutable call/action ordering |
 | Dirty worker tree | Refuse submission with a structured reason before recording a Handoff; if discovered against a recorded Handoff at decision time, record an explicit Rejection of that Attempt |
 | Missing/failed evidence | Refuse submission before recording a Handoff, or explicitly reject the recorded Handoff according to assignment policy; never conflate refusal with Rejection |
+| Required red-green pair invalid | Use distinct policy reasons for missing red, red bound anywhere but the declared base commit, passing red, `execution-error` red (`red-errored`), or overlay digests that do not match the Handoff commit (`red-stale`, requiring recapture). Refuse out-of-policy overlay paths as malformed evidence. Preserve the actual ordinary Evidence records; never invert an outcome, create a pair row, or substitute coverage/threshold checks. |
 | Ambiguous provider mutation | Stop, inspect provider state, and reconcile idempotently |
 | Provider schema/version mismatch | Refuse affected operation; do not parse best-effort text |
 
@@ -624,8 +632,8 @@ Record actual baselines once code exists. On slower/faster machines, compare bot
 
 ### Test seams
 
-- Core receives deterministic clocks, ID generation, and policy inputs.
-- State uses temporary Git common directories and SQLite files; tests cover Signal subject/sender fencing, per-actor/global linked-resolution derivation, mechanical Directive surfacing and causal-call enforcement, and schema/interface proof that no read/ack state exists.
+- Core receives deterministic clocks, ID generation, and policy inputs, including red-green pairing and overlay validation over ordinary fake Evidence values.
+- State uses temporary Git common directories and SQLite files; tests cover Signal subject/sender fencing, per-actor/global linked-resolution derivation, mechanical Directive surfacing and causal-call enforcement, red-green evidence queries with overlay metadata but no new record class, and schema/interface proof that no read/ack state exists.
 - Work uses a fake argv process runner and versioned stdout/stderr/exit fixtures.
 - Runtime uses a fake Herdr socket/protocol peer and recorded event fixtures; it does not need state tests to exercise a doorbell.
 - CLI composes in-memory/fake adapters through the same interfaces used in production.
@@ -670,6 +678,7 @@ The first vertical slice is architecturally acceptable when:
 - workers can durably Report progress/blockers, orchestrators can issue Directives and actor-to-actor Requests, per-actor/global unresolved coordination derives from linked responding actions, and Herdr can ring content-free transient doorbells without a generic ABACUS inbox;
 - every fenced worker response mechanically surfaces the Attempt's current binding Directives as a Scribe protocol property, and a worker can submit a fenced, Directive-compliant, evidence-bound clean commit without hooks/read receipts;
 - Acceptance rejects changed bead content, out-of-scope paths, and unaccounted verification-induced workspace changes;
+- an Assignment may require assertion-level red against its declared-base implementation using only policy-named, digest-bound verification overlays and green for the same verification set at its Handoff commit, while green-only, wrong-commit-red, passing-red, red-errored, red-stale, and out-of-policy-overlay cases are refused correctly without coverage machinery or new evidence records;
 - the orchestrator can reject or accept the handoff and only acceptance closes the bead;
 - an existing orchestration capability can move between two named profiles without rebuilding adapter modules;
 - Scribe and runtime restarts preserve or explicitly reconcile durable state;

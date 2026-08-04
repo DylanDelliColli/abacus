@@ -54,7 +54,7 @@ For worker startup, the composed use case renders one canonical sanitized Envelo
 
 For durable coordination, the composed use case first commits a typed Signal through Scribe and only then asks Herdr for a best-effort, content-free doorbell to the target Attempt/actor when a runtime exists. Signal bodies never ride Herdr prompts. A failed doorbell never rolls back or retries the Signal. Recipients query per-actor or global derived unresolved sets through the state facade. Every fenced worker response mechanically surfaces the Attempt's current binding Directives; the CLI cannot suppress them, manufacture read/ack state, submit a client-asserted Directive head, or bypass the state/core refusal that guards consequential actions.
 
-The initial real Git commit verifier may be a private CLI/composition adapter satisfying the core-owned port. It returns commit/base identity, clean-tree facts, normalized changed paths for Assignment-scope conformance, and before/after workspace digests around verification commands. If it grows beyond a small argv-based implementation, extract it through an ADR rather than allowing CLI to become a Git module.
+The initial real Git commit verifier and standard evidence wrapper may be private CLI/composition adapters satisfying the core-owned port. They return honest raw command/exit details; a framework-normalized outcome from the closed set `pass`, `assert-fail`, and `execution-error`; commit/base identity; clean-tree facts; normalized changed paths for Assignment-scope conformance; and before/after workspace digests around verification commands. If this implementation grows beyond a small argv-based adapter, extract it through an ADR rather than allowing CLI to become a Git module.
 
 ## Configuration
 
@@ -150,7 +150,7 @@ abacus work <ready|list|show|create|update|depend|close|reopen>
 abacus assignment <create|show|list|sync|retry|revoke>
 abacus signal <directive|report|request|list|unresolved>
 abacus runtime <start|prompt|inspect|wait|read|stop>
-abacus evidence <submit|show>
+abacus evidence <capture|submit|show>
 abacus handoff <submit|show|accept|reject|transfer>
 abacus profile <list|show|validate>
 abacus reconcile <assignment|all>
@@ -163,6 +163,23 @@ Authored agents normally receive smaller task-specific instructions, not the who
 `abacus signal directive` is restricted to the Assignment's exact decision authority and the `state:issue_directive` capability; its closed forms are amend, pause, abort, and answer. `abacus signal report` records structured progress or blocked-with-reason state from the current Attempt under its current lease token and `state:report`. `abacus signal request` carries an in-scope arbitration, authority-transfer, reconciliation, or other bounded decision ask under `state:request`; the responding command resolves it only by recording a linked fenced decision. Every form requires a typed bead/Assignment/Attempt/scope subject and rejects a subject-free body.
 
 `abacus signal list` reads immutable records. `abacus signal unresolved --actor <id>` and its authorized global form derive Signals lacking their typed responding actions; neither command creates an inbox, `read_at`, per-Directive acknowledgement, or escalation state. `abacus assignment sync` is an orientation/latency convenience only. Correctness never depends on a worker remembering to call it because Scribe mechanically includes current binding Directives in every fenced response. A fenced response renders those Directives even when the requested Handoff or mutation is refused; amend/pause produce distinct Submission-refusal reasons at Handoff, and abort permits only abort-consistent mutations.
+
+### Evidence wrapper
+
+The standard wrapper captures every policy-named verification through one path. For a red-green policy, the intended ergonomics are:
+
+```text
+abacus evidence capture --assignment <assignment-id> --verification <name> --at base --expect-fail
+abacus evidence capture --assignment <assignment-id> --verification <name> --at handoff
+```
+
+`--at base` resolves only to the declared base commit recorded on the Assignment; it does not accept an arbitrary worker-selected revision. The wrapper creates an isolated checkout of that declared-base implementation, overlays only the policy-named verification files from the worker's current work, and runs the policy-named verification set in the composed tree. It records one ordinary Evidence value containing the honest raw command/exit details, normalized outcome, declared base binding, exact overlaid path set, per-file overlay digests, and the composed tree's before/after workspace digests. The overlay paths must be a subset of the policy's verification file set. The green capture runs the same verification set natively at the Handoff commit.
+
+Each supported framework maps its process result into exactly one of `pass`, `assert-fail` (the verification completed and asserted failure), or `execution-error` (collection, missing-file, usage, infrastructure, or other inability to complete). The adapter owns this normalization; an unknown result fails closed as `execution-error` rather than being guessed into assertion failure.
+
+`--expect-fail` changes only how the resulting ordinary Evidence is offered to red-green policy evaluation. It never suppresses, flips, or rewrites the command outcome. A successful base run is recorded as `pass` and later produces the distinct passing-red refusal; a base collection or execution failure is recorded as `execution-error` and produces `red-errored`. The wrapper must not manufacture `assert-fail`. At acceptance, a changed or missing overlaid file in the Handoff commit produces `red-stale` and requires recapture. Machine output keeps wrapper/capture status separate from the recorded verification outcome and exposes the exact three-way outcome so callers cannot confuse “record written” with “verification passed.”
+
+The CLI neither injects this policy globally nor infers it from an unsupervised flag. The Phase 6 orchestrator role card will default unsupervised autonomous Assignments to the red-green form by explicitly selecting it at Assignment creation. Rust and CLI behavior remain policy-neutral, with no coverage collection or thresholds.
 
 ## Output and errors
 
@@ -214,6 +231,9 @@ Default tests cover:
 - known-capability registry composition and unknown-capability refusal;
 - machine-output schema and stderr separation;
 - context-envelope rendering;
+- standard evidence-wrapper capture at declared base/Handoff commits, base-implementation overlay construction from only policy-named verification paths, per-file overlay digests, before/after composed-workspace digests, and truthful three-way outcome recording under `--expect-fail`;
+- per-framework normalization into `pass`/`assert-fail`/`execution-error`, including collection and execution failures that can never satisfy red;
+- red-green policy-refusal rendering for missing red, wrong-commit red, passing red, `red-errored`, `red-stale`, out-of-policy overlay paths, and green-only submissions, with no CLI or Rust default and no coverage/threshold surface;
 - Signal validation/subject routing, commit-before-content-free-doorbell ordering, per-actor/global derived unresolved presentation, and absence of client read/ack/head inputs;
 - mechanical Directive surfacing on every fenced success/refusal response, amend/pause Handoff-refusal rendering, abort mutation refusal, and structured Report parsing;
 - command handlers with fake core/state/work/runtime/commit interfaces;
@@ -236,6 +256,7 @@ Warm hermetic target: under fifteen seconds for CLI tests; complete T0–T2 work
 - `abx` behaves as an alias, not a divergent command implementation.
 - Adding a named manager/watchdog with existing capabilities requires no Rust build.
 - Operators and agents can issue/query typed Signals through the CLI, while Herdr doorbell failure leaves the durable derived-unresolved result intact and no Signal body enters a prompt.
+- The wrapper can capture assertion-level red by overlaying only policy-named verification files onto the declared-base implementation, bind their digests for Handoff validation, and capture green without changing either normalized outcome or creating a second evidence path.
 - Module-specific configuration prevents unrelated settings from coupling adapters.
 - Internal work/runtime/state changes do not require CLI tests when their public interface is unchanged.
 - Machine output is versioned and human output is not a parsing contract.

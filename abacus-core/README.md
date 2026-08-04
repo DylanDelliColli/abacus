@@ -17,6 +17,7 @@ This module has the broadest downstream impact, so it must change least often. I
 - Lease and fencing-token rules
 - Typed Signal values, subject-reference validation, and resolution-linkage semantics
 - Evidence/handoff value semantics
+- Acceptance-policy forms, including optional red-green evidence pairing
 - Authorization and transition decisions
 - Deterministic ready-work fallback policy
 - Evidence acceptance policy evaluation
@@ -101,11 +102,29 @@ If ABACUS ever needs untyped subject-free messages, per-message read/ack state, 
 
 - Validate the shape and identity binding of evidence.
 - Require a commit object, expected base, clean-tree proof, and policy-required command outcomes.
+- Evaluate an Assignment-selected red-green evidence-pair policy without introducing a new evidence record type.
 - Bind the Assignment to the bead-content hash used to authorize it and require Acceptance to recheck that hash.
 - Require each verification command to record before/after workspace digests so test-induced mutations are visible.
 - Require the handed-off commit's changed paths to conform to the Assignment's normalized edit scope.
 - Distinguish submitted evidence from independently verified evidence.
 - Decide accept/reject without consulting raw pane output.
+
+An Assignment's acceptance policy may select a **red-green evidence pair** form and name the canonical verification command set to which it applies. The policy is fixed as part of the bead-content-hash-bound Assignment; a worker cannot add, remove, or weaken this requirement.
+
+Verification outcomes are normalized at the wrapper boundary into the closed set `pass`, `assert-fail`, and `execution-error`. `assert-fail` means the verification ran to completion and reported an assertion failure. Collection failures, missing files, usage errors, infrastructure failures, and any other failure to run to completion are `execution-error`. Core evaluates this normalized outcome while Evidence retains the honest underlying command and exit details.
+
+The form is satisfied by two ordinary Evidence records produced through the standard wrapper:
+
+- **red:** the policy-named verification files from the worker's current work are overlaid onto an isolated checkout of the Assignment's declared-base implementation, and that composed run records `assert-fail`; and
+- **green:** the same policy-named verification set runs natively at the Handoff commit and records `pass`.
+
+The red Evidence binds the declared base commit, the exact overlaid path set, a per-file content digest for every overlaid file, and the composed checkout's before/after workspace digests. Its overlaid paths must be a subset of the policy's verification file set. At acceptance, every overlay digest must equal the digest of the same file in the Handoff commit; verification edited after red capture is stale and must be recaptured. The green Evidence retains its Handoff commit binding and before/after workspace digests. Pairing and overlay validation derive from those existing Evidence values. There is no `RedEvidence`, `GreenEvidence`, pair record, coverage record, or threshold state.
+
+The pair is the structural counter to vacuous verification: a test or command set that cannot fail cannot produce a valid red half, even if it passes at the Handoff commit.
+
+When this policy form is required, green-only or invalid-red submissions fail with distinct policy reasons: red evidence missing, red bound to a commit other than the declared base, the claimed red run actually passed, red produced `execution-error` (`red-errored`), or the overlay digests do not match the Handoff commit (`red-stale`). An overlay path outside the policy's verification file set is malformed evidence and is refused before pairing. The ordinary missing/failing-green reasons continue to apply to the green half. An expectation flag supplied to the wrapper cannot change the recorded exit code or normalized outcome; policy evaluates the honest record.
+
+Red-green pairing is a per-Assignment policy choice, never a universal completion gate or compiled default. The future orchestrator role card defaults to it for unsupervised autonomous runs; core merely validates the explicit policy stored on each Assignment. Downstream projects remain free to choose their verification policy, and core defines no coverage machinery or thresholds.
 
 The initial Git verification implementation may live privately in the composition module behind a core-owned `CommitVerifier` port. If Git behavior grows into a substantial independent implementation, extracting an `abacus-git` module requires a focused ADR rather than expanding core.
 
@@ -142,6 +161,7 @@ These are not a generic plugin framework. A port exists only for behavior a core
 16. Every fenced worker response mechanically surfaces the Attempt's current binding Directives as a Scribe protocol property, and current Directive policy gates consequential mutations regardless of delivery/read status.
 17. Acceptance fails if the authoritative bead content no longer matches the Assignment's bound hash, the commit diff escapes edit scope, or verification changed the workspace without an allowed and accounted-for result.
 18. Signal exposure and discharge are derived from immutable call ordering and linked responding actions, never from delivery metadata, opening, acknowledgement, or a timer.
+19. A required red-green pair is selected by the bead-content-hash-bound Assignment and derives from ordinary, honestly recorded Evidence: assertion-level red against the declared-base implementation using digest-bound verification overlays, and green at the Handoff commit; workers cannot opt into or out of it.
 
 ## Dependency rule
 
@@ -174,6 +194,7 @@ All default tests are pure and deterministic:
 - Directive binding-from-commit, authorization, mechanical response surfacing, causal-call ordering, lost-response/idempotency, pause/amend/abort transition gates, and responding-action discharge tests;
 - Acceptance decision/application-attempt/application-receipt ordering and crash-window tests;
 - bead-hash, edit-scope, before/after-workspace-digest, and evidence-policy tests with fake commit verification;
+- red-green pairing tests for matching command sets, missing red, wrong-commit red, passing “red,” green-only submission, `execution-error` rejected as red, overlay-digest mismatch rejected as `red-stale`, matching overlay digests accepted, paths outside the policy verification set rejected, and honest outcome interpretation;
 - deterministic fallback-order tests;
 - profile redistribution tests proving no named role is hard-coded.
 
@@ -194,5 +215,6 @@ Warm test target: under five seconds on the baseline development machine.
 - A Directive, Report, and actor-to-actor Request can be created and resolved through typed responding actions without unread/ack state.
 - A stale worker is rejected by fencing in deterministic tests.
 - Runtime `done` with no handoff remains incomplete.
+- An Assignment requiring red-green evidence accepts only assertion-level red with policy-scoped overlay files whose digests match the Handoff commit, and distinctly rejects green-only, wrong-commit-red, passing-red, red-errored, and red-stale submissions while reusing ordinary Evidence values.
 - `bv` absence has no effect on eligibility or correctness.
 - Provider and persistence types are absent from the public interface.
