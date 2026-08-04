@@ -152,9 +152,9 @@ SABLE's complementary planning layer (test-contract interviews, backlog-freshnes
 
 ## Open questions (for cross-review and operator decision)
 
-1. **Codex sandbox vs. the socket.** Confirm a sandboxed Codex agent can connect to `$XDG_RUNTIME_DIR/abacus/<repo-id>.sock` under `workspace-write`. If not, the Scribe-mediated model needs a permitted transport (spike gate below).
-2. **`ABACUS-` prefix support in `br`.** Confirm custom ID prefixes are first-class upstream before the namespace validation is specified.
-3. **Scope expression.** How responsibility scopes/routes are expressed and checked (labels, bead subtrees, explicit routes) — must be specified with the profile schema in `abacus-core` before `abacus-state` implements decision-actor authorization. (Overlap *policy* is decided: exclusive scopes are rejected at config validation; Scribe fencing is the backstop — Decision §7.)
+1. **Codex sandbox vs. the socket.** Confirm a sandboxed Codex agent can connect to `$XDG_RUNTIME_DIR/abacus/<repo-id>.sock` under `workspace-write`. If not, the Scribe-mediated model needs a permitted transport (spike gate below). *Status 2026-08-04: partially resolved — the Claude session sandbox passed all probes; the Codex default sandbox denied Unix sockets, and exact-grant permission-profile validation from a fresh Codex session remains open (`docs/compatibility/2026-08-04-scribe-socket.md`, bead `ABACUS-HPG.5`).*
+2. **`ABACUS-` prefix support in `br`.** Confirm custom ID prefixes are first-class upstream before the namespace validation is specified. *Resolved 2026-08-04: supported with lowercase normalization; the work facade owns a lossless `ABACUS-`/`abacus-` ID seam (`docs/compatibility/2026-08-04-br-bv.md`).*
+3. **Scope expression.** How responsibility scopes/routes are expressed and checked (labels, bead subtrees, explicit routes) — must be specified with the profile schema in `abacus-core` before `abacus-state` implements decision-actor authorization. (Overlap *policy* is decided: exclusive scopes are rejected at config validation; Scribe fencing is the backstop — Decision §7.) *Resolved by ADR-0002 (label-selector algebra over declared keys), Accepted 2026-08-04 after Codex C2 cross-review.*
 
 ### Spike gates (pre-implementation)
 

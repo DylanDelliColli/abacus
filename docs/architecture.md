@@ -260,14 +260,20 @@ A named agent is a profile layered on an authority class:
 ```text
 profile: delivery-manager
 class: orchestrator
-capabilities: [work:select, state:assign, state:decide_handoff]
-scope: label=delivery
+grants:
+  work:select: "area=delivery"
+  state:assign: "area=delivery"
+  state:decide_handoff: "area=delivery"
 
 profile: watchdog
 class: orchestrator
-capabilities: [runtime:observe, state:read_audit, runtime:prompt]
-scope: repository
+grants:
+  runtime:observe: "*"
+  state:read_audit: "*"
+  runtime:prompt: "*"
 ```
+
+Scope expressions follow the label-selector algebra of ADR-0002: selectors over repository-declared scope keys, matched against a bead's normalized `key:value` label map, with `*` as the universal scope.
 
 Role-card Markdown frontmatter is the single profile definition. Repository configuration references cards and routes responsibility; it does not duplicate their authority schema. The semantics are fixed:
 
@@ -282,7 +288,7 @@ Role-card Markdown frontmatter is the single profile definition. Repository conf
 - assignments name the exact actor authorized to accept or reject their handoff;
 - transfer of decision authority is explicit, fenced, and audited.
 
-Scopes declare whether a capability is exclusive or shared. Configuration validation rejects overlapping exclusive mutation/decision scopes before sessions launch. Shared read, observation, and alert scopes may overlap. Scribe still serializes decisions and enforces fencing as a backstop; configuration validity never replaces write-time authorization.
+Each capability *descriptor* declares its check class (ADR-0002 §3): `exclusive` (responsibility-owning mutations/decisions — pairwise-disjoint scopes across profiles, rejected at config validation before sessions launch, with the assignment-lifecycle bundle granted at one coherent scope), `fenced` (attempt-bound worker mutations — authorized by Assignment binding and lease fencing, overlapping grants expected), or `shared` (reads/observation — overlap freely). A grant in a card is `capability → scope expression`; cards cannot reclassify a capability. Scribe still serializes decisions and enforces fencing as a backstop; configuration validity never replaces write-time authorization.
 
 This makes topology evolution cheap:
 
