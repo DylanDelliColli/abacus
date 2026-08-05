@@ -23,6 +23,7 @@ This module has the broadest downstream impact, so it must change least often. I
 - Deterministic ready-work fallback policy
 - Evidence acceptance policy evaluation
 - Provider-neutral ports required by core use cases
+- The use-case composition module: functions generic over those ports that sequence multi-seam workflows (ADR-0001 amendment, 2026-08-05). It adds no dependency, holds no provider knowledge, and duplicates no transition policy; `abacus-cli` calls these functions rather than re-implementing them
 - Normalized error categories that callers can act on
 
 ## Does not own
@@ -32,6 +33,7 @@ This module has the broadest downstream impact, so it must change least often. I
 - The complete vocabulary of module-owned capabilities
 - SQLite tables, migrations, or transport encoding
 - `br`/`bv` commands, schemas, paths, or types
+- Provider selection, process invocation, or any adapter behavior the use-case module might otherwise be tempted to absorb; composition sequences ports, it never speaks to a provider
 - Herdr panes, sessions, socket messages, or status detection
 - Git subprocess implementation
 - Formatting CLI output
