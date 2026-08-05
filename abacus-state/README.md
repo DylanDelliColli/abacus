@@ -57,6 +57,8 @@ $XDG_RUNTIME_DIR/abacus/<repo-id>.sock
 
 Only Scribe mutates the database. The database and socket directory are user-only. No fallback silently writes to a user home or worktree when these paths are unavailable.
 
+**Credential authentication is this module's own:** Scribe verifies a presented bearer against the launch subject's active bound provisioning — the Attempt's for a worker, the actor activation's for a spawned orchestrator/watchdog — using a **vetted constant-time comparison implemented here** (core holds no cryptographic primitive, I15) and returns only a typed outcome — the stored digest never leaves Scribe. Wrong-token/right-ID must be refused before any provider mutation.
+
 **Agent transport (ADR-0003, Proposed rev 5):** one versioned Scribe protocol on two carriages selected by injected configuration — direct UDS where the sandbox permits, or a per-call operator-owned `scribe-rpc` relay (exact two-token argv; one bounded newline-terminated typed-JSON request line on stdin; private 4-byte framing performed by the host client; one structured stdout line; fixed deadline; strictly one request per process and connection, batching forbidden). Actors are credentialed, never asserted: no enrolment verb exists anywhere in the agent-facing protocol; initial enrolment happens on a one-shot pre-listen operator channel, worker credential minting is an authenticated effect of `AssignmentOpening`, bearers are CSPRNG ≥128-bit with digest-only storage and constant-time comparison, and plaintext rides only an ephemeral launch secret — never the persisted Envelope. Host-approval denial is an agent-boundary fact; this client observes only connect failure (`Unavailable`) and protocol errors.
 
 ## Deep interface
@@ -66,7 +68,7 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 ### Repository and actors
 
 - initialize/inspect repository workflow state;
-- initial actor provisioning ONLY through the one-shot pre-listen operator channel — no standalone or general enrolment verb exists on the public client;
+- five closed activation cases and nothing else: operator-channel-only bootstrap of the initial/orchestrator actor; actor-authorized rotation for an already-registered same ActorId and class; first-worker registration as an atomic effect of `AssignmentOpening`; operator-channel recovery/root rotation for an already-registered orchestrator (never creates an actor); and operator-channel enrolment of an additional orchestrator actor into another validated profile (unknown actors only, orchestrator class only, occupancy still enforced, bootstrap sentinel untouched) — all operator-channel cases are absent from the agent protocol. No standalone or general enrolment verb exists on the public client;
 - authenticated activation/resume for an already-provisioned actor;
 - atomic worker credential **binding** solely as an effect of `AssignmentOpening` or retry `AttemptOpening`: the caller passes opaque id+digest (`CredentialProvisioning`), Scribe persists digest-only and returns idempotent `StateApplied`, plaintext never crosses in either direction;
 - audit profile activation/change before it authorizes new actions;
@@ -79,12 +81,12 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 - inspect current and historical attempts;
 - transition an attempt using core validation;
 - enforce the core-validated optional per-Assignment Attempt cap on explicit retry;
-- persist/read the canonical sanitized Envelope snapshot associated with an Assignment/Attempt;
+- persist/read the canonical sanitized Envelope snapshot keyed by the closed launch subject (worker Attempt or actor activation);
 - append an authorized Directive, Report, or Request with a validated bead/Assignment/Attempt/scope subject and full fenced-sender snapshot;
 - query immutable Signals by subject, sender, recipient, and causal order;
 - query per-actor and global derived unresolved sets: Signals lacking the typed responding action that resolves or discharges them;
 - return the active Attempt's current binding Directives in every fenced worker response;
-- bind/unbind an opaque runtime handle;
+- persist/read the canonical Envelope and bind/unbind an opaque runtime handle, both keyed by the closed launch subject (worker Attempt or actor activation) so spawned orchestrator/watchdog profiles are first-class;
 - reconcile an uncertain runtime association.
 
 ### Leases and fencing

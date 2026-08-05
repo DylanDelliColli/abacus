@@ -1,17 +1,24 @@
 # ABACUS build notes
 
-## 2026-08-04 — overnight log (Claude + Codex autonomous, operator returns morning)
+## 2026-08-04/05 — overnight log (Claude + Codex autonomous)
 
-Running summary for the operator; beads remain authoritative. Items needing an operator decision are marked **MORNING**.
+Running summary for the operator; beads remain authoritative. **MORNING** marks items needing an operator decision.
 
-- Ports seam (9NH.5): six adversarial revision rounds complete (R1–R6, R7–R11, S1–S6, then the six integration findings F1–F6 with eight mid-pass refinements). The state seam is now transactional use-case operations with Scribe-allocated ordering, fenced actor-authenticated calls, payload-bearing decisions, and audited submission refusals. 57 core tests; fmt/clippy/test gates all clean. Awaiting pass 4 verdict.
-- 9NH.6 (scope algebra + profile schema) complete on disk since before the goal was set; lands with 9NH.5.
-- OMW and GYH epics carry full decomposition drafts in their design fields, ready to mint when the ports seam passes.
-- ADR-0003: at revision 5 Proposed — substantive composer/credential/runtime-sideband work post-dates the rev-4 pass; awaiting Codex consolidated verdict, then **MORNING sign-off**.
-- Landing protocol in effect: claims expire 1h after the holder's last git op and auto-transfer on the next attempt; we announce LANDING NOW in-pane, batch, push, alternate. Codex's pile (herdr evidence, providers lock, scribe-socket updates) lands first.
-- **MORNING**: ADR-0003 will need your sign-off as named decider once cross-reviewed; the two upstream Codex feature requests (Linux unix_sockets parity; named-descriptor preservation) need your authorization before anything is filed externally; and the tree-claim hook's project scoping still deserves a permanent fix.
+**Landed and pushed (3 commits):**
+- `e02fde1` — complete `abacus-core` domain unit (ports seam, scope algebra, profiles, evidence) after eight adversarial C1 rounds with Codex terminal PASS; closed `9NH.5`/`9NH.6`.
+- `564e0a3` — Phase 3/4 epics decomposed into 13 dependency-wired implementation beads.
+- `0d6aca5` — ADR-0003 (rev 5 Proposed) plus the credential seam and aligned contracts.
 
-Pre-backlog scratchpad per `AGENTS.md`. Once the `ABACUS-` backlog exists, durable work items belong in `br`, not here. Newest entries first; an entry that gets absorbed into a bead should be annotated with the bead ID rather than deleted.
+**In flight (uncommitted, held for the post-PASS follow-up commit by agreement):**
+- Transport review rounds R5.1–R5.29 applied, including the closed LaunchSubject generalization, credential binding/revocation precision, the typed projection saga, and full call-identity idempotency. 88 hermetic core tests; clippy `-D warnings` and fmt clean throughout.
+- Awaiting Codex's consolidated verdict, then the follow-up commit.
+
+**MORNING — operator decisions:**
+1. **Sign off ADR-0003** (or return findings) — it is Proposed; sign-off flips it Accepted and closes `HPG.7`.
+2. **Authorize the two upstream Codex feature requests** (Linux `unix_sockets` parity; named-descriptor preservation) before anything is filed externally.
+3. **Tree-claim hook scoping** — the legacy SABLE hook still gates every commit in this repo and serialises the two agents to roughly one landing per hour.
+
+**Still open for Codex:** its compatibility-record and provider-lock alignment, its evidence-pile landing, and the three HPG.5 fresh-session controls (loaded-rule, absent-rule, dynamic-stdin prototype).
 
 ## 2026-08-04 — Codex teammate acknowledgement and graph review
 
