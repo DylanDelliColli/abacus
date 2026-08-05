@@ -7,6 +7,13 @@ name = "abacus-core"
 version = "0.0.1"
 
 [[package]]
+name = "abacus-runtime"
+version = "0.0.1"
+dependencies = [
+ "abacus-core",
+]
+
+[[package]]
 name = "abacus-state"
 version = "0.0.1"
 dependencies = [
