@@ -276,6 +276,10 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         self.read(WorkflowStatePort::pending_applications)
     }
 
+    fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError> {
+        self.read(WorkflowStatePort::superseded_applications)
+    }
+
     fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError> {
         self.read(|state| state.unresolved_signals(recipient))
     }

@@ -528,6 +528,50 @@ impl<C> InMemoryState<C> {
             Err(StateError::Corrupt)
         }
     }
+
+    fn receipt_candidate(state: &State, target: &OperationId) -> Option<ReceiptCandidate> {
+        // Attempts append under the Ledger lock, and SQLite reconstructs
+        // each target's vector by committed sequence. The first Applied
+        // entry is therefore the portable earliest-Ledger-order choice.
+        state
+            .application_attempts
+            .get(target.as_str())?
+            .iter()
+            .find_map(|attempt| match &attempt.outcome {
+                ApplicationOutcome::Applied { after, .. } => Some(ReceiptCandidate {
+                    attempt: attempt.id.clone(),
+                    after: after.clone(),
+                }),
+                ApplicationOutcome::FoundPresent { .. }
+                | ApplicationOutcome::ObservedAfterAmbiguous { .. }
+                | ApplicationOutcome::Failed { .. }
+                | ApplicationOutcome::Ambiguous => None,
+            })
+    }
+
+    fn superseding_projection<'a>(
+        state: &'a State,
+        projection: &PendingApplication,
+    ) -> Option<&'a PendingApplication> {
+        if projection.projection != WorkProjection::MarkInProgress {
+            return None;
+        }
+        state
+            .projections
+            .values()
+            .filter(|candidate| {
+                candidate.assignment == projection.assignment
+                    && candidate.committed_at > projection.committed_at
+                    && matches!(candidate.projection, WorkProjection::Close { .. })
+            })
+            .min_by_key(|candidate| candidate.committed_at)
+    }
+
+    fn pending_view(state: &State, projection: &PendingApplication) -> PendingApplication {
+        let mut application = projection.clone();
+        application.receipt_candidate = Self::receipt_candidate(state, &projection.operation);
+        application
+    }
 }
 
 /// Cloneable clock control used by hermetic state-contract fixtures.
@@ -651,6 +695,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                 projection: WorkProjection::MarkInProgress,
                 committed_at: seq,
                 authorized_revision: Some(opening.bead_revision.clone()),
+                receipt_candidate: None,
             },
         );
         Self::append_audit(
@@ -997,6 +1042,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                     projection: WorkProjection::Close { reason },
                     committed_at: seq,
                     authorized_revision: None,
+                    receipt_candidate: None,
                 },
             );
         }
@@ -1809,8 +1855,10 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             .ok_or(StateError::IncoherentBundle)?;
         let revision_matches = match &attempt.outcome {
             ApplicationOutcome::Applied { after, .. } => after == &receipt.after,
-            ApplicationOutcome::EffectAlreadyPresent { revision, .. } => revision == &receipt.after,
-            ApplicationOutcome::Failed { .. } | ApplicationOutcome::Ambiguous => false,
+            ApplicationOutcome::FoundPresent { .. }
+            | ApplicationOutcome::ObservedAfterAmbiguous { .. }
+            | ApplicationOutcome::Failed { .. }
+            | ApplicationOutcome::Ambiguous => false,
         };
         if !revision_matches {
             return Err(StateError::IncoherentBundle);
@@ -1942,10 +1990,34 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             .projections
             .values()
             .filter(|projection| !state.receipts.contains_key(projection.operation.as_str()))
-            .cloned()
+            .filter(|projection| Self::superseding_projection(&state, projection).is_none())
+            .map(|projection| Self::pending_view(&state, projection))
             .collect();
         pending.sort_by_key(|projection| projection.committed_at);
         Ok(pending)
+    }
+
+    fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError> {
+        let state = self.lock()?;
+        let mut superseded: Vec<SupersededApplication> = state
+            .projections
+            .values()
+            // A successful receipt already resolved the projection; this
+            // view names the receiptless projections removed from the
+            // actionable set specifically by causal supersession.
+            .filter(|projection| !state.receipts.contains_key(projection.operation.as_str()))
+            .filter_map(|projection| {
+                let superseding = Self::superseding_projection(&state, projection)?;
+                let mut application = projection.clone();
+                application.receipt_candidate = None;
+                Some(SupersededApplication {
+                    application,
+                    superseded_by: superseding.operation.clone(),
+                })
+            })
+            .collect();
+        superseded.sort_by_key(|item| item.application.committed_at);
+        Ok(superseded)
     }
 
     fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError> {

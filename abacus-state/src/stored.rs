@@ -546,7 +546,12 @@ enum StoredApplicationOutcome {
         before: String,
         after: String,
     },
-    EffectAlreadyPresent {
+    #[serde(alias = "effect_already_present")]
+    FoundPresent {
+        status: StoredWorkStatus,
+        revision: String,
+    },
+    ObservedAfterAmbiguous {
         status: StoredWorkStatus,
         revision: String,
     },
@@ -719,7 +724,9 @@ enum StoredAuditSubmissionRefusal {
 #[serde(rename_all = "snake_case")]
 enum StoredAuditApplicationOutcome {
     Applied,
-    EffectAlreadyPresent,
+    #[serde(alias = "effect_already_present")]
+    FoundPresent,
+    ObservedAfterAmbiguous,
     Failed,
     Ambiguous,
 }
@@ -1989,6 +1996,7 @@ impl TryFrom<StoredPendingApplication> for PendingApplication {
             projection: value.projection.into(),
             committed_at: Seq(value.committed_at),
             authorized_revision: value.authorized_revision.map(work_revision).transpose()?,
+            receipt_candidate: None,
         })
     }
 }
@@ -2082,8 +2090,12 @@ impl From<&ApplicationOutcome> for StoredApplicationOutcome {
                 before: before.0.as_str().to_owned(),
                 after: after.0.as_str().to_owned(),
             },
-            ApplicationOutcome::EffectAlreadyPresent { status, revision } => {
-                Self::EffectAlreadyPresent {
+            ApplicationOutcome::FoundPresent { status, revision } => Self::FoundPresent {
+                status: (*status).into(),
+                revision: revision.0.as_str().to_owned(),
+            },
+            ApplicationOutcome::ObservedAfterAmbiguous { status, revision } => {
+                Self::ObservedAfterAmbiguous {
                     status: (*status).into(),
                     revision: revision.0.as_str().to_owned(),
                 }
@@ -2105,8 +2117,12 @@ impl TryFrom<StoredApplicationOutcome> for ApplicationOutcome {
                 before: work_revision(before)?,
                 after: work_revision(after)?,
             },
-            StoredApplicationOutcome::EffectAlreadyPresent { status, revision } => {
-                Self::EffectAlreadyPresent {
+            StoredApplicationOutcome::FoundPresent { status, revision } => Self::FoundPresent {
+                status: status.into(),
+                revision: work_revision(revision)?,
+            },
+            StoredApplicationOutcome::ObservedAfterAmbiguous { status, revision } => {
+                Self::ObservedAfterAmbiguous {
                     status: status.into(),
                     revision: work_revision(revision)?,
                 }
@@ -2471,7 +2487,8 @@ impl From<AuditApplicationOutcome> for StoredAuditApplicationOutcome {
     fn from(value: AuditApplicationOutcome) -> Self {
         match value {
             AuditApplicationOutcome::Applied => Self::Applied,
-            AuditApplicationOutcome::EffectAlreadyPresent => Self::EffectAlreadyPresent,
+            AuditApplicationOutcome::FoundPresent => Self::FoundPresent,
+            AuditApplicationOutcome::ObservedAfterAmbiguous => Self::ObservedAfterAmbiguous,
             AuditApplicationOutcome::Failed => Self::Failed,
             AuditApplicationOutcome::Ambiguous => Self::Ambiguous,
         }
@@ -2482,7 +2499,8 @@ impl From<StoredAuditApplicationOutcome> for AuditApplicationOutcome {
     fn from(value: StoredAuditApplicationOutcome) -> Self {
         match value {
             StoredAuditApplicationOutcome::Applied => Self::Applied,
-            StoredAuditApplicationOutcome::EffectAlreadyPresent => Self::EffectAlreadyPresent,
+            StoredAuditApplicationOutcome::FoundPresent => Self::FoundPresent,
+            StoredAuditApplicationOutcome::ObservedAfterAmbiguous => Self::ObservedAfterAmbiguous,
             StoredAuditApplicationOutcome::Failed => Self::Failed,
             StoredAuditApplicationOutcome::Ambiguous => Self::Ambiguous,
         }
@@ -4054,6 +4072,33 @@ mod tests {
             decode_row(i64::from(SCHEMA_VERSION), &json).expect("decode scope row");
         let recovered: ScopeExpr = decoded.try_into().expect("recover scope");
         assert_eq!(recovered, scope);
+    }
+
+    #[test]
+    fn legacy_effect_presence_decodes_as_conservative_found_present() {
+        let legacy = format!(
+            r#"{{"schema_version":{SCHEMA_VERSION},"value":{{"kind":"effect_already_present","status":{{"kind":"in_progress"}},"revision":"{}"}}}}"#,
+            "a".repeat(64)
+        );
+        let stored: StoredApplicationOutcome =
+            decode_row(i64::from(SCHEMA_VERSION), &legacy).expect("decode legacy attempt");
+        assert_eq!(
+            ApplicationOutcome::try_from(stored).expect("recover legacy attempt"),
+            ApplicationOutcome::FoundPresent {
+                status: WorkStatus::InProgress,
+                revision: WorkRevision(
+                    ContentHash::new(&"a".repeat(64)).expect("valid legacy revision")
+                ),
+            },
+            "the provenance-losing legacy value remains readable but never receipt-eligible"
+        );
+
+        let stored_audit: StoredAuditApplicationOutcome =
+            serde_json::from_str(r#""effect_already_present""#).expect("decode legacy audit");
+        assert_eq!(
+            AuditApplicationOutcome::from(stored_audit),
+            AuditApplicationOutcome::FoundPresent
+        );
     }
 
     #[test]

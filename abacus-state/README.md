@@ -122,8 +122,15 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 - submit an immutable Handoff;
 - record an authorized accept/reject/revoke/cancel decision;
 - atomically record an Acceptance decision/operation identity and terminal `accepted` transition;
-- record immutable application attempts/receipts after the caller applies the `br` mutation;
-- derive decisions lacking a successful application receipt without maintaining a queue;
+- record immutable application attempts with their exact application provenance, and
+  accept receipts only for a named `Applied` attempt whose resulting revision matches;
+- derive the actionable application set without maintaining a queue: receiptless
+  projections exclude a `MarkInProgress` causally superseded in Ledger order by a
+  later `Close` for the exact same Assignment, while an otherwise actionable
+  projection carries the earliest Ledger-order `Applied` attempt as its
+  mutation-free receipt-recovery candidate;
+- expose receiptless causally superseded projections separately with the exact later
+  close operation that superseded each one;
 - query the complete audit lineage.
 
 ### Observation and watchdog access
@@ -192,7 +199,8 @@ Canonical `br` fields are not copied into mutable state. An audit record may sto
 - WAL and busy-timeout behavior are configured centrally.
 - Scribe alone owns writes; clients never compete for SQLite locks.
 - Lease decisions use the Scribe clock.
-- Restart preserves repo identity, attempts, fencing, and idempotency.
+- Restart preserves repo identity, attempts, fencing, and idempotency, and re-derives
+  receipt candidates and causal supersession in the same Ledger order as memory.
 - Restart re-derives per-actor/global unresolved Signals and current binding Directives from immutable records and call ordering; it rebuilds no inbox, acknowledgement state, notifier, or retry queue.
 - When an authorized caller explicitly inspects and reports a missing runtime handle, Scribe records an `unknown` observation audit event; Scribe never polls or refreshes runtime state itself.
 - Migrations are ordered, transactional where SQLite permits, and backed up before destructive transforms.
@@ -224,7 +232,10 @@ suite covers every port method, including profile lifecycle, clock-driven
 expiry and stale fencing, response linkage, response-bearing abort refusals,
 the explicit and decision-driven terminal-action paths, typed audit lineage,
 derived unresolved/pending queries, runtime associations, and reconciliation
-receipts. `SqliteState` invokes this same suite and a portable restart suite.
+receipts, including only-`Applied` receipt validation, earliest-attempt recovery
+candidates, and exact-Assignment causal supersession. `SqliteState` invokes this
+same suite and a portable restart suite that verifies those derivations survive
+reconstruction from relational rows.
 Every future persisted state family or table must add its restart probe in the
 same change so delta completeness remains an enforced property rather than an
 assumption.

@@ -134,9 +134,9 @@ where
         let successful = ApplicationAttempt {
             id: op("app-restart-success"),
             target: op("op-contract-open"),
-            outcome: ApplicationOutcome::EffectAlreadyPresent {
-                status: WorkStatus::InProgress,
-                revision: revision('9'),
+            outcome: ApplicationOutcome::Applied {
+                before: revision('e'),
+                after: revision('9'),
             },
         };
         assert_eq!(
@@ -273,6 +273,188 @@ where
             .expect("unresolved derivation reloads")
             .contains(&pause),
         "the reloaded terminal response action discharges Pause"
+    );
+
+    restart_preserves_application_derivations(&build);
+}
+
+fn restart_preserves_application_derivations<H: RestartStateContractHarness>(
+    build: &impl Fn(Timestamp) -> H,
+) {
+    let mut harness = build(Timestamp(50));
+    let first_applied = ApplicationAttempt {
+        id: op("zz-restart-applied-first"),
+        target: op("op-contract-open"),
+        outcome: ApplicationOutcome::Applied {
+            before: revision('e'),
+            after: revision('7'),
+        },
+    };
+    let second_applied = ApplicationAttempt {
+        id: op("aa-restart-applied-later"),
+        target: op("op-contract-open"),
+        outcome: ApplicationOutcome::Applied {
+            before: revision('7'),
+            after: revision('8'),
+        },
+    };
+    let superseded_target = op("op-restart-superseded-open");
+    let superseding_operation = op("op-restart-superseding-close");
+
+    {
+        let port = harness.port();
+        open(port);
+        for attempt in [
+            ApplicationAttempt {
+                id: op("app-restart-found-present"),
+                target: op("op-contract-open"),
+                outcome: ApplicationOutcome::FoundPresent {
+                    status: WorkStatus::InProgress,
+                    revision: revision('5'),
+                },
+            },
+            ApplicationAttempt {
+                id: op("app-restart-observed-ambiguous"),
+                target: op("op-contract-open"),
+                outcome: ApplicationOutcome::ObservedAfterAmbiguous {
+                    status: WorkStatus::InProgress,
+                    revision: revision('6'),
+                },
+            },
+            ApplicationAttempt {
+                id: op("app-restart-failed-derivation"),
+                target: op("op-contract-open"),
+                outcome: ApplicationOutcome::Failed {
+                    error: WorkError::Busy,
+                },
+            },
+            ApplicationAttempt {
+                id: op("app-restart-ambiguous"),
+                target: op("op-contract-open"),
+                outcome: ApplicationOutcome::Ambiguous,
+            },
+            first_applied.clone(),
+            second_applied.clone(),
+        ] {
+            assert_eq!(
+                port.record_application_attempt(&attempt),
+                Ok(StateApplied::Applied)
+            );
+        }
+
+        let mut superseded_opening = opening_for(
+            "asg-restart-superseded",
+            "attempt-restart-superseded",
+            "cred-restart-superseded",
+            superseded_target.as_str(),
+        );
+        superseded_opening.assignment.bead = opening().assignment.bead;
+        assert_eq!(
+            port.open_assignment(&superseded_opening),
+            Ok(StateApplied::Applied)
+        );
+        assert_eq!(
+            port.record_application_attempt(&ApplicationAttempt {
+                id: op("app-restart-superseded-applied"),
+                target: superseded_target.clone(),
+                outcome: ApplicationOutcome::Applied {
+                    before: revision('e'),
+                    after: revision('9'),
+                },
+            }),
+            Ok(StateApplied::Applied)
+        );
+        assert_eq!(
+            port.record_decision(&DecisionRecord {
+                operation: superseding_operation.clone(),
+                assignment: superseded_opening.assignment.id,
+                authority: lead_authority("state:cancel"),
+                kind: DecisionKind::Cancel {
+                    reason: reason("restart supersession fixture"),
+                },
+                resolves: None,
+            }),
+            Ok(StateApplied::Applied)
+        );
+    }
+
+    let pending_before = harness
+        .port()
+        .pending_applications()
+        .expect("pending derivation succeeds before restart");
+    let superseded_before = harness
+        .port()
+        .superseded_applications()
+        .expect("superseded derivation succeeds before restart");
+    let audit_before = harness
+        .port()
+        .audit_events(&AuditQuery::default())
+        .expect("application provenance audit succeeds before restart");
+    assert_eq!(
+        pending_before[0].receipt_candidate,
+        Some(ReceiptCandidate {
+            attempt: first_applied.id.clone(),
+            after: revision('7'),
+        }),
+        "the earliest Ledger-order Applied attempt is the recovery basis"
+    );
+    assert_eq!(superseded_before.len(), 1);
+    assert_eq!(
+        superseded_before[0].application.operation,
+        superseded_target
+    );
+    assert_eq!(
+        superseded_before[0].application.receipt_candidate, None,
+        "supersession outranks an otherwise recoverable receipt candidate"
+    );
+    assert_eq!(superseded_before[0].superseded_by, superseding_operation);
+
+    harness.restart();
+    assert_eq!(
+        harness
+            .port()
+            .pending_applications()
+            .expect("pending derivation reloads"),
+        pending_before
+    );
+    assert_eq!(
+        harness
+            .port()
+            .superseded_applications()
+            .expect("superseded derivation reloads"),
+        superseded_before
+    );
+    assert_eq!(
+        harness
+            .port()
+            .audit_events(&AuditQuery::default())
+            .expect("application provenance audit reloads"),
+        audit_before
+    );
+
+    assert_eq!(
+        harness
+            .port()
+            .record_application_receipt(&ApplicationReceipt {
+                target: first_applied.target,
+                attempt: first_applied.id,
+                after: revision('7'),
+            }),
+        Ok(StateApplied::Applied)
+    );
+    harness.restart();
+    let pending_after_receipt = harness
+        .port()
+        .pending_applications()
+        .expect("recovered receipt reloads");
+    assert_eq!(pending_after_receipt.len(), 1);
+    assert_eq!(pending_after_receipt[0].operation, superseding_operation);
+    assert_eq!(
+        harness
+            .port()
+            .superseded_applications()
+            .expect("supersession reloads after unrelated receipt"),
+        superseded_before
     );
 }
 
@@ -639,6 +821,7 @@ fn opening_is_atomic_idempotent_and_queryable<H: StateContractHarness>(
     assert_eq!(pending[0].operation, op("op-contract-open"));
     assert_eq!(pending[0].projection, WorkProjection::MarkInProgress);
     assert_eq!(pending[0].authorized_revision, Some(revision('e')));
+    assert_eq!(pending[0].receipt_candidate, None);
 }
 
 fn refused_opening_claims_nothing<H: StateContractHarness>(build: &impl Fn(Timestamp) -> H) {
@@ -2424,8 +2607,41 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
         ordering.open_assignment(&late_key_opening),
         Ok(StateApplied::Applied)
     );
-    let early_key_cancel = DecisionRecord {
-        operation: op("aa-contract-cancel"),
+    let mut other_opening = opening_for(
+        "asg-contract-other",
+        "attempt-contract-other",
+        "cred-contract-other",
+        "yy-contract-open-other",
+    );
+    other_opening.assignment.bead = late_key_opening.assignment.bead.clone();
+    assert_eq!(
+        ordering.open_assignment(&other_opening),
+        Ok(StateApplied::Applied)
+    );
+    let superseded_applied = ApplicationAttempt {
+        id: op("app-contract-superseded-applied"),
+        target: late_key_opening.authorizing.operation.clone(),
+        outcome: ApplicationOutcome::Applied {
+            before: revision('e'),
+            after: revision('6'),
+        },
+    };
+    assert_eq!(
+        ordering.record_application_attempt(&superseded_applied),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        ordering
+            .pending_applications()
+            .expect("pending query succeeds")[0]
+            .receipt_candidate,
+        Some(ReceiptCandidate {
+            attempt: superseded_applied.id,
+            after: revision('6'),
+        })
+    );
+    let first_cancel = DecisionRecord {
+        operation: op("zz-contract-cancel-first"),
         assignment: assignment_id(),
         authority: lead_authority("state:cancel"),
         kind: DecisionKind::Cancel {
@@ -2434,16 +2650,16 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
         resolves: None,
     };
     assert_eq!(
-        ordering.record_decision(&early_key_cancel),
+        ordering.record_decision(&first_cancel),
         Ok(StateApplied::Applied)
     );
     let ordered = ordering
         .pending_applications()
         .expect("pending query succeeds");
     assert_eq!(ordered.len(), 2);
-    assert_eq!(ordered[0].operation, op("zz-contract-open"));
+    assert_eq!(ordered[0].operation, op("yy-contract-open-other"));
     assert_eq!(ordered[0].projection, WorkProjection::MarkInProgress);
-    assert_eq!(ordered[1].operation, op("aa-contract-cancel"));
+    assert_eq!(ordered[1].operation, first_cancel.operation);
     assert_eq!(
         ordered[1].projection,
         WorkProjection::Close {
@@ -2452,6 +2668,49 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
     );
     assert_eq!(ordered[1].authorized_revision, None);
     assert!(ordered[0].committed_at < ordered[1].committed_at);
+    let superseded = ordering
+        .superseded_applications()
+        .expect("superseded query succeeds");
+    assert_eq!(superseded.len(), 1);
+    assert_eq!(superseded[0].application.operation, op("zz-contract-open"));
+    assert_eq!(superseded[0].superseded_by, first_cancel.operation);
+    assert_eq!(superseded[0].application.receipt_candidate, None);
+
+    let second_cancel = DecisionRecord {
+        operation: op("aa-contract-cancel-second"),
+        assignment: other_opening.assignment.id,
+        authority: lead_authority("state:cancel"),
+        kind: DecisionKind::Cancel {
+            reason: reason("other assignment became obsolete"),
+        },
+        resolves: None,
+    };
+    assert_eq!(
+        ordering.record_decision(&second_cancel),
+        Ok(StateApplied::Applied)
+    );
+    let ordered = ordering
+        .pending_applications()
+        .expect("pending query succeeds");
+    assert_eq!(ordered.len(), 2);
+    assert_eq!(ordered[0].operation, first_cancel.operation);
+    assert_eq!(ordered[1].operation, second_cancel.operation);
+    assert!(ordered[0].committed_at < ordered[1].committed_at);
+    let superseded = ordering
+        .superseded_applications()
+        .expect("superseded query succeeds");
+    assert_eq!(superseded.len(), 2);
+    assert_eq!(superseded[0].application.operation, op("zz-contract-open"));
+    assert_eq!(
+        superseded[1].application.operation,
+        op("yy-contract-open-other")
+    );
+    assert_eq!(superseded[0].superseded_by, first_cancel.operation);
+    assert_eq!(superseded[1].superseded_by, second_cancel.operation);
+    assert!(
+        superseded[0].application.committed_at < superseded[1].application.committed_at,
+        "the derived superseded view follows Ledger order rather than operation-key order"
+    );
 
     let harness = build(Timestamp(50));
     let port = harness.port();
@@ -2512,8 +2771,80 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
         1
     );
 
+    let found = ApplicationAttempt {
+        id: op("app-found-present"),
+        target: target.clone(),
+        outcome: ApplicationOutcome::FoundPresent {
+            status: WorkStatus::InProgress,
+            revision: revision('4'),
+        },
+    };
+    assert_eq!(
+        port.record_application_attempt(&found),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.record_application_receipt(&ApplicationReceipt {
+            target: target.clone(),
+            attempt: found.id,
+            after: revision('4'),
+        }),
+        Err(StateError::IncoherentBundle),
+        "matching facts found before submission are not receipt-eligible"
+    );
+
+    let observed = ApplicationAttempt {
+        id: op("app-observed-after-ambiguous"),
+        target: target.clone(),
+        outcome: ApplicationOutcome::ObservedAfterAmbiguous {
+            status: WorkStatus::InProgress,
+            revision: revision('5'),
+        },
+    };
+    assert_eq!(
+        port.record_application_attempt(&observed),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.record_application_receipt(&ApplicationReceipt {
+            target: target.clone(),
+            attempt: observed.id,
+            after: revision('5'),
+        }),
+        Err(StateError::IncoherentBundle),
+        "a satisfying post-ambiguity observation is not receipt-eligible"
+    );
+    assert_eq!(
+        port.pending_applications().expect("query succeeds")[0].receipt_candidate,
+        None,
+        "only Applied attempts can become recovery candidates"
+    );
+
+    let ambiguous = ApplicationAttempt {
+        id: op("app-ambiguous"),
+        target: target.clone(),
+        outcome: ApplicationOutcome::Ambiguous,
+    };
+    assert_eq!(
+        port.record_application_attempt(&ambiguous),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.record_application_receipt(&ApplicationReceipt {
+            target: target.clone(),
+            attempt: ambiguous.id,
+            after: revision('6'),
+        }),
+        Err(StateError::IncoherentBundle),
+        "an attempt with no provider conclusion is not receipt-eligible"
+    );
+    assert_eq!(
+        port.pending_applications().expect("query succeeds")[0].receipt_candidate,
+        None
+    );
+
     let successful = ApplicationAttempt {
-        id: op("app-success"),
+        id: op("zz-app-success-first"),
         target: target.clone(),
         outcome: ApplicationOutcome::Applied {
             before: revision('e'),
@@ -2523,6 +2854,42 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
     assert_eq!(
         port.record_application_attempt(&successful),
         Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.pending_applications().expect("query succeeds")[0].receipt_candidate,
+        Some(ReceiptCandidate {
+            attempt: successful.id.clone(),
+            after: revision('9'),
+        })
+    );
+    let later_success = ApplicationAttempt {
+        id: op("aa-app-success-later"),
+        target: target.clone(),
+        outcome: ApplicationOutcome::Applied {
+            before: revision('9'),
+            after: revision('8'),
+        },
+    };
+    assert_eq!(
+        port.record_application_attempt(&later_success),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.pending_applications().expect("query succeeds")[0].receipt_candidate,
+        Some(ReceiptCandidate {
+            attempt: successful.id.clone(),
+            after: revision('9'),
+        }),
+        "later Applied history never rewrites the earliest recovery basis"
+    );
+    assert_eq!(
+        port.record_application_receipt(&ApplicationReceipt {
+            target: target.clone(),
+            attempt: successful.id.clone(),
+            after: revision('8'),
+        }),
+        Err(StateError::IncoherentBundle),
+        "an Applied receipt must still name its exact after revision"
     );
     let receipt = ApplicationReceipt {
         target,
