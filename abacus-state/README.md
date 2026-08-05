@@ -2,10 +2,12 @@
 
 Status: migration foundation landed (`ABACUS-9NH.7`, commit `6e91149`) —
 transactional SQLite schema v1/v2 under `src/migrations.rs` with WAL and
-busy-timeout configuration, exported from `src/lib.rs`. Scribe itself
-(process, socket transport, client/server, lease and Ledger operations)
-is not yet implemented; everything below describing those remains a
-design contract.
+busy-timeout configuration. `ABACUS-9NH.11` adds the public, empty-state
+`InMemoryState` and the portable `run_workflow_state_suite`; both consume an
+injected core `ClockPort`, so lease behavior is hermetic and shared with the
+future SQLite implementation. Scribe itself (process, socket transport,
+client/server, and SQLite-backed Ledger operations) is not yet implemented;
+everything below describing those remains a design contract.
 
 ## Purpose
 
@@ -200,6 +202,21 @@ Canonical `br` fields are not copied into mutable state. An audit record may sto
 Database schema changes do not automatically require work or runtime tests. Only a changed public outcome creates downstream validation.
 
 ## Test contract
+
+`contract::run_workflow_state_suite` is the provider-independent behavioral
+gate for every `WorkflowStatePort` implementation. Its factory returns an
+empty state plus a suite-controlled clock; assertions use only the public port
+and clock control, never implementation internals or pre-seeded answers. The
+suite covers every port method, including profile lifecycle, clock-driven
+expiry and stale fencing, response linkage, response-bearing abort refusals,
+derived unresolved/pending queries, runtime associations, and reconciliation
+receipts. The future SQLite fixture must invoke this same suite.
+
+The state crate's `InMemoryState` is the canonical behavioral fake for
+cross-module use-case tests. Core retains its seam-local `FakeState` because
+the dependency direction prevents core from importing this crate; any future
+behavioral divergence found between those two fakes is a defect to record and
+resolve, not an accepted alternate contract.
 
 Default tests use temporary Git common directories, sockets, and SQLite files. They cover:
 

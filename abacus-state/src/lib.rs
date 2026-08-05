@@ -9,15 +9,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod contract;
+mod memory;
 mod migrations;
 
+pub use memory::{InMemoryState, ManualClock};
 pub use migrations::{MigrationError, MigrationReport, apply_migrations, latest_schema_version};
-
-#[cfg(test)]
-mod tests {
-    // Scaffold placeholder proving the per-module hermetic test target
-    // (`cargo test -p abacus-state`) exists and runs. Replaced by real
-    // persistence tests as ABACUS-9NH.7 through .11 land.
-    #[test]
-    fn hermetic_test_target_runs() {}
-}
