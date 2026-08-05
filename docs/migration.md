@@ -295,6 +295,8 @@ The migration must not reproduce SABLE's validation coupling.
 8. If a ported behavior requires tests in three unrelated modules, reconsider its owner or interface before proceeding.
 9. Record a baseline for every module and reject unexplained test-runtime growth.
 10. A breaking module interface or new lateral dependency requires an ADR.
+11. **Phase-gate budget checkpoint (operator-ratified 2026-08-05).** Every phase acceptance refreshes `docs/test-baselines.md` with the same commands under broadly comparable machine conditions and compares against the declared budgets (core under 5 seconds; adapter, state, work, runtime, and CLI module suites under 15 seconds; the full hermetic gate under 90 seconds). A breached budget is answered structurally — remove redundant tests, repair the module boundary, split the module, or move live/provider work out of the default lane — never with a test-selection subsystem that lets the underlying suite keep growing.
+12. **Phase-gate core-change log (operator-ratified 2026-08-05).** Every phase acceptance records the `abacus-core` changes landed since the prior gate with their cause: what changed (vocabulary, invariants, or only interface expressibility), why, the crates affected, and whether the trigger could reasonably have stayed outside core. Elevated C3 activity while the kernel seams are still forming is expected; recurring feature-driven core change after Phase 2 declares the execution kernel stable is the alarm this log exists to catch.
 
 ## Parallel operation with legacy SABLE
 

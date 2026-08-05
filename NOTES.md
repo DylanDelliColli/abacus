@@ -1,5 +1,16 @@
 # ABACUS build notes
 
+## 2026-08-05 — external adversarial review adoptions (operator-ratified)
+
+Two rounds of adversarial review from the legacy SABLE repository assessed the ABACUS build; the operator ratified all four resulting proposals, with the reviewer's second-round guardrails incorporated. Records landed alongside this entry:
+
+1. **Hermetic vertical journey** (`abacus-3ju`, blocked on `gyh.1`; the one-time live pilot is `abacus-2is`, blocked on `3ju`+`omw.2`; the planning/delivery exams are `abacus-3tq`, deferred): after `9nh.11` and `gyh.1`, drive ready→assign→launch→report→evidence→handoff→accept through PRODUCTION composition wiring over the canonical fakes. Exactly four paths (happy; interruption/stale-attempt; directive-or-abort; acceptance/application-ambiguity); module suites keep combinatorics; a dedicated dev-only integration crate so no production crate gains lateral deps. Separately, ONE minimal live-provider vertical pilot before interface freeze, recorded in `docs/compatibility/` as architectural evidence — not a recurring lane.
+2. **Liveness-is-modular boundary reading** appended to CONTEXT I12: kernel correctness never depends on a recurring process; an authorized operations module may later provide liveness whose absence or failure delays progress but can never corrupt or invent workflow state; it arrives by its own ADR. CONTEXT is normative — this clarification is operator-ratified and awaits Codex cross-review at landing.
+3. **Phase-gate checkpoints** added as migration rules 11 (budget refresh with structural-only responses; never a test-selection subsystem) and 12 (core-change causality log: vocabulary vs invariants vs expressibility, affected crates, could-it-have-stayed-outside; the alarm is recurring feature-driven core change after Phase 2 declares the kernel stable).
+4. **Planning/delivery architectural exams** (deferred bead `abacus-3tq`): planning consumes existing facade state by default; new durable planning facts require a named owner and an ADR — a constraint, not an absolute ban; planning never alters execution lifecycle semantics for convenience. Delivery consumes accepted Handoffs and may own its own publication lifecycle states (publication-attempted/integrated/deployed) but never redefines Acceptance.
+
+The reviewer's falsifiable claims stand as the build's success criteria: modules compose; core stabilizes after Phase 2; optional liveness never becomes kernel correctness; planning and delivery extend rather than rewrite execution; verification time stays bounded as capabilities grow.
+
 ## 2026-08-04/05 — overnight log (Claude + Codex autonomous)
 
 Running summary for the operator; beads remain authoritative. **MORNING** marks items needing an operator decision.
