@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use abacus_core::ports::WorkError;
-use abacus_core::{ScopeKey, ScopeMap, ScopeValue};
+use abacus_core::{ContentHash, ScopeKey, ScopeMap, ScopeValue};
 
 /// Provider whole-label ceiling for pinned `br` v0.1.45.
 ///
@@ -135,9 +135,8 @@ pub fn covered_scope_labels<'a>(
 /// Length-prefixed framing, not a delimiter join: a separator-joined
 /// encoding lets two different label sets collide (`["a:b", "c:d"]` vs
 /// `["a:b\nc:d"]`), which would let label drift slip past a hash
-/// recheck. The digest primitive itself is applied by the caller — see
-/// the module note in `README.md` — so this crate defines WHAT is
-/// hashed without hand-rolling a hash.
+/// recheck. This defines WHAT is hashed; [`bead_content_hash`] binds
+/// HOW, and nothing here hand-rolls a hash.
 pub fn scope_label_preimage<'a>(
     declared: &[ScopeKey],
     raw_labels: impl IntoIterator<Item = &'a str>,
@@ -151,6 +150,30 @@ pub fn scope_label_preimage<'a>(
         out.extend_from_slice(label.as_bytes());
     }
     out
+}
+
+/// The canonical bead-content hash: SHA-256 over
+/// [`scope_label_preimage`], rendered as the 64-hex [`ContentHash`]
+/// core requires for assignment and acceptance rechecks.
+///
+/// This is the ONE digest path (ABACUS-omw.8, operator-authorized
+/// `sha2` dependency): the pre-image defines WHAT is hashed, this
+/// binds HOW, and hand-rolled cryptography remains forbidden.
+pub fn bead_content_hash<'a>(
+    declared: &[ScopeKey],
+    raw_labels: impl IntoIterator<Item = &'a str>,
+) -> ContentHash {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let digest = Sha256::digest(scope_label_preimage(declared, raw_labels));
+    let hex = digest
+        .iter()
+        .fold(String::with_capacity(digest.len() * 2), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing hex to a String cannot fail");
+            hex
+        });
+    ContentHash::new(&hex).expect("a SHA-256 digest is always 64 lowercase hex characters")
 }
 
 #[cfg(test)]
@@ -395,6 +418,47 @@ mod tests {
         assert_ne!(
             split, joined,
             "length-prefixed framing must prevent a separator collision"
+        );
+    }
+
+    #[test]
+    fn the_digest_is_canonical_sha256_of_the_preimage() {
+        // Known-answer vector: an empty covered set's pre-image is
+        // exactly eight zero bytes (the u64 count), independently
+        // computed: sha256(00 00 00 00 00 00 00 00).
+        assert_eq!(
+            bead_content_hash(&keys(&["area"]), []).as_str(),
+            "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+        );
+    }
+
+    #[test]
+    fn covered_label_drift_changes_the_content_hash() {
+        let declared = keys(&["area"]);
+        assert_ne!(
+            bead_content_hash(&declared, ["area:auth"]),
+            bead_content_hash(&declared, ["area:billing"]),
+            "declared-key label drift must fail the recheck"
+        );
+    }
+
+    #[test]
+    fn provider_ordering_never_changes_the_content_hash() {
+        let declared = keys(&["area", "epic"]);
+        assert_eq!(
+            bead_content_hash(&declared, ["area:auth", "epic:login"]),
+            bead_content_hash(&declared, ["epic:login", "area:auth"]),
+            "the provider promises no ordering, so order is not content"
+        );
+    }
+
+    #[test]
+    fn ordinary_label_churn_never_changes_the_content_hash() {
+        let declared = keys(&["area"]);
+        assert_eq!(
+            bead_content_hash(&declared, ["area:auth", "note:one"]),
+            bead_content_hash(&declared, ["area:auth", "note:two", "misc"]),
+            "labels outside the declared keys are not content"
         );
     }
 }

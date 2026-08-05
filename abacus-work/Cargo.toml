@@ -9,3 +9,6 @@ abacus-core = { path = "../abacus-core" }
 # Scope: this crate only; abacus-core stays dependency-free.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Operator-authorized 2026-08-05 for the bead-content digest (omw.8):
+# vetted RustCrypto SHA-256; hand-rolled cryptography is forbidden.
+sha2 = "0.10"
