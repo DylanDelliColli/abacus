@@ -278,28 +278,88 @@ pub fn fallback_order(ready: &[BeadSnapshot]) -> Vec<BeadId> {
     beads.into_iter().map(|b| b.id.clone()).collect()
 }
 
-/// The single advice gate (core invariant 6): accept only advice bound
-/// to the current revision whose order is an exact permutation of the
-/// eligible set; otherwise the deterministic fallback.
-pub fn apply_advice(
+/// Why the single advice gate rejected an answered advice outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdviceRejection {
+    /// Advice bound to a revision other than the bracketed read.
+    StaleBinding,
+    /// Not an exact permutation of the eligible set.
+    NotCovering,
+}
+
+/// How an advice solicitation was disposed of by the single advice
+/// gate. Degradation and rejection are noted outcomes carried WITH the
+/// fallback order (CONTEXT: "the degradation is noted in output") —
+/// never errors, and never silently erased.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdviceDisposition {
+    /// The advisor's permutation governs the order.
+    Followed,
+    /// The advisor itself degraded; the deterministic fallback governs.
+    Degraded { reason: AdviceDegradation },
+    /// The advisor answered but the gate rejected the answer; the
+    /// deterministic fallback governs.
+    Rejected { reason: AdviceRejection },
+}
+
+/// The single advice gate (core invariant 6), with its disposition:
+/// accept only advice bound to the current revision whose order is an
+/// exact permutation of the eligible set; otherwise the deterministic
+/// fallback, with the reason noted.
+pub fn appraise_advice(
     ready: &[BeadSnapshot],
     outcome: &AdviceOutcome,
     current: &WorkRevision,
-) -> Vec<BeadId> {
+) -> (Vec<BeadId>, AdviceDisposition) {
     let AdviceOutcome::Advice { order, bound_to } = outcome else {
-        return fallback_order(ready);
+        let reason = match outcome {
+            AdviceOutcome::Degraded { reason } => *reason,
+            AdviceOutcome::Advice { .. } => unreachable!("matched above"),
+        };
+        return (
+            fallback_order(ready),
+            AdviceDisposition::Degraded { reason },
+        );
     };
-    if bound_to != current || order.len() != ready.len() {
-        return fallback_order(ready);
+    if bound_to != current {
+        return (
+            fallback_order(ready),
+            AdviceDisposition::Rejected {
+                reason: AdviceRejection::StaleBinding,
+            },
+        );
+    }
+    if order.len() != ready.len() {
+        return (
+            fallback_order(ready),
+            AdviceDisposition::Rejected {
+                reason: AdviceRejection::NotCovering,
+            },
+        );
     }
     let mut expected: Vec<&str> = ready.iter().map(|b| b.id.as_str()).collect();
     let mut proposed: Vec<&str> = order.iter().map(|b| b.as_str()).collect();
     expected.sort_unstable();
     proposed.sort_unstable();
     if expected != proposed {
-        return fallback_order(ready);
+        return (
+            fallback_order(ready),
+            AdviceDisposition::Rejected {
+                reason: AdviceRejection::NotCovering,
+            },
+        );
     }
-    order.clone()
+    (order.clone(), AdviceDisposition::Followed)
+}
+
+/// The order alone, for callers with no disposition to carry. Same
+/// gate — this delegates to [`appraise_advice`].
+pub fn apply_advice(
+    ready: &[BeadSnapshot],
+    outcome: &AdviceOutcome,
+    current: &WorkRevision,
+) -> Vec<BeadId> {
+    appraise_advice(ready, outcome, current).0
 }
 
 // ---------------------------------------------------------------------------

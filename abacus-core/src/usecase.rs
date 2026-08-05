@@ -12,15 +12,18 @@
 //! drives them. Neither re-implements them.
 
 use crate::ports::{
-    ApplicationAttempt, ApplicationOutcome, ApplicationReceipt, AssignmentOpening, BeadSnapshot,
-    CloseReason, DecisionRecord, EphemeralLaunchSecret, EvidenceOutcome, FencedAction,
-    FencedResponse, HandoffRecord, LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec,
-    LaunchSubject, MutationOutcome, ObservedCloseReason, PendingApplication, ReportOutcome,
-    RuntimeError, RuntimePort, StateApplied, StateError, SubmissionOutcome, WorkAdvicePort,
-    WorkError, WorkGraphPort, WorkProjection, WorkRevision, WorkStatus, WorkflowStatePort,
-    apply_advice,
+    AdviceDisposition, ApplicationAttempt, ApplicationOutcome, ApplicationReceipt,
+    AssignmentOpening, BeadSnapshot, CloseReason, DecisionKind, DecisionReason, DecisionRecord,
+    EphemeralLaunchSecret, EvidenceOutcome, FencedAction, FencedResponse, HandoffRecord,
+    LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec, LaunchSubject, MutationOutcome,
+    ObservedCloseReason, PendingApplication, ReportOutcome, RuntimeError, RuntimePort,
+    StateApplied, StateError, SubmissionOutcome, WorkAdvicePort, WorkError, WorkGraphPort,
+    WorkProjection, WorkRevision, WorkStatus, WorkflowStatePort, appraise_advice,
 };
-use crate::{BeadId, Evidence, OperationId, SignalDraft};
+use crate::{
+    AssignmentId, AuthoritySnapshot, BeadId, Evidence, HandoffId, OperationId, SignalDraft,
+    SignalId,
+};
 
 /// Why a committed decision's provider projection is not yet
 /// confirmed. Every variant leaves the projection in the derived
@@ -77,7 +80,16 @@ pub struct AcceptanceOutcome {
 /// confirmed success also records the receipt that clears the pending
 /// set. An ambiguous outcome records the attempt and stops — the
 /// caller reconciles explicitly.
-pub fn project_pending<S, W>(
+///
+/// Deliberately NOT public: every `PendingApplication` fed here must be
+/// state-derived. A caller-constructed value could pair a real target
+/// operation with a substituted bead, projection, or revision — the
+/// substituted bead would be mutated while the attempt and receipt
+/// attest against the real target, and Scribe's receipt validation
+/// (target/attempt/after) cannot see the substitution. Public callers
+/// name a target operation instead ([`redrive_pending`]) and the
+/// Ledger's own record is fetched.
+fn project_pending<S, W>(
     state: &S,
     work: &W,
     pending: &PendingApplication,
@@ -177,8 +189,27 @@ where
     Ok(ProjectionOutcome::Projected { after })
 }
 
-/// The Acceptance saga: commit the authorizing decision, then project
-/// it onto the work graph under its own operation identity.
+/// The typed authorizing input of the Acceptance saga: an Accept and
+/// nothing else. Mirrors [`crate::ports::AssignDecision`]'s rule (S2):
+/// a generic decision cannot invoke a saga whose contract is
+/// Acceptance — Reject, Cancel, Revoke, Reclaim, and Transfer are
+/// recorded through the state port directly and are structurally
+/// unrepresentable here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceDecision {
+    pub operation: OperationId,
+    pub assignment: AssignmentId,
+    pub authority: AuthoritySnapshot,
+    /// The immutable Handoff this acceptance decides; the decided
+    /// Attempt is derived transactionally from it.
+    pub handoff: HandoffId,
+    pub reason: DecisionReason,
+    /// A Signal this decision resolves, if any.
+    pub resolves: Option<SignalId>,
+}
+
+/// The Acceptance saga: commit the authorizing Accept decision, then
+/// project it onto the work graph under its own operation identity.
 ///
 /// The decision is committed FIRST and independently: it authorizes
 /// the provider mutation, and a projection failure never unwinds it
@@ -188,14 +219,24 @@ where
 pub fn accept_handoff<S, W>(
     state: &S,
     work: &W,
-    decision: &DecisionRecord,
+    decision: &AcceptanceDecision,
     attempt_operation: &OperationId,
 ) -> Result<AcceptanceOutcome, StateError>
 where
     S: WorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
-    let applied = state.record_decision(decision)?;
+    let record = DecisionRecord {
+        operation: decision.operation.clone(),
+        assignment: decision.assignment.clone(),
+        authority: decision.authority.clone(),
+        kind: DecisionKind::Accept {
+            handoff: decision.handoff.clone(),
+            reason: decision.reason.clone(),
+        },
+        resolves: decision.resolves.clone(),
+    };
+    let applied = state.record_decision(&record)?;
     let pending = state
         .pending_applications()?
         .into_iter()
@@ -258,8 +299,51 @@ where
     })
 }
 
-/// The advice-gated ready selection: the bracketed ready snapshot plus
-/// the order composition dispatches in.
+/// Outcome of explicitly redriving ONE pending projection by its
+/// authorizing operation identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedriveOutcome {
+    /// No projection with that identity is pending: it was never
+    /// committed, or it already earned its receipt. Nothing was
+    /// mutated or recorded.
+    NotPending,
+    Driven(ProjectionOutcome),
+}
+
+/// Explicitly redrive one pending projection, named by its authorizing
+/// operation identity.
+///
+/// The Ledger's own pending record is fetched and driven — the caller
+/// supplies no projection facts, so a substituted bead, projection, or
+/// revision is unrepresentable at this surface.
+pub fn redrive_pending<S, W>(
+    state: &S,
+    work: &W,
+    target: &OperationId,
+    attempt_operation: &OperationId,
+) -> Result<RedriveOutcome, StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+    W: WorkGraphPort + ?Sized,
+{
+    let pending = state
+        .pending_applications()?
+        .into_iter()
+        .find(|candidate| candidate.operation == *target);
+    match pending {
+        None => Ok(RedriveOutcome::NotPending),
+        Some(pending) => Ok(RedriveOutcome::Driven(project_pending(
+            state,
+            work,
+            &pending,
+            attempt_operation,
+        )?)),
+    }
+}
+
+/// The advice-gated ready selection: the bracketed ready snapshot, the
+/// order composition dispatches in, and how the advisor's answer was
+/// disposed of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadySelection {
     /// The revision the ready set (and any accepted advice) is bound to.
@@ -269,14 +353,19 @@ pub struct ReadySelection {
     /// exactly covering `ready`; the deterministic fallback otherwise
     /// (core invariant 6 — the single advice gate decides, here).
     pub order: Vec<BeadId>,
+    /// The gate's disposition of the advisor's answer. Degradation and
+    /// rejection are noted outcomes, never errors and never erased
+    /// (CONTEXT: "the degradation is noted in output").
+    pub advice: AdviceDisposition,
 }
 
 /// Select ready work: one bracketed read of the ready set, advice
 /// solicited against exactly that revision, and the gate applied.
 ///
 /// Advice is never authoritative and never required (I8): a degraded,
-/// stale, or non-covering answer silently yields the deterministic
-/// fallback order, which is a normal outcome rather than an error.
+/// stale, or non-covering answer yields the deterministic fallback
+/// order with the reason noted in the selection — a normal outcome
+/// rather than an error.
 pub fn select_ready<W, A>(work: &W, advice: &A) -> Result<ReadySelection, WorkError>
 where
     W: WorkGraphPort + ?Sized,
@@ -285,36 +374,69 @@ where
     let (revision, ready) = work.ready()?;
     let eligible: Vec<BeadId> = ready.iter().map(|bead| bead.id.clone()).collect();
     let outcome = advice.advise(&revision, &eligible);
-    let order = apply_advice(&ready, &outcome, &revision);
+    let (order, disposition) = appraise_advice(&ready, &outcome, &revision);
     Ok(ReadySelection {
         revision,
         ready,
         order,
+        advice: disposition,
     })
+}
+
+/// Why an opening bundle was refused BEFORE any state or work
+/// mutation: it is not bound to the ready selection it claims to
+/// realize (architecture §2.4: an Assignment is created from an
+/// ELIGIBLE bead snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignRefusal {
+    /// The opening's bead is not in the selection's ready set.
+    BeadNotReady { bead: BeadId },
+    /// The opening's authorized bead revision is not the revision the
+    /// selection was bracketed at.
+    RevisionMismatch {
+        authorized: WorkRevision,
+        selection: WorkRevision,
+    },
+    /// The opening's bead content hash is not the selected snapshot's.
+    ContentHashMismatch { bead: BeadId },
+    /// The opening's scope map is not the selected snapshot's.
+    ScopeMapMismatch { bead: BeadId },
 }
 
 /// Outcome of assigning ready work (architecture §2.4–2.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssignmentOutcome {
-    /// Whether the opening bundle was committed now or was already
-    /// committed by an identical earlier call.
-    pub opening: StateApplied,
-    /// The mark-in-progress projection result, or `None` when no
-    /// pending projection remained (an idempotent replay after the
-    /// original projection already earned its receipt).
-    pub projection: Option<ProjectionOutcome>,
+pub enum AssignmentOutcome {
+    /// Refused before any state or work mutation: the opening is not
+    /// bound to the given ready selection.
+    Refused { refusal: AssignRefusal },
+    /// The opening bundle committed (or was already committed by an
+    /// identical earlier call), and its mark-in-progress projection
+    /// was driven when one remained pending.
+    Opened {
+        opening: StateApplied,
+        /// `None` when no pending projection remained (an idempotent
+        /// replay after the original projection already earned its
+        /// receipt).
+        projection: Option<ProjectionOutcome>,
+    },
 }
 
-/// Assign ready work: commit the opening bundle, then project its
+/// Assign ready work: verify the opening is bound to the given ready
+/// selection, commit the opening bundle, then project its
 /// mark-in-progress onto the work graph under the same authorizing
 /// operation identity.
 ///
-/// Mirrors [`accept_handoff`]: the opening is committed FIRST, and a
-/// projection failure never unwinds it — an unconfirmed projection
-/// stays in the derived pending set for explicit reconciliation.
+/// The binding is verified FIRST, against the exact snapshot the
+/// selection read — bead membership, bracketed revision, content hash,
+/// and scope map — and a mismatch refuses before anything mutates. An
+/// opening for a bead the graph never offered, or carrying facts other
+/// than the snapshot's, must not reach Scribe: Scribe checks bundle
+/// coherence, not readiness. After the commit this mirrors
+/// [`accept_handoff`]: a projection failure never unwinds the opening.
 pub fn assign_ready<S, W>(
     state: &S,
     work: &W,
+    selection: &ReadySelection,
     opening: &AssignmentOpening,
     attempt_operation: &OperationId,
 ) -> Result<AssignmentOutcome, StateError>
@@ -322,6 +444,31 @@ where
     S: WorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
+    let bead = &opening.assignment.bead;
+    let Some(snapshot) = selection.ready.iter().find(|offered| offered.id == *bead) else {
+        return Ok(AssignmentOutcome::Refused {
+            refusal: AssignRefusal::BeadNotReady { bead: bead.clone() },
+        });
+    };
+    if opening.bead_revision != selection.revision {
+        return Ok(AssignmentOutcome::Refused {
+            refusal: AssignRefusal::RevisionMismatch {
+                authorized: opening.bead_revision.clone(),
+                selection: selection.revision.clone(),
+            },
+        });
+    }
+    if opening.assignment.bead_content_hash != snapshot.content_hash {
+        return Ok(AssignmentOutcome::Refused {
+            refusal: AssignRefusal::ContentHashMismatch { bead: bead.clone() },
+        });
+    }
+    if opening.assignment.scope_map != snapshot.scope_map {
+        return Ok(AssignmentOutcome::Refused {
+            refusal: AssignRefusal::ScopeMapMismatch { bead: bead.clone() },
+        });
+    }
+
     let applied = state.open_assignment(opening)?;
     let pending = state
         .pending_applications()?
@@ -331,7 +478,7 @@ where
         None => None,
         Some(pending) => Some(project_pending(state, work, &pending, attempt_operation)?),
     };
-    Ok(AssignmentOutcome {
+    Ok(AssignmentOutcome::Opened {
         opening: applied,
         projection,
     })
@@ -962,6 +1109,31 @@ mod tests {
         }
     }
 
+    /// The selection the `opening()` fixture is honestly bound to.
+    fn matching_selection() -> ReadySelection {
+        ReadySelection {
+            revision: rev('e'),
+            ready: vec![snapshot("ABACUS-usecase.1", 1)],
+            order: vec![bead()],
+            advice: AdviceDisposition::Followed,
+        }
+    }
+
+    fn acceptance_decision() -> AcceptanceDecision {
+        AcceptanceDecision {
+            operation: op("op-accept"),
+            assignment: AssignmentId::new("asg-1").expect("valid assignment"),
+            authority: AuthoritySnapshot {
+                actor: lead_actor(),
+                capability: CapabilityId::new("state:accept").expect("valid capability"),
+                scope: ScopeExpr::Universal,
+            },
+            handoff: HandoffId::new("hnd-1").expect("valid handoff"),
+            reason: DecisionReason::new("verified and accepted").expect("valid reason"),
+            resolves: None,
+        }
+    }
+
     #[derive(Default)]
     struct RecordingState {
         pending: RefCell<Vec<PendingApplication>>,
@@ -1542,6 +1714,7 @@ mod tests {
                 BeadId::new("ABACUS-b.1").expect("valid"),
             ]
         );
+        assert_eq!(selection.advice, AdviceDisposition::Followed);
 
         // Advice was solicited against exactly the bracketed revision
         // and eligible set.
@@ -1576,6 +1749,69 @@ mod tests {
             ],
             "stale advice yields the priority-then-id fallback"
         );
+        assert_eq!(
+            selection.advice,
+            AdviceDisposition::Rejected {
+                reason: AdviceRejection::StaleBinding
+            },
+            "the rejection is noted in the selection, never erased"
+        );
+    }
+
+    #[test]
+    fn selection_notes_advisor_degradation_in_its_output() {
+        let work = ReadyWork {
+            revision: rev('1'),
+            ready: vec![snapshot("ABACUS-b.2", 2), snapshot("ABACUS-b.1", 0)],
+        };
+        let advice = ScriptedAdvice::new(AdviceOutcome::Degraded {
+            reason: AdviceDegradation::Unavailable,
+        });
+
+        let selection = select_ready(&work, &advice).expect("selection runs");
+        assert_eq!(
+            selection.order,
+            vec![
+                BeadId::new("ABACUS-b.1").expect("valid"),
+                BeadId::new("ABACUS-b.2").expect("valid"),
+            ],
+            "an unavailable advisor never blocks: deterministic fallback"
+        );
+        assert_eq!(
+            selection.advice,
+            AdviceDisposition::Degraded {
+                reason: AdviceDegradation::Unavailable
+            }
+        );
+    }
+
+    #[test]
+    fn selection_rejects_advice_that_does_not_cover_the_eligible_set() {
+        let work = ReadyWork {
+            revision: rev('1'),
+            ready: vec![snapshot("ABACUS-b.2", 2), snapshot("ABACUS-b.1", 0)],
+        };
+        // Bound to the right revision, but naming only one of two
+        // eligible beads: not a permutation, so the gate must reject.
+        let advice = ScriptedAdvice::new(AdviceOutcome::Advice {
+            order: vec![BeadId::new("ABACUS-b.2").expect("valid")],
+            bound_to: rev('1'),
+        });
+
+        let selection = select_ready(&work, &advice).expect("selection runs");
+        assert_eq!(
+            selection.order,
+            vec![
+                BeadId::new("ABACUS-b.1").expect("valid"),
+                BeadId::new("ABACUS-b.2").expect("valid"),
+            ]
+        );
+        assert_eq!(
+            selection.advice,
+            AdviceDisposition::Rejected {
+                reason: AdviceRejection::NotCovering
+            }
+        );
     }
 
     #[test]
@@ -1587,12 +1823,20 @@ mod tests {
             summary: "in progress".to_owned(),
         }));
 
-        let outcome =
-            assign_ready(&state, &work, &opening(), &op("app-1")).expect("assignment runs");
-        assert_eq!(outcome.opening, StateApplied::Applied);
+        let outcome = assign_ready(
+            &state,
+            &work,
+            &matching_selection(),
+            &opening(),
+            &op("app-1"),
+        )
+        .expect("assignment runs");
         assert_eq!(
-            outcome.projection,
-            Some(ProjectionOutcome::Projected { after: rev('9') })
+            outcome,
+            AssignmentOutcome::Opened {
+                opening: StateApplied::Applied,
+                projection: Some(ProjectionOutcome::Projected { after: rev('9') }),
+            }
         );
 
         // The opening bundle was committed before any provider
@@ -1611,19 +1855,134 @@ mod tests {
     }
 
     #[test]
+    fn an_opening_for_a_bead_the_graph_never_offered_is_refused() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+        // The selection offers a DIFFERENT bead than the opening names.
+        let selection = ReadySelection {
+            ready: vec![snapshot("ABACUS-other.1", 0)],
+            order: vec![BeadId::new("ABACUS-other.1").expect("valid")],
+            ..matching_selection()
+        };
+
+        let outcome = assign_ready(&state, &work, &selection, &opening(), &op("app-1"))
+            .expect("refusal is in-band");
+        assert_eq!(
+            outcome,
+            AssignmentOutcome::Refused {
+                refusal: AssignRefusal::BeadNotReady { bead: bead() }
+            }
+        );
+        assert!(
+            state.openings.borrow().is_empty(),
+            "a refused opening must never reach Scribe"
+        );
+        assert!(work.marks.borrow().is_empty());
+        assert!(state.attempts.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_opening_authorized_at_a_different_revision_is_refused() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+        let selection = ReadySelection {
+            revision: rev('1'),
+            ..matching_selection()
+        };
+
+        let outcome = assign_ready(&state, &work, &selection, &opening(), &op("app-1"))
+            .expect("refusal is in-band");
+        assert_eq!(
+            outcome,
+            AssignmentOutcome::Refused {
+                refusal: AssignRefusal::RevisionMismatch {
+                    authorized: rev('e'),
+                    selection: rev('1'),
+                }
+            }
+        );
+        assert!(state.openings.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_opening_with_a_forged_content_hash_is_refused() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+        let mut forged = opening();
+        forged.assignment.bead_content_hash = rev('f').0;
+
+        let outcome = assign_ready(&state, &work, &matching_selection(), &forged, &op("app-1"))
+            .expect("refusal is in-band");
+        assert_eq!(
+            outcome,
+            AssignmentOutcome::Refused {
+                refusal: AssignRefusal::ContentHashMismatch { bead: bead() }
+            },
+            "the opening must snapshot the EXACT content the graph offered"
+        );
+        assert!(state.openings.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_opening_with_a_substituted_scope_map_is_refused() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+        let mut forged = opening();
+        forged.assignment.scope_map = ScopeMap::new(vec![(
+            ScopeKey::new("area").expect("valid key"),
+            ScopeValue::new("auth").expect("valid value"),
+        )])
+        .expect("valid scope map");
+
+        let outcome = assign_ready(&state, &work, &matching_selection(), &forged, &op("app-1"))
+            .expect("refusal is in-band");
+        assert_eq!(
+            outcome,
+            AssignmentOutcome::Refused {
+                refusal: AssignRefusal::ScopeMapMismatch { bead: bead() }
+            }
+        );
+        assert!(state.openings.borrow().is_empty());
+    }
+
+    #[test]
     fn an_ambiguous_opening_projection_stays_pending() {
         let state = RecordingState::default();
         let work = ScriptedWork::new(Err(WorkError::AmbiguousOutcome));
 
-        let outcome =
-            assign_ready(&state, &work, &opening(), &op("app-2")).expect("assignment runs");
-        assert_eq!(outcome.opening, StateApplied::Applied);
+        let outcome = assign_ready(
+            &state,
+            &work,
+            &matching_selection(),
+            &opening(),
+            &op("app-2"),
+        )
+        .expect("assignment runs");
         assert_eq!(
-            outcome.projection,
-            Some(ProjectionOutcome::Unresolved {
-                attempt: op("app-2"),
-                reason: ProjectionUnresolved::Ambiguous
-            })
+            outcome,
+            AssignmentOutcome::Opened {
+                opening: StateApplied::Applied,
+                projection: Some(ProjectionOutcome::Unresolved {
+                    attempt: op("app-2"),
+                    reason: ProjectionUnresolved::Ambiguous
+                }),
+            }
         );
         assert!(
             state.receipts.borrow().is_empty(),
@@ -1880,15 +2239,102 @@ mod tests {
             summary: "must not be issued".to_owned(),
         }));
 
-        let outcome =
-            assign_ready(&state, &work, &opening(), &op("app-3")).expect("assignment runs");
-        assert_eq!(outcome.opening, StateApplied::AlreadyApplied);
+        let outcome = assign_ready(
+            &state,
+            &work,
+            &matching_selection(),
+            &opening(),
+            &op("app-3"),
+        )
+        .expect("assignment runs");
         assert_eq!(
-            outcome.projection, None,
+            outcome,
+            AssignmentOutcome::Opened {
+                opening: StateApplied::AlreadyApplied,
+                projection: None,
+            },
             "no pending projection remained, so there is nothing to project"
         );
         assert!(work.marks.borrow().is_empty());
         assert!(work.closes.borrow().is_empty());
         assert!(state.attempts.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_acceptance_saga_commits_an_accept_decision_and_projects_it() {
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending_close());
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "closed".to_owned(),
+        }));
+
+        let outcome =
+            accept_handoff(&state, &work, &acceptance_decision(), &op("app-1")).expect("saga runs");
+        assert_eq!(outcome.decision, StateApplied::Applied);
+        assert_eq!(
+            outcome.projection,
+            Some(ProjectionOutcome::Projected { after: rev('9') })
+        );
+
+        // The recorded decision is structurally an Accept binding the
+        // decided Handoff — no other kind is expressible here.
+        let decisions = state.decisions.borrow();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].operation, op("op-accept"));
+        assert_eq!(
+            decisions[0].kind,
+            DecisionKind::Accept {
+                handoff: HandoffId::new("hnd-1").expect("valid"),
+                reason: DecisionReason::new("verified and accepted").expect("valid"),
+            }
+        );
+    }
+
+    #[test]
+    fn redriving_by_identity_uses_the_ledgers_own_projection_facts() {
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending_close());
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "closed".to_owned(),
+        }));
+
+        let outcome = redrive_pending(&state, &work, &op("op-accept"), &op("app-redrive"))
+            .expect("redrive runs");
+        assert_eq!(
+            outcome,
+            RedriveOutcome::Driven(ProjectionOutcome::Projected { after: rev('9') })
+        );
+
+        // The mutation drove the LEDGER's bead under the LEDGER's
+        // authorizing operation — the caller supplied no projection
+        // facts that could be substituted.
+        let closes = work.closes.borrow();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].0, bead());
+        assert_eq!(closes[0].2, op("op-accept"));
+    }
+
+    #[test]
+    fn redriving_an_unknown_or_receipted_identity_is_not_pending() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+
+        let outcome = redrive_pending(&state, &work, &op("op-unknown"), &op("app-redrive"))
+            .expect("redrive runs");
+        assert_eq!(outcome, RedriveOutcome::NotPending);
+        assert!(work.closes.borrow().is_empty());
+        assert!(work.marks.borrow().is_empty());
+        assert!(
+            state.attempts.borrow().is_empty(),
+            "nothing pending means nothing recorded"
+        );
     }
 }
