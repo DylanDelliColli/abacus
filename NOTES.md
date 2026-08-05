@@ -7,7 +7,7 @@ Running summary for the operator; beads remain authoritative. Items needing an o
 - Ports seam (9NH.5): six adversarial revision rounds complete (R1–R6, R7–R11, S1–S6, then the six integration findings F1–F6 with eight mid-pass refinements). The state seam is now transactional use-case operations with Scribe-allocated ordering, fenced actor-authenticated calls, payload-bearing decisions, and audited submission refusals. 57 core tests; fmt/clippy/test gates all clean. Awaiting pass 4 verdict.
 - 9NH.6 (scope algebra + profile schema) complete on disk since before the goal was set; lands with 9NH.5.
 - OMW and GYH epics carry full decomposition drafts in their design fields, ready to mint when the ports seam passes.
-- ADR-0003 draft complete except the decision section, which waits on Codex's avenue-2 probe (command-scoped host-approved Scribe client).
+- ADR-0003: at revision 5 Proposed — substantive composer/credential/runtime-sideband work post-dates the rev-4 pass; awaiting Codex consolidated verdict, then **MORNING sign-off**.
 - Landing protocol in effect: claims expire 1h after the holder's last git op and auto-transfer on the next attempt; we announce LANDING NOW in-pane, batch, push, alternate. Codex's pile (herdr evidence, providers lock, scribe-socket updates) lands first.
 - **MORNING**: ADR-0003 will need your sign-off as named decider once cross-reviewed; the two upstream Codex feature requests (Linux unix_sockets parity; named-descriptor preservation) need your authorization before anything is filed externally; and the tree-claim hook's project scoping still deserves a permanent fix.
 

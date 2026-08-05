@@ -155,7 +155,7 @@ These are not a generic plugin framework. A port exists only for behavior a core
 10. A named profile can be added or split without changing authority-class enums or lifecycle schemas.
 11. Overlapping exclusive mutation/decision scopes are invalid configuration; shared observation scopes may overlap.
 12. Submission refusal, Handoff Rejection, and Assignment cancellation are distinct outcomes with distinct lifecycle effects.
-13. Attempt retry is an explicit fenced decision-actor action; no transition or timer creates one automatically.
+13. Attempt retry is an explicit fenced decision-actor action; no transition or timer creates one automatically. A retry commits atomically with its successor credential binding (`AttemptOpening`); a credential-dead Attempt is unrepresentable.
 14. Submission refusal produces an auditable outcome even though it creates no Handoff or decision.
 15. Every Signal is append-only, sender-fenced with full actor identity, typed, and bound to a validated workflow subject; no Signal type accepts a subject-free body.
 16. Every fenced worker response mechanically surfaces the Attempt's current binding Directives as a Scribe protocol property, and current Directive policy gates consequential mutations regardless of delivery/read status.

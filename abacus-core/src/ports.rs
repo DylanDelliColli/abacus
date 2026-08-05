@@ -22,7 +22,8 @@ use crate::content::{CommitId, ContentHash, WorkspaceDigest};
 use crate::edit_scope::{EditScope, WorkPath};
 use crate::evidence::{AcceptancePolicy, Evidence, PairRefusal, PathSet};
 use crate::id::{
-    ActorId, AssignmentId, AttemptId, BeadId, HandoffId, OperationId, ProfileName, SignalId,
+    ActorId, AssignmentId, AttemptId, BeadId, CredentialId, HandoffId, OperationId, ProfileName,
+    SignalId,
 };
 use crate::lease::{FencingToken, Lease, Timestamp};
 use crate::lifecycle::{AssignmentState, AttemptState};
@@ -481,14 +482,75 @@ pub struct DecisionRecord {
     pub resolves: Option<SignalId>,
 }
 
+/// Caller-provisioned credential binding (ADR-0003 integration): the
+/// caller/CLI generates the CSPRNG secret, retains plaintext
+/// transiently for ephemeral launch delivery, and passes ONLY the
+/// opaque id + digest across this seam. Scribe never sees or returns
+/// plaintext, which preserves idempotent lost-response retry (the
+/// caller retains the same secret and digest). Redaction/non-Debug
+/// plaintext handling is a composition-layer obligation; no plaintext
+/// type exists in core. The credential's normative binding — worker
+/// actor, class, profile, profile hash — derives from the bundled
+/// record, with the current activation generation read and locked
+/// inside the same Scribe transaction; nothing is caller-asserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialProvisioning {
+    pub id: CredentialId,
+    pub digest: ContentHash,
+}
+
+/// The explicit-retry bundle (mirror of [`AssignmentOpening`]): a new
+/// fenced Attempt, its authorizing Retry decision, and the successor
+/// credential binding — committed in ONE transaction, because the
+/// predecessor Attempt's credential is revoked at its end and a
+/// credential-dead retry would be unusable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptOpening {
+    pub authorizing: RetryDecision,
+    pub attempt: AttemptRecord,
+    pub worker_credential: CredentialProvisioning,
+}
+
 /// The architecture §2.4 opening bundle, committed in ONE Scribe
-/// transaction under the Assign decision's single operation identity.
+/// transaction under the Assign decision's single operation identity —
+/// including the worker credential binding, atomically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentOpening {
     pub assignment: AssignmentRecord,
     pub first_attempt: AttemptRecord,
     pub authorizing: AssignDecision,
     pub bead_revision: WorkRevision,
+    pub worker_credential: CredentialProvisioning,
+}
+
+/// The closed set of activation cases (ADR-0003 §F1). There is still
+/// no general enrolment verb: creation is operator-channel-only, an
+/// actor-authorized call may only ROTATE an already-registered actor's
+/// credential (same ActorId and class), and a first worker is
+/// registered as an authenticated effect of `AssignmentOpening` —
+/// never through this call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationCase {
+    /// Initial/orchestrator actor creation. Scribe accepts this ONLY on
+    /// the pre-listen operator admin channel; the same message arriving
+    /// on the agent-facing protocol is unknown/forbidden.
+    OperatorBootstrap,
+    /// Reactivation of an already-registered actor: Scribe proves the
+    /// target exists with the same ActorId and authority class, the
+    /// caller holds the explicit rotation capability, and only the
+    /// credential and activation generation advance.
+    ActorAuthorizedRotation { authority: AuthoritySnapshot },
+}
+
+/// Activation bundled with its credential provisioning and case,
+/// committed atomically (ADR-0003). Credential-creating, so it takes
+/// part in the composer/secret-return lifecycle exactly like the
+/// opening bundles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationOpening {
+    pub activation: ProfileActivation,
+    pub case: ActivationCase,
+    pub credential: CredentialProvisioning,
 }
 
 /// Fenced worker call identity (state protocol rules): the
@@ -596,6 +658,13 @@ pub enum StateError {
     /// activating under a different class is refused (this structurally
     /// preserves "a worker cannot accept its own handoff").
     ActorClassMismatch,
+    /// The presented credential digest matches no live credential.
+    CredentialInvalid,
+    /// The credential exists but its (actor, class, profile-hash,
+    /// activation-generation) binding does not match the request.
+    CredentialBindingMismatch,
+    /// The credential was revoked (attempt end / deactivation).
+    CredentialRevoked,
     /// Same operation identity, different content: corrupt input.
     ConflictingOperation,
     UnknownRecord,
@@ -641,21 +710,21 @@ pub trait WorkflowStatePort {
     fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError>;
 
     /// Append a new fenced Attempt atomically with its authorizing
-    /// Retry decision.
-    fn append_attempt(
-        &self,
-        retry: &RetryDecision,
-        attempt: &AttemptRecord,
-    ) -> Result<StateApplied, StateError>;
+    /// Retry decision AND its successor credential binding.
+    fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError>;
 
     /// Record an orchestrator decision (accept/reject/cancel/revoke/
     /// reclaim/transfer).
     fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError>;
 
-    /// Audited profile activation (ADR-0002 §7): a singleton-occupancy
-    /// profile refuses a second active occupant; shared profiles
-    /// multi-occupy freely.
-    fn activate_profile(&self, activation: &ProfileActivation) -> Result<StateApplied, StateError>;
+    /// Audited profile activation (ADR-0002 §7) bundled with the
+    /// activating actor's credential provisioning, because activation
+    /// advances the generation credentials bind to — an activation
+    /// without fresh provisioning would be credential-dead. Initial
+    /// (bootstrap) activation arrives on Scribe's pre-listen operator
+    /// channel; every later activation/reactivation is authorized by an
+    /// already-enrolled decision actor whose authority is recorded.
+    fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError>;
 
     /// Explicit audited deactivation.
     fn deactivate_profile(
@@ -853,11 +922,105 @@ pub enum LivenessKind {
     StaleGeneration,
 }
 
+/// Transient launch secret (ADR-0003 sideband). Honest guarantees, and
+/// only these: it is non-`Clone` and has no serde implementation, so
+/// casual duplication and serialization are ownership-level friction;
+/// its `Debug` is redacted; it is moved into `launch` rather than
+/// borrowed. NOT guaranteed: `reveal` hands out a `&str` an adapter
+/// could copy, and the backing `String` is not zeroized on drop —
+/// memory-residency exposure is the accepted v1 residual. It rides
+/// NEXT TO LaunchSpec — never inside it, never argv/env/Envelope.
+pub struct EphemeralLaunchSecret {
+    token: String,
+    /// Identity binding (R5.2): the material names the Attempt and
+    /// credential it belongs to, so two concurrent launches cannot be
+    /// swapped into credential-dead sessions.
+    attempt: AttemptId,
+    credential: CredentialId,
+}
+
+/// Launch-material shape refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LaunchSecretError {
+    /// Below the ≥128-bit contract (32 hex chars).
+    TooShort,
+    TooLong,
+    NotHex,
+}
+
+impl EphemeralLaunchSecret {
+    /// Canonical bounded token: 32–128 lowercase hex characters
+    /// (≥128 bits of CSPRNG material), bound to its Attempt and
+    /// credential.
+    pub fn new(
+        token: String,
+        attempt: AttemptId,
+        credential: CredentialId,
+    ) -> Result<Self, LaunchSecretError> {
+        if token.len() < 32 {
+            return Err(LaunchSecretError::TooShort);
+        }
+        if token.len() > 128 {
+            return Err(LaunchSecretError::TooLong);
+        }
+        if !token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(LaunchSecretError::NotHex);
+        }
+        Ok(Self {
+            token,
+            attempt,
+            credential,
+        })
+    }
+
+    pub fn attempt(&self) -> &AttemptId {
+        &self.attempt
+    }
+
+    pub fn credential(&self) -> &CredentialId {
+        &self.credential
+    }
+
+    /// One-time read by the runtime adapter for startup delivery.
+    pub fn reveal(&self) -> &str {
+        &self.token
+    }
+}
+
+impl core::fmt::Debug for EphemeralLaunchSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("EphemeralLaunchSecret(REDACTED)")
+    }
+}
+
+/// Closed outcome of startup-material delivery (Envelope AND the
+/// transient secret, carried by ONE provider API submission). A definite failure keeps the handle so the caller can
+/// stop and reconcile the created session: an outer `Err` means no
+/// usable handle exists at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupDelivery {
+    /// One provider API submission accepted (text + delayed Enter
+    /// scheduled) — submission, never proof of application or read.
+    Submitted,
+    /// Definitely not delivered, with the normalized reason; the
+    /// session exists and must be stopped/reconciled.
+    NotDelivered(RuntimeError),
+    /// Unknown: stop, revoke, and open a successor with fresh
+    /// provisioning — never retry the same secret.
+    Ambiguous,
+}
+
 /// Normalized launch facts returned with the handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOutcome {
     pub handle: RuntimeHandle,
     pub observation: LivenessObservation,
+    /// Covers Envelope and secret together (one atomic startup
+    /// delivery); see [`StartupDelivery`].
+    pub startup_delivery: StartupDelivery,
 }
 
 /// Best-effort delivery report (I6): informational only; `Ambiguous`
@@ -909,7 +1072,17 @@ pub enum StopMode {
 /// Agent/session lifecycle mechanics. Every call is bounded by an
 /// explicit deadline; every mutating verb fences stale generations.
 pub trait RuntimePort {
-    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchOutcome, RuntimeError>;
+    /// Launch with the persisted Envelope (inside `spec`) and the
+    /// transient credential secret as separate startup material — the
+    /// adapter delivers both without logging, argv, env, or child
+    /// inheritance.
+    /// Implementations MUST refuse before any provider mutation when
+    /// `secret.attempt() != spec.attempt` (R5.2 swap defense).
+    fn launch(
+        &self,
+        spec: &LaunchSpec,
+        secret: EphemeralLaunchSecret,
+    ) -> Result<LaunchOutcome, RuntimeError>;
 
     fn observe(
         &self,
@@ -1337,6 +1510,10 @@ mod tests {
                 authority: authority("state:assign"),
             },
             bead_revision: rev('a'),
+            worker_credential: CredentialProvisioning {
+                id: CredentialId::new("cred-1").unwrap(),
+                digest: ContentHash::new(&"d".repeat(64)).unwrap(),
+            },
         }
     }
 
@@ -1419,14 +1596,10 @@ mod tests {
             )
         }
 
-        fn append_attempt(
-            &self,
-            retry: &RetryDecision,
-            attempt: &AttemptRecord,
-        ) -> Result<StateApplied, StateError> {
+        fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError> {
             self.apply(
-                format!("attempt:{}", retry.operation.as_str()),
-                format!("{retry:?}{attempt:?}"),
+                format!("attempt:{}", opening.authorizing.operation.as_str()),
+                format!("{opening:?}"),
             )
         }
 
@@ -1443,8 +1616,9 @@ mod tests {
 
         fn activate_profile(
             &self,
-            activation: &ProfileActivation,
+            opening: &ActivationOpening,
         ) -> Result<StateApplied, StateError> {
+            let activation = &opening.activation;
             let mut classes = self.actor_classes.borrow_mut();
             match classes.get(activation.actor.as_str()) {
                 Some(existing) if *existing != activation.class() => {
@@ -1474,7 +1648,12 @@ mod tests {
                     }
                 }
             }
-            self.apply(format!("act:{}", activation.operation.as_str()), holder)
+            // Full-content idempotency: authority case, activation
+            // content, and credential all participate.
+            self.apply(
+                format!("act:{}", activation.operation.as_str()),
+                format!("{opening:?}"),
+            )
         }
 
         fn deactivate_profile(
@@ -1768,6 +1947,66 @@ mod tests {
             port.open_assignment(&altered),
             Err(StateError::ConflictingOperation)
         );
+        // Same operation with a changed credential id or digest is a
+        // conflict, never a silent rebind (R2).
+        let mut cred_id = opening();
+        cred_id.worker_credential.id = CredentialId::new("cred-2").unwrap();
+        assert_eq!(
+            port.open_assignment(&cred_id),
+            Err(StateError::ConflictingOperation)
+        );
+        let mut cred_digest = opening();
+        cred_digest.worker_credential.digest = ContentHash::new(&"e".repeat(64)).unwrap();
+        assert_eq!(
+            port.open_assignment(&cred_digest),
+            Err(StateError::ConflictingOperation)
+        );
+    }
+
+    #[test]
+    fn retry_bundle_carries_and_fences_its_credential() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let retry_opening = AttemptOpening {
+            authorizing: RetryDecision {
+                operation: op("op-retry"),
+                assignment: AssignmentId::new("asg-1").unwrap(),
+                authority: authority("state:assign"),
+                reason: reason("previous attempt expired"),
+            },
+            attempt: AttemptRecord {
+                id: AttemptId::new("att-2").unwrap(),
+                assignment: AssignmentId::new("asg-1").unwrap(),
+                lease: Lease {
+                    token: FencingToken(2),
+                    expires_at: Timestamp(200),
+                },
+            },
+            worker_credential: CredentialProvisioning {
+                id: CredentialId::new("cred-2").unwrap(),
+                digest: ContentHash::new(&"f".repeat(64)).unwrap(),
+            },
+        };
+        assert_eq!(
+            port.append_attempt(&retry_opening),
+            Ok(StateApplied::Applied)
+        );
+        assert_eq!(
+            port.append_attempt(&retry_opening),
+            Ok(StateApplied::AlreadyApplied)
+        );
+        let mut altered = retry_opening.clone();
+        altered.worker_credential.digest = ContentHash::new(&"9".repeat(64)).unwrap();
+        assert_eq!(
+            port.append_attempt(&altered),
+            Err(StateError::ConflictingOperation)
+        );
+        let mut altered_id = retry_opening;
+        altered_id.worker_credential.id = CredentialId::new("cred-9").unwrap();
+        assert_eq!(
+            port.append_attempt(&altered_id),
+            Err(StateError::ConflictingOperation)
+        );
     }
 
     #[test]
@@ -1984,15 +2223,22 @@ mod tests {
         validate_profiles(&profiles, &registry).unwrap()
     }
 
-    fn activation(op_id: &str, actor_id: &str, profile: &str) -> ProfileActivation {
-        ProfileActivation::from_validated(
-            &small_validated_set(),
-            op(op_id),
-            ActorId::new(actor_id).unwrap(),
-            ProfileName::new(profile).unwrap(),
-            ContentHash::new(&"a".repeat(64)).unwrap(),
-        )
-        .unwrap()
+    fn activation(op_id: &str, actor_id: &str, profile: &str) -> ActivationOpening {
+        ActivationOpening {
+            activation: ProfileActivation::from_validated(
+                &small_validated_set(),
+                op(op_id),
+                ActorId::new(actor_id).unwrap(),
+                ProfileName::new(profile).unwrap(),
+                ContentHash::new(&"a".repeat(64)).unwrap(),
+            )
+            .unwrap(),
+            case: ActivationCase::OperatorBootstrap,
+            credential: CredentialProvisioning {
+                id: CredentialId::new(&format!("cred-{op_id}")).unwrap(),
+                digest: ContentHash::new(&"c".repeat(64)).unwrap(),
+            },
+        }
     }
 
     #[test]
@@ -2026,6 +2272,41 @@ mod tests {
         assert_eq!(
             port.activate_profile(&activation("a-5", "lead-2", "lead")),
             Ok(StateApplied::Applied)
+        );
+    }
+
+    #[test]
+    fn activation_idempotency_covers_full_content() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let base = activation("a-10", "lead-9", "lead");
+        assert_eq!(port.activate_profile(&base), Ok(StateApplied::Applied));
+        assert_eq!(
+            port.activate_profile(&base),
+            Ok(StateApplied::AlreadyApplied)
+        );
+        // Same operation, different credential id → conflict.
+        let mut cred_id = base.clone();
+        cred_id.credential.id = CredentialId::new("cred-zz").unwrap();
+        assert_eq!(
+            port.activate_profile(&cred_id),
+            Err(StateError::ConflictingOperation)
+        );
+        // Same operation, different digest → conflict.
+        let mut digest = base.clone();
+        digest.credential.digest = ContentHash::new(&"7".repeat(64)).unwrap();
+        assert_eq!(
+            port.activate_profile(&digest),
+            Err(StateError::ConflictingOperation)
+        );
+        // Same operation, different authority case → conflict.
+        let mut case = base;
+        case.case = ActivationCase::ActorAuthorizedRotation {
+            authority: authority("state:assign"),
+        };
+        assert_eq!(
+            port.activate_profile(&case),
+            Err(StateError::ConflictingOperation)
         );
     }
 
@@ -2072,13 +2353,24 @@ mod tests {
     }
 
     impl RuntimePort for FakeRuntime {
-        fn launch(&self, _spec: &LaunchSpec) -> Result<LaunchOutcome, RuntimeError> {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            secret: EphemeralLaunchSecret,
+        ) -> Result<LaunchOutcome, RuntimeError> {
+            // Contract checks: the secret Debug is redacted, and it is
+            // consumed here without duplication (non-Clone).
+            assert_eq!(format!("{secret:?}"), "EphemeralLaunchSecret(REDACTED)");
+            if secret.attempt() != &_spec.attempt {
+                return Err(RuntimeError::Rejected);
+            }
             Ok(LaunchOutcome {
                 handle: self.live.clone(),
                 observation: LivenessObservation {
                     observed_at: Timestamp(1),
                     kind: LivenessKind::Starting,
                 },
+                startup_delivery: StartupDelivery::Submitted,
             })
         }
 
@@ -2191,8 +2483,19 @@ mod tests {
             live: RuntimeHandle::new("gen-2-token"),
         };
         let port: &dyn RuntimePort = &runtime;
-        let outcome = port.launch(&spec()).unwrap();
+        let outcome = port
+            .launch(
+                &spec(),
+                EphemeralLaunchSecret::new(
+                    "a".repeat(32),
+                    AttemptId::new("att-1").unwrap(),
+                    CredentialId::new("cred-1").unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         assert_eq!(outcome.observation.kind, LivenessKind::Starting);
+        assert_eq!(outcome.startup_delivery, StartupDelivery::Submitted);
         let live = outcome.handle;
         let stale = RuntimeHandle::new("gen-1-token");
         let d = Timestamp(5);
@@ -2230,6 +2533,35 @@ mod tests {
 
         let recovered = port.reassociate(&stale, d).unwrap();
         assert_eq!(recovered, live);
+    }
+
+    #[test]
+    fn launch_material_is_bounded_and_identity_bound() {
+        let attempt = AttemptId::new("att-1").unwrap();
+        let cred = CredentialId::new("cred-1").unwrap();
+        // Shape: >=128 bits of lowercase hex, bounded.
+        assert_eq!(
+            EphemeralLaunchSecret::new("short".into(), attempt.clone(), cred.clone()).err(),
+            Some(LaunchSecretError::TooShort)
+        );
+        assert_eq!(
+            EphemeralLaunchSecret::new("z".repeat(32), attempt.clone(), cred.clone()).err(),
+            Some(LaunchSecretError::NotHex)
+        );
+        assert_eq!(
+            EphemeralLaunchSecret::new("a".repeat(129), attempt.clone(), cred.clone()).err(),
+            Some(LaunchSecretError::TooLong)
+        );
+        // Swap defense: material for another Attempt is refused before
+        // any provider mutation.
+        let runtime = FakeRuntime {
+            live: RuntimeHandle::new("gen-2-token"),
+        };
+        let port: &dyn RuntimePort = &runtime;
+        let wrong =
+            EphemeralLaunchSecret::new("b".repeat(32), AttemptId::new("att-9").unwrap(), cred)
+                .unwrap();
+        assert_eq!(port.launch(&spec(), wrong), Err(RuntimeError::Rejected));
     }
 
     #[test]

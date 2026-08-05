@@ -57,6 +57,8 @@ $XDG_RUNTIME_DIR/abacus/<repo-id>.sock
 
 Only Scribe mutates the database. The database and socket directory are user-only. No fallback silently writes to a user home or worktree when these paths are unavailable.
 
+**Agent transport (ADR-0003, Proposed rev 5):** one versioned Scribe protocol on two carriages selected by injected configuration — direct UDS where the sandbox permits, or a per-call operator-owned `scribe-rpc` relay (exact two-token argv; one bounded newline-terminated typed-JSON request line on stdin; private 4-byte framing performed by the host client; one structured stdout line; fixed deadline; strictly one request per process and connection, batching forbidden). Actors are credentialed, never asserted: no enrolment verb exists anywhere in the agent-facing protocol; initial enrolment happens on a one-shot pre-listen operator channel, worker credential minting is an authenticated effect of `AssignmentOpening`, bearers are CSPRNG ≥128-bit with digest-only storage and constant-time comparison, and plaintext rides only an ephemeral launch secret — never the persisted Envelope. Host-approval denial is an agent-boundary fact; this client observes only connect failure (`Unavailable`) and protocol errors.
+
 ## Deep interface
 
 The public client exposes workflow outcomes rather than database-shaped CRUD.
@@ -64,7 +66,9 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 ### Repository and actors
 
 - initialize/inspect repository workflow state;
-- register or resume an actor with authority class and profile snapshot;
+- initial actor provisioning ONLY through the one-shot pre-listen operator channel — no standalone or general enrolment verb exists on the public client;
+- authenticated activation/resume for an already-provisioned actor;
+- atomic worker credential **binding** solely as an effect of `AssignmentOpening` or retry `AttemptOpening`: the caller passes opaque id+digest (`CredentialProvisioning`), Scribe persists digest-only and returns idempotent `StateApplied`, plaintext never crosses in either direction;
 - audit profile activation/change before it authorizes new actions;
 - inspect current actor/runtime associations;
 - record explicit authority transfer.
@@ -115,7 +119,7 @@ Watchdogs are ordinary Herdr-managed agent profiles, never additional daemon pro
 
 ## Protocol rules
 
-- Every request carries protocol version, repository identity, actor identity, request ID, and idempotency key where mutating.
+- Every agent request carries protocol version, repository identity, ActorId **plus its bearer credential**, request ID, and idempotency key where mutating. Scribe authenticates the credential digest and its (actor, class, profile-hash, activation-generation) binding **before** `authorize` runs; an invalid, binding-mismatched, or revoked credential is a distinct refusal, and any enrolment-shaped request on the agent protocol is unknown/forbidden and audited.
 - Fenced operations carry assignment, attempt, and current fencing token.
 - Every fenced worker response mechanically surfaces the Attempt's current binding Directives. This is a protocol property of Scribe responses, never worker discipline; the response envelope contains the field even when the set is empty.
 - Scribe commits immutable per-Attempt call/response ordering and applies core's Directive gate before mutation. Exposure and discharge are derived from that ordering and responding workflow actions: a Directive committed before the worker's latest fenced call was surfaced in that call's response.
@@ -129,7 +133,7 @@ Watchdogs are ordinary Herdr-managed agent profiles, never additional daemon pro
 - Envelope and evidence payload limits are explicit and bounded.
 - Client disconnect does not imply transaction failure or success; retry returns the stored idempotent result.
 
-The initial wire encoding is an open spike. Its details remain private to this module and its client; changing encoding with the same public Rust interface should not affect work/runtime modules.
+ADR-0003 settles the wire: a public bounded typed-JSON **facade command envelope**, distinct from the **internal versioned Scribe request schema** for credential-creating calls, with private 4-byte length framing performed by the composing transport layer (the facade process directly, or the fixed-function `scribe-rpc` composer on the relay carriage), strictly one request per process and connection. Framing and internal-schema details remain private to this module and its client; lost/ambiguous exchanges surface as typed Ambiguous with replayable provisioning, never silent retry.
 
 ## Persistence model
 
@@ -189,6 +193,8 @@ Database schema changes do not automatically require work or runtime tests. Only
 ## Test contract
 
 Default tests use temporary Git common directories, sockets, and SQLite files. They cover:
+
+- credential authentication: no agent-protocol enrolment request exists; invalid, binding-mismatched, and revoked credentials refuse distinctly; digest-only persistence; worker binding atomic with `AssignmentOpening` and retry `AttemptOpening` (id and digest conflicts both refused); expiry/revocation at attempt end and deactivation;
 
 - initialization and single-Scribe behavior;
 - migrations and rollback/backup paths;

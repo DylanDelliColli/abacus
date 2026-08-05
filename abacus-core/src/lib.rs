@@ -35,8 +35,8 @@ pub use evidence::{
     evaluate_red_green_pair,
 };
 pub use id::{
-    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, HandoffId, IdError, OperationId,
-    ProfileName, SignalId,
+    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, CredentialId, HandoffId, IdError,
+    OperationId, ProfileName, SignalId,
 };
 pub use lease::{FencingError, FencingToken, Lease, Timestamp, validate_fencing};
 pub use lifecycle::{
