@@ -11,15 +11,19 @@
 //! `abacus-cli` calls these functions; the hermetic vertical journey
 //! drives them. Neither re-implements them.
 
-use crate::OperationId;
 use crate::ports::{
-    ApplicationAttempt, ApplicationOutcome, ApplicationReceipt, DecisionRecord, MutationOutcome,
-    PendingApplication, StateApplied, StateError, WorkError, WorkGraphPort, WorkProjection,
-    WorkRevision, WorkflowStatePort,
+    ApplicationAttempt, ApplicationOutcome, ApplicationReceipt, AssignmentOpening, BeadSnapshot,
+    CloseReason, DecisionRecord, EphemeralLaunchSecret, EvidenceOutcome, FencedAction,
+    FencedResponse, HandoffRecord, LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec,
+    LaunchSubject, MutationOutcome, ObservedCloseReason, PendingApplication, ReportOutcome,
+    RuntimeError, RuntimePort, StateApplied, StateError, SubmissionOutcome, WorkAdvicePort,
+    WorkError, WorkGraphPort, WorkProjection, WorkRevision, WorkStatus, WorkflowStatePort,
+    apply_advice,
 };
+use crate::{BeadId, Evidence, OperationId, SignalDraft};
 
 /// Why a committed decision's provider projection is not yet
-/// confirmed. Both variants leave the projection in the derived
+/// confirmed. Every variant leaves the projection in the derived
 /// pending set for explicit, caller-invoked reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionUnresolved {
@@ -28,6 +32,15 @@ pub enum ProjectionUnresolved {
     /// The outcome is unknown: the mutation may have landed. Inspect
     /// before any retry — never re-issue blindly.
     Ambiguous,
+    /// The provider reports an already-present effect that does NOT
+    /// satisfy this projection (closed under a different reason, or
+    /// terminal where in-progress was intended): an out-of-band
+    /// mutation this operation must not adopt as its own. Re-driving
+    /// cannot resolve it — resolution is a decision, not a retry.
+    ConflictingEffect {
+        status: WorkStatus,
+        revision: WorkRevision,
+    },
 }
 
 /// Outcome of projecting ONE committed decision onto the work graph.
@@ -74,10 +87,29 @@ where
     S: WorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
-    let expected = pending
-        .authorized_revision
-        .clone()
-        .unwrap_or_else(|| current_revision_placeholder(&pending.projection));
+    let expected = match pending.authorized_revision.clone() {
+        Some(revision) => revision,
+        // The authorizing decision bound no bead revision (the Accept
+        // path does not): the precondition is a fresh observation of
+        // the graph. A failed observation is a definite non-effect —
+        // no mutation was issued — recorded and left pending.
+        None => match work.inspect(&pending.bead) {
+            Ok(view) => view.revision,
+            Err(error) => {
+                state.record_application_attempt(&ApplicationAttempt {
+                    id: attempt_operation.clone(),
+                    target: pending.operation.clone(),
+                    outcome: ApplicationOutcome::Failed {
+                        error: error.clone(),
+                    },
+                })?;
+                return Ok(ProjectionOutcome::Unresolved {
+                    attempt: attempt_operation.clone(),
+                    reason: ProjectionUnresolved::Failed(error),
+                });
+            }
+        },
+    };
 
     let mutation = match &pending.projection {
         WorkProjection::MarkInProgress => {
@@ -107,11 +139,22 @@ where
     state.record_application_attempt(&attempt)?;
 
     // Only a confirmed effect yields the receipt that clears the
-    // projection. `EffectAlreadyPresent` counts: the effect IS present,
-    // which is exactly what the receipt attests.
+    // projection. An already-present effect counts ONLY when the
+    // observed facts satisfy this projection: the facade reports what
+    // it saw precisely so this correlation can refuse to adopt an
+    // out-of-band mutation as this operation's own.
     let after = match outcome {
         ApplicationOutcome::Applied { after, .. } => after,
-        ApplicationOutcome::EffectAlreadyPresent { revision, .. } => revision,
+        ApplicationOutcome::EffectAlreadyPresent { status, revision } => {
+            if effect_satisfies(&pending.projection, status) {
+                revision
+            } else {
+                return Ok(ProjectionOutcome::Unresolved {
+                    attempt: attempt_operation.clone(),
+                    reason: ProjectionUnresolved::ConflictingEffect { status, revision },
+                });
+            }
+        }
         ApplicationOutcome::Ambiguous => {
             return Ok(ProjectionOutcome::Unresolved {
                 attempt: attempt_operation.clone(),
@@ -167,7 +210,20 @@ where
     })
 }
 
-/// Explicitly reconcile every projection still lacking a receipt.
+/// Outcome of one explicit reconciliation pass. A pass bounded by the
+/// supplied attempt identities is legitimate; silently truncating one
+/// is not, so the uncovered remainder is named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationPass {
+    /// Each redriven projection's authorizing operation and outcome.
+    pub reconciled: Vec<(OperationId, ProjectionOutcome)>,
+    /// Pending projections the supplied attempt identities did not
+    /// cover, in the derived set's order. Non-empty means: mint more
+    /// attempt operations and reconcile again.
+    pub unattempted: Vec<OperationId>,
+}
+
+/// Explicitly reconcile projections still lacking a receipt.
 ///
 /// Caller-invoked by an operator or authorized decision actor (I12:
 /// no timer, watcher, or background sweep). Each pending projection
@@ -178,25 +234,255 @@ pub fn reconcile_pending<S, W>(
     state: &S,
     work: &W,
     attempt_operations: &[OperationId],
-) -> Result<Vec<(OperationId, ProjectionOutcome)>, StateError>
+) -> Result<ReconciliationPass, StateError>
 where
     S: WorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
     let pending = state.pending_applications()?;
-    let mut results = Vec::with_capacity(pending.len().min(attempt_operations.len()));
-    for (item, attempt) in pending.iter().zip(attempt_operations) {
-        let outcome = project_pending(state, work, item, attempt)?;
-        results.push((item.operation.clone(), outcome));
+    let mut reconciled = Vec::with_capacity(pending.len().min(attempt_operations.len()));
+    let mut unattempted = Vec::new();
+    let mut attempts = attempt_operations.iter();
+    for item in &pending {
+        match attempts.next() {
+            Some(attempt) => {
+                let outcome = project_pending(state, work, item, attempt)?;
+                reconciled.push((item.operation.clone(), outcome));
+            }
+            None => unattempted.push(item.operation.clone()),
+        }
     }
-    Ok(results)
+    Ok(ReconciliationPass {
+        reconciled,
+        unattempted,
+    })
 }
 
-/// A projection recorded without an authorized revision cannot carry a
-/// meaningful precondition; the provider's own revision check governs.
-/// Kept explicit rather than silently defaulting.
-fn current_revision_placeholder(_projection: &WorkProjection) -> WorkRevision {
-    WorkRevision(crate::ContentHash::new(&"0".repeat(64)).expect("zero revision is valid 64-hex"))
+/// The advice-gated ready selection: the bracketed ready snapshot plus
+/// the order composition dispatches in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadySelection {
+    /// The revision the ready set (and any accepted advice) is bound to.
+    pub revision: WorkRevision,
+    pub ready: Vec<BeadSnapshot>,
+    /// The advisor's permutation only when bound to `revision` and
+    /// exactly covering `ready`; the deterministic fallback otherwise
+    /// (core invariant 6 — the single advice gate decides, here).
+    pub order: Vec<BeadId>,
+}
+
+/// Select ready work: one bracketed read of the ready set, advice
+/// solicited against exactly that revision, and the gate applied.
+///
+/// Advice is never authoritative and never required (I8): a degraded,
+/// stale, or non-covering answer silently yields the deterministic
+/// fallback order, which is a normal outcome rather than an error.
+pub fn select_ready<W, A>(work: &W, advice: &A) -> Result<ReadySelection, WorkError>
+where
+    W: WorkGraphPort + ?Sized,
+    A: WorkAdvicePort + ?Sized,
+{
+    let (revision, ready) = work.ready()?;
+    let eligible: Vec<BeadId> = ready.iter().map(|bead| bead.id.clone()).collect();
+    let outcome = advice.advise(&revision, &eligible);
+    let order = apply_advice(&ready, &outcome, &revision);
+    Ok(ReadySelection {
+        revision,
+        ready,
+        order,
+    })
+}
+
+/// Outcome of assigning ready work (architecture §2.4–2.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentOutcome {
+    /// Whether the opening bundle was committed now or was already
+    /// committed by an identical earlier call.
+    pub opening: StateApplied,
+    /// The mark-in-progress projection result, or `None` when no
+    /// pending projection remained (an idempotent replay after the
+    /// original projection already earned its receipt).
+    pub projection: Option<ProjectionOutcome>,
+}
+
+/// Assign ready work: commit the opening bundle, then project its
+/// mark-in-progress onto the work graph under the same authorizing
+/// operation identity.
+///
+/// Mirrors [`accept_handoff`]: the opening is committed FIRST, and a
+/// projection failure never unwinds it — an unconfirmed projection
+/// stays in the derived pending set for explicit reconciliation.
+pub fn assign_ready<S, W>(
+    state: &S,
+    work: &W,
+    opening: &AssignmentOpening,
+    attempt_operation: &OperationId,
+) -> Result<AssignmentOutcome, StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+    W: WorkGraphPort + ?Sized,
+{
+    let applied = state.open_assignment(opening)?;
+    let pending = state
+        .pending_applications()?
+        .into_iter()
+        .find(|candidate| candidate.operation == opening.authorizing.operation);
+    let projection = match pending {
+        None => None,
+        Some(pending) => Some(project_pending(state, work, &pending, attempt_operation)?),
+    };
+    Ok(AssignmentOutcome {
+        opening: applied,
+        projection,
+    })
+}
+
+/// Outcome of the launch sequence (architecture §3.3–3.5): Envelope
+/// persisted, launch attempted, handle associated. Every compensation
+/// is an explicit returned outcome, never a hidden retry (I12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchSequenceOutcome {
+    /// The session is live and its handle is durably associated. The
+    /// caller must still read `launched.startup_delivery`: a live,
+    /// bound session whose startup material definitely or possibly
+    /// failed to deliver is stopped/reconciled by the caller's
+    /// explicit decision.
+    Launched {
+        launched: LaunchOutcome,
+        bound: StateApplied,
+    },
+    /// The session is live but the durable association write failed.
+    /// The handle is surfaced so the caller can stop the session or
+    /// re-bind explicitly — swallowing it would strand a live session.
+    LaunchedUnbound {
+        launched: LaunchOutcome,
+        bind_error: StateError,
+    },
+    /// The provider may have created a session; no handle is known.
+    /// Recovery is `RuntimePort::recover_launch` under the echoed
+    /// correlation — never a relaunch.
+    Ambiguous {
+        subject: LaunchSubject,
+        correlation: LaunchCorrelation,
+    },
+    /// Definite failure: no session exists. The persisted Envelope
+    /// remains keyed by the subject for a future launch.
+    NotLaunched { error: RuntimeError },
+}
+
+/// Launch a subject: persist the canonical Envelope FIRST, then launch
+/// with the transient credential secret, then durably associate the
+/// returned handle.
+///
+/// The ordering is the contract (architecture §3.3): nothing may reach
+/// a live session that is not already durable, so a persist failure
+/// aborts before any provider interaction. Subject/secret identity
+/// agreement is the adapter's refusal to make (it must refuse before
+/// any provider mutation); this sequence does not duplicate that gate.
+pub fn launch_subject<S, R>(
+    state: &S,
+    runtime: &R,
+    spec: &LaunchSpec,
+    secret: EphemeralLaunchSecret,
+    persist_operation: &OperationId,
+    bind_operation: &OperationId,
+) -> Result<LaunchSequenceOutcome, StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+    R: RuntimePort + ?Sized,
+{
+    state.persist_envelope(persist_operation, &spec.subject, &spec.envelope)?;
+
+    let attempt = match runtime.launch(spec, secret) {
+        Ok(attempt) => attempt,
+        Err(error) => return Ok(LaunchSequenceOutcome::NotLaunched { error }),
+    };
+
+    match attempt {
+        LaunchAttempt::Ambiguous {
+            subject,
+            correlation,
+        } => Ok(LaunchSequenceOutcome::Ambiguous {
+            subject,
+            correlation,
+        }),
+        LaunchAttempt::Launched(launched) => {
+            match state.bind_runtime_handle(bind_operation, &spec.subject, &launched.handle) {
+                Ok(bound) => Ok(LaunchSequenceOutcome::Launched { launched, bound }),
+                Err(bind_error) => Ok(LaunchSequenceOutcome::LaunchedUnbound {
+                    launched,
+                    bind_error,
+                }),
+            }
+        }
+    }
+}
+
+/// Fenced worker Report append — the worker-side composition surface.
+///
+/// These three pass-throughs exist so the CLI and the journey drive
+/// ONE production surface for every worker action rather than the
+/// port directly: the gate outcomes (including in-band Abort
+/// refusals) and the fenced response envelope cross unaltered, and no
+/// caller re-implements or reinterprets them. Policy lives in the
+/// state seam's gates; nothing is added here by design.
+pub fn record_report<S>(
+    state: &S,
+    action: &FencedAction,
+    draft: &SignalDraft,
+) -> Result<(ReportOutcome, FencedResponse), StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+{
+    state.fenced_report(action, draft)
+}
+
+/// Fenced worker Evidence append — see [`record_report`].
+pub fn record_evidence<S>(
+    state: &S,
+    action: &FencedAction,
+    evidence: &Evidence,
+) -> Result<(EvidenceOutcome, FencedResponse), StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+{
+    state.fenced_evidence(action, evidence)
+}
+
+/// Fenced Handoff submission — see [`record_report`]. The submission
+/// outcome (recorded or refused) is owned idempotently by the call's
+/// operation and returned unaltered.
+pub fn submit_handoff<S>(
+    state: &S,
+    action: &FencedAction,
+    handoff: &HandoffRecord,
+) -> Result<(SubmissionOutcome, FencedResponse), StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+{
+    state.fenced_submit_handoff(action, handoff)
+}
+
+/// True when observed provider facts satisfy the intended projection —
+/// the correlation `MutationOutcome`'s contract assigns to core. An
+/// unrecognized provider close reason never matches: adopting an
+/// out-of-band close as this operation's effect is the silent-adoption
+/// defect this gate exists to refuse.
+fn effect_satisfies(projection: &WorkProjection, status: WorkStatus) -> bool {
+    match (projection, status) {
+        (WorkProjection::MarkInProgress, WorkStatus::InProgress) => true,
+        (WorkProjection::Close { reason }, WorkStatus::Closed { observed_reason }) => matches!(
+            (reason, observed_reason),
+            (
+                CloseReason::AcceptedHandoff,
+                ObservedCloseReason::AcceptedHandoff
+            ) | (
+                CloseReason::CancelledObsolete,
+                ObservedCloseReason::CancelledObsolete
+            )
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -204,7 +490,12 @@ mod tests {
     use super::*;
     use crate::ports::*;
     use crate::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// Cross-fake call-order log: the launch sequence's ordering
+    /// contract spans the state and runtime seams.
+    type EventLog = Rc<RefCell<Vec<&'static str>>>;
 
     fn op(raw: &str) -> OperationId {
         OperationId::new(raw).expect("valid operation id")
@@ -231,11 +522,96 @@ mod tests {
         }
     }
 
-    /// Records what the saga asked the work seam to do, and answers
-    /// with a scripted outcome.
+    fn snapshot(id: &str, priority: u8) -> BeadSnapshot {
+        BeadSnapshot {
+            id: BeadId::new(id).expect("valid bead id"),
+            content_hash: rev('c').0,
+            scope_map: ScopeMap::default(),
+            priority: Priority::new(priority).expect("valid priority"),
+        }
+    }
+
+    fn lead_actor() -> DecisionActor {
+        DecisionActor {
+            actor: ActorId::new("lead-1").expect("valid actor id"),
+            class: AuthorityClass::Orchestrator,
+            profile: ProfileName::new("lead").expect("valid profile"),
+            profile_hash: rev('a').0,
+        }
+    }
+
+    fn worker_actor() -> DecisionActor {
+        DecisionActor {
+            actor: ActorId::new("worker-1").expect("valid actor id"),
+            class: AuthorityClass::Worker,
+            profile: ProfileName::new("worker").expect("valid profile"),
+            profile_hash: rev('b').0,
+        }
+    }
+
+    fn verification() -> crate::evidence::VerificationSet {
+        crate::evidence::VerificationSet::new(
+            vec![Argv::new(vec!["cargo".into(), "test".into()]).expect("valid argv")],
+            PathSet::new(vec![WorkPath::new("tests/usecase.rs").expect("valid path")])
+                .expect("valid path set"),
+        )
+        .expect("valid verification set")
+    }
+
+    fn opening() -> AssignmentOpening {
+        let assignment = AssignmentId::new("asg-1").expect("valid assignment");
+        let attempt = AttemptId::new("att-1").expect("valid attempt");
+        AssignmentOpening {
+            assignment: AssignmentRecord {
+                id: assignment.clone(),
+                bead: bead(),
+                bead_content_hash: rev('c').0,
+                scope_map: ScopeMap::default(),
+                worker: worker_actor(),
+                decision_actor: lead_actor(),
+                edit_scope: EditScope::new(vec![WorkPath::new("src").expect("valid path")])
+                    .expect("valid edit scope"),
+                acceptance: crate::evidence::AcceptancePolicy {
+                    verification: verification(),
+                    form: crate::evidence::PolicyForm::Standard,
+                },
+                attempt_policy: AttemptPolicy::default(),
+                declared_base: CommitId::new(&"d".repeat(40)).expect("valid commit"),
+            },
+            first_attempt: AttemptRecord {
+                id: attempt.clone(),
+                assignment: assignment.clone(),
+                lease: Lease {
+                    token: FencingToken(1),
+                    expires_at: Timestamp(100),
+                },
+            },
+            authorizing: AssignDecision {
+                operation: op("op-assign"),
+                assignment,
+                first_attempt: attempt,
+                authority: AuthoritySnapshot {
+                    actor: lead_actor(),
+                    capability: CapabilityId::new("state:assign").expect("valid capability"),
+                    scope: ScopeExpr::Universal,
+                },
+            },
+            bead_revision: rev('e'),
+            worker_credential: CredentialProvisioning {
+                id: CredentialId::new("cred-1").expect("valid credential"),
+                digest: rev('f').0,
+            },
+        }
+    }
+
+    /// Records what a use case asked the work seam to do, and answers
+    /// with a scripted outcome shared by both mutating verbs (a
+    /// projection issues at most one mutation).
     struct ScriptedWork {
         answer: RefCell<Option<Result<MutationOutcome, WorkError>>>,
         closes: RefCell<Vec<(BeadId, CloseReason, OperationId, WorkRevision)>>,
+        marks: RefCell<Vec<(BeadId, OperationId, WorkRevision)>>,
+        view: RefCell<Option<Result<BeadStatusView, WorkError>>>,
     }
 
     impl ScriptedWork {
@@ -243,26 +619,48 @@ mod tests {
             Self {
                 answer: RefCell::new(Some(answer)),
                 closes: RefCell::new(Vec::new()),
+                marks: RefCell::new(Vec::new()),
+                view: RefCell::new(None),
             }
+        }
+
+        /// Script the single read-before-write inspection an
+        /// unauthorized-revision projection performs.
+        fn with_view(self, view: Result<BeadStatusView, WorkError>) -> Self {
+            *self.view.borrow_mut() = Some(view);
+            self
+        }
+
+        fn take_answer(&self) -> Result<MutationOutcome, WorkError> {
+            self.answer
+                .borrow_mut()
+                .take()
+                .expect("a use case issues at most one mutation per projection")
         }
     }
 
     impl WorkGraphPort for ScriptedWork {
         fn ready(&self) -> Result<(WorkRevision, Vec<BeadSnapshot>), WorkError> {
-            unimplemented!("the saga never lists ready work")
+            unimplemented!("mutation scenarios never list ready work")
         }
 
         fn inspect(&self, _id: &BeadId) -> Result<BeadStatusView, WorkError> {
-            unimplemented!("the saga never inspects directly")
+            self.view
+                .borrow_mut()
+                .take()
+                .expect("this scenario scripts no inspection")
         }
 
         fn mark_in_progress(
             &self,
-            _id: &BeadId,
-            _operation: &OperationId,
-            _expected: &WorkRevision,
+            id: &BeadId,
+            operation: &OperationId,
+            expected: &WorkRevision,
         ) -> Result<MutationOutcome, WorkError> {
-            unimplemented!("this scenario projects a close")
+            self.marks
+                .borrow_mut()
+                .push((id.clone(), operation.clone(), expected.clone()));
+            self.take_answer()
         }
 
         fn close(
@@ -278,10 +676,289 @@ mod tests {
                 operation.clone(),
                 expected.clone(),
             ));
+            self.take_answer()
+        }
+    }
+
+    /// Read-only work seam scripting exactly one bracketed ready set.
+    struct ReadyWork {
+        revision: WorkRevision,
+        ready: Vec<BeadSnapshot>,
+    }
+
+    impl WorkGraphPort for ReadyWork {
+        fn ready(&self) -> Result<(WorkRevision, Vec<BeadSnapshot>), WorkError> {
+            Ok((self.revision.clone(), self.ready.clone()))
+        }
+
+        fn inspect(&self, _id: &BeadId) -> Result<BeadStatusView, WorkError> {
+            unimplemented!("selection never inspects")
+        }
+
+        fn mark_in_progress(
+            &self,
+            _id: &BeadId,
+            _operation: &OperationId,
+            _expected: &WorkRevision,
+        ) -> Result<MutationOutcome, WorkError> {
+            unimplemented!("selection never mutates")
+        }
+
+        fn close(
+            &self,
+            _id: &BeadId,
+            _reason: CloseReason,
+            _operation: &OperationId,
+            _expected: &WorkRevision,
+        ) -> Result<MutationOutcome, WorkError> {
+            unimplemented!("selection never mutates")
+        }
+    }
+
+    /// Answers every advice solicitation with one scripted outcome,
+    /// recording the revision it was asked against.
+    struct ScriptedAdvice {
+        outcome: AdviceOutcome,
+        asked: RefCell<Vec<(WorkRevision, Vec<BeadId>)>>,
+    }
+
+    impl ScriptedAdvice {
+        fn new(outcome: AdviceOutcome) -> Self {
+            Self {
+                outcome,
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorkAdvicePort for ScriptedAdvice {
+        fn advise(&self, revision: &WorkRevision, ready: &[BeadId]) -> AdviceOutcome {
+            self.asked
+                .borrow_mut()
+                .push((revision.clone(), ready.to_vec()));
+            self.outcome.clone()
+        }
+    }
+
+    /// Scripts exactly one launch answer and records what was asked.
+    struct ScriptedRuntime {
+        answer: RefCell<Option<Result<LaunchAttempt, RuntimeError>>>,
+        launches: RefCell<Vec<(LaunchSubject, LaunchCorrelation)>>,
+        events: EventLog,
+    }
+
+    impl ScriptedRuntime {
+        fn new(answer: Result<LaunchAttempt, RuntimeError>, events: EventLog) -> Self {
+            Self {
+                answer: RefCell::new(Some(answer)),
+                launches: RefCell::new(Vec::new()),
+                events,
+            }
+        }
+    }
+
+    impl RuntimePort for ScriptedRuntime {
+        fn launch(
+            &self,
+            spec: &LaunchSpec,
+            _secret: EphemeralLaunchSecret,
+        ) -> Result<LaunchAttempt, RuntimeError> {
+            self.events.borrow_mut().push("launch");
+            self.launches
+                .borrow_mut()
+                .push((spec.subject.clone(), spec.correlation.clone()));
             self.answer
                 .borrow_mut()
                 .take()
-                .expect("the saga issues at most one mutation per projection")
+                .expect("the sequence issues at most one launch")
+        }
+
+        fn recover_launch(
+            &self,
+            _: &LaunchSubject,
+            _: &LaunchCorrelation,
+            _: Timestamp,
+        ) -> Result<Option<LaunchOutcome>, RuntimeError> {
+            unimplemented!("recovery is a separate explicit act")
+        }
+
+        fn observe(
+            &self,
+            _: &RuntimeHandle,
+            _: Timestamp,
+        ) -> Result<LivenessObservation, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn wait(
+            &self,
+            _: &RuntimeHandle,
+            _: LivenessKind,
+            _: Timestamp,
+        ) -> Result<LivenessObservation, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn read_view(
+            &self,
+            _: &RuntimeHandle,
+            _: u32,
+            _: Timestamp,
+        ) -> Result<String, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn doorbell(
+            &self,
+            _: &RuntimeHandle,
+            _: Timestamp,
+        ) -> Result<DeliveryReport, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn prompt(
+            &self,
+            _: &RuntimeHandle,
+            _: &str,
+            _: Timestamp,
+        ) -> Result<DeliveryReport, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn control(
+            &self,
+            _: &RuntimeHandle,
+            _: ControlAction,
+            _: Timestamp,
+        ) -> Result<EffectReport, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn stop(
+            &self,
+            _: &RuntimeHandle,
+            _: StopMode,
+            _: Timestamp,
+        ) -> Result<EffectReport, RuntimeError> {
+            unimplemented!()
+        }
+
+        fn reassociate(
+            &self,
+            _: &RuntimeHandle,
+            _: Timestamp,
+        ) -> Result<RuntimeHandle, RuntimeError> {
+            unimplemented!()
+        }
+    }
+
+    fn worker_subject() -> LaunchSubject {
+        LaunchSubject::WorkerAttempt {
+            attempt: AttemptId::new("att-1").expect("valid attempt"),
+            credential: CredentialId::new("cred-1").expect("valid credential"),
+        }
+    }
+
+    fn launch_spec() -> LaunchSpec {
+        LaunchSpec {
+            subject: worker_subject(),
+            correlation: LaunchCorrelation::new("abacus-att-1").expect("valid correlation"),
+            agent_kind: "claude".to_owned(),
+            executable: "claude".to_owned(),
+            args: Vec::new(),
+            working_directory: HostPath::new("/worktrees/att-1").expect("valid path"),
+            environment: std::collections::BTreeMap::new(),
+            envelope: EnvelopeSnapshot::new("do the assigned work".to_owned(), rev('c').0)
+                .expect("bounded envelope"),
+            startup_deadline: Timestamp(1_000),
+            delivery_deadline: Timestamp(2_000),
+        }
+    }
+
+    fn launch_secret() -> EphemeralLaunchSecret {
+        EphemeralLaunchSecret::new("a".repeat(32), worker_subject()).expect("valid secret")
+    }
+
+    fn launched_outcome() -> LaunchOutcome {
+        LaunchOutcome {
+            handle: RuntimeHandle::new("arh1|abacus-workers-r1|p2|g1"),
+            observation: LivenessObservation {
+                observed_at: Timestamp(5),
+                kind: LivenessKind::Starting,
+            },
+            startup_delivery: StartupDelivery::Submitted,
+        }
+    }
+
+    fn worker_action(operation: &str) -> FencedAction {
+        FencedAction {
+            call: FencedCall {
+                assignment: AssignmentId::new("asg-1").expect("valid assignment"),
+                attempt: AttemptId::new("att-1").expect("valid attempt"),
+                actor: worker_actor().actor,
+                token: FencingToken(1),
+                operation: op(operation),
+            },
+            responds_to: None,
+        }
+    }
+
+    fn report_draft() -> SignalDraft {
+        SignalDraft {
+            id: SignalId::new("sig-report-1").expect("valid signal id"),
+            sender: AuthoritySnapshot {
+                actor: worker_actor(),
+                capability: CapabilityId::new("state:report").expect("valid capability"),
+                scope: ScopeExpr::Universal,
+            },
+            subject: SubjectRef::Attempt(AttemptId::new("att-1").expect("valid attempt")),
+            body: SignalBody::Report {
+                attempt: AttemptId::new("att-1").expect("valid attempt"),
+                kind: ReportKind::Progress {
+                    phase: SemanticPhase::Verifying,
+                    summary: None,
+                },
+            },
+        }
+    }
+
+    fn evidence_fixture() -> Evidence {
+        let verification = verification();
+        Evidence::new(
+            verification.commands()[0].clone(),
+            verification,
+            0,
+            VerificationOutcome::Pass,
+            CommitId::new(&"d".repeat(40)).expect("valid commit"),
+            WorkspaceDigest::new(&"1".repeat(64)).expect("valid digest"),
+            WorkspaceDigest::new(&"2".repeat(64)).expect("valid digest"),
+            None,
+            FileDigestSet::default(),
+            None,
+        )
+        .expect("coherent evidence")
+    }
+
+    fn handoff_record() -> HandoffRecord {
+        HandoffRecord {
+            id: HandoffId::new("hnd-1").expect("valid handoff id"),
+            attempt: AttemptId::new("att-1").expect("valid attempt"),
+            commit: CommitId::new(&"9".repeat(40)).expect("valid commit"),
+            expected_base: CommitId::new(&"d".repeat(40)).expect("valid commit"),
+            clean_tree: WorkspaceDigest::new(&"3".repeat(64)).expect("valid digest"),
+            changed_paths: PathSet::new(vec![WorkPath::new("src/lib.rs").expect("valid path")])
+                .expect("valid path set"),
+            evidence_operations: OperationSet::new(vec![op("op-evidence-1")])
+                .expect("valid operations"),
+            attestation: rev('8').0,
+        }
+    }
+
+    fn fenced_response(head: u64) -> FencedResponse {
+        FencedResponse {
+            applied: StateApplied::Applied,
+            binding_directives: Vec::new(),
+            head: Seq(head),
         }
     }
 
@@ -291,6 +968,22 @@ mod tests {
         attempts: RefCell<Vec<ApplicationAttempt>>,
         receipts: RefCell<Vec<ApplicationReceipt>>,
         decisions: RefCell<Vec<DecisionRecord>>,
+        openings: RefCell<Vec<AssignmentOpening>>,
+        /// Scripts an idempotent-replay opening: `AlreadyApplied`, and
+        /// no pending projection is (re)minted — modelling a replay
+        /// whose original projection already earned its receipt.
+        open_replay: Cell<bool>,
+        envelopes: RefCell<Vec<(OperationId, LaunchSubject, EnvelopeSnapshot)>>,
+        binds: RefCell<Vec<(OperationId, LaunchSubject, RuntimeHandle)>>,
+        fail_persist: Cell<bool>,
+        fail_bind: Cell<bool>,
+        events: EventLog,
+        report_calls: RefCell<Vec<(FencedAction, SignalDraft)>>,
+        report_answer: RefCell<Option<(ReportOutcome, FencedResponse)>>,
+        evidence_calls: RefCell<Vec<(FencedAction, Evidence)>>,
+        evidence_answer: RefCell<Option<(EvidenceOutcome, FencedResponse)>>,
+        handoff_calls: RefCell<Vec<(FencedAction, HandoffRecord)>>,
+        handoff_answer: RefCell<Option<(SubmissionOutcome, FencedResponse)>>,
     }
 
     impl WorkflowStatePort for RecordingState {
@@ -323,8 +1016,23 @@ mod tests {
             Ok(self.pending.borrow().clone())
         }
 
-        fn open_assignment(&self, _: &AssignmentOpening) -> Result<StateApplied, StateError> {
-            unimplemented!()
+        fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError> {
+            self.openings.borrow_mut().push(opening.clone());
+            if self.open_replay.get() {
+                return Ok(StateApplied::AlreadyApplied);
+            }
+            // Mirrors the state contract: the opening mints its
+            // mark-in-progress projection under the authorizing
+            // operation, bound to the opening's bead revision.
+            self.pending.borrow_mut().push(PendingApplication {
+                operation: opening.authorizing.operation.clone(),
+                assignment: opening.assignment.id.clone(),
+                bead: opening.assignment.bead.clone(),
+                projection: WorkProjection::MarkInProgress,
+                committed_at: Seq(1),
+                authorized_revision: Some(opening.bead_revision.clone()),
+            });
+            Ok(StateApplied::Applied)
         }
         fn append_attempt(&self, _: &AttemptOpening) -> Result<StateApplied, StateError> {
             unimplemented!()
@@ -345,24 +1053,45 @@ mod tests {
         }
         fn fenced_report(
             &self,
-            _: &FencedAction,
-            _: &SignalDraft,
+            action: &FencedAction,
+            draft: &SignalDraft,
         ) -> Result<(ReportOutcome, FencedResponse), StateError> {
-            unimplemented!()
+            self.report_calls
+                .borrow_mut()
+                .push((action.clone(), draft.clone()));
+            Ok(self
+                .report_answer
+                .borrow_mut()
+                .take()
+                .expect("this scenario scripts no report answer"))
         }
         fn fenced_evidence(
             &self,
-            _: &FencedAction,
-            _: &Evidence,
+            action: &FencedAction,
+            evidence: &Evidence,
         ) -> Result<(EvidenceOutcome, FencedResponse), StateError> {
-            unimplemented!()
+            self.evidence_calls
+                .borrow_mut()
+                .push((action.clone(), evidence.clone()));
+            Ok(self
+                .evidence_answer
+                .borrow_mut()
+                .take()
+                .expect("this scenario scripts no evidence answer"))
         }
         fn fenced_submit_handoff(
             &self,
-            _: &FencedAction,
-            _: &HandoffRecord,
+            action: &FencedAction,
+            handoff: &HandoffRecord,
         ) -> Result<(SubmissionOutcome, FencedResponse), StateError> {
-            unimplemented!()
+            self.handoff_calls
+                .borrow_mut()
+                .push((action.clone(), handoff.clone()));
+            Ok(self
+                .handoff_answer
+                .borrow_mut()
+                .take()
+                .expect("this scenario scripts no handoff answer"))
         }
         fn fenced_abort_attempt(&self, _: &FencedCall) -> Result<FencedResponse, StateError> {
             unimplemented!()
@@ -376,22 +1105,38 @@ mod tests {
         }
         fn persist_envelope(
             &self,
-            _: &OperationId,
-            _: &LaunchSubject,
-            _: &EnvelopeSnapshot,
+            operation: &OperationId,
+            subject: &LaunchSubject,
+            envelope: &EnvelopeSnapshot,
         ) -> Result<StateApplied, StateError> {
-            unimplemented!()
+            self.events.borrow_mut().push("persist_envelope");
+            if self.fail_persist.get() {
+                return Err(StateError::Unavailable);
+            }
+            self.envelopes.borrow_mut().push((
+                operation.clone(),
+                subject.clone(),
+                envelope.clone(),
+            ));
+            Ok(StateApplied::Applied)
         }
         fn envelope(&self, _: &LaunchSubject) -> Result<EnvelopeSnapshot, StateError> {
             unimplemented!()
         }
         fn bind_runtime_handle(
             &self,
-            _: &OperationId,
-            _: &LaunchSubject,
-            _: &RuntimeHandle,
+            operation: &OperationId,
+            subject: &LaunchSubject,
+            handle: &RuntimeHandle,
         ) -> Result<StateApplied, StateError> {
-            unimplemented!()
+            self.events.borrow_mut().push("bind_runtime_handle");
+            if self.fail_bind.get() {
+                return Err(StateError::Unavailable);
+            }
+            self.binds
+                .borrow_mut()
+                .push((operation.clone(), subject.clone(), handle.clone()));
+            Ok(StateApplied::Applied)
         }
         fn unbind_runtime_handle(
             &self,
@@ -561,17 +1306,589 @@ mod tests {
         }));
 
         let results = reconcile_pending(&state, &work, &[op("app-retry")]).expect("reconciles");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, op("op-accept"));
+        assert_eq!(results.reconciled.len(), 1);
+        assert_eq!(results.reconciled[0].0, op("op-accept"));
         assert_eq!(
-            results[0].1,
+            results.reconciled[0].1,
             ProjectionOutcome::Projected { after: rev('9') }
         );
+        assert!(results.unattempted.is_empty());
         assert!(state.pending.borrow().is_empty());
 
         // Nothing is left pending, so a further reconciliation is a
         // no-op rather than a second mutation.
         let again = reconcile_pending(&state, &work, &[op("app-retry-2")]).expect("reconciles");
-        assert!(again.is_empty());
+        assert!(again.reconciled.is_empty());
+        assert!(again.unattempted.is_empty());
+    }
+
+    #[test]
+    fn a_close_authorized_without_a_revision_uses_the_observed_revision() {
+        // The production Accept path mints its close projection with
+        // authorized_revision: None — the decision does not bind a bead
+        // revision. The expected revision must come from a fresh
+        // observation, never from a placeholder no real graph can match.
+        let mut pending = pending_close();
+        pending.authorized_revision = None;
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending.clone());
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('5'),
+            after: rev('9'),
+            summary: "closed".to_owned(),
+        }))
+        .with_view(Ok(BeadStatusView {
+            snapshot: snapshot("ABACUS-usecase.1", 1),
+            status: WorkStatus::InProgress,
+            revision: rev('5'),
+        }));
+
+        let outcome =
+            project_pending(&state, &work, &pending, &op("app-5")).expect("projection runs");
+        assert_eq!(outcome, ProjectionOutcome::Projected { after: rev('9') });
+
+        let closes = work.closes.borrow();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(
+            closes[0].3,
+            rev('5'),
+            "the observed revision is the precondition, not a placeholder"
+        );
+        assert_eq!(state.receipts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_observation_before_an_unauthorized_revision_close_stays_pending() {
+        let mut pending = pending_close();
+        pending.authorized_revision = None;
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending.clone());
+        // Inspection fails before any mutation is issued: a definite
+        // non-effect, recorded and left pending.
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('5'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }))
+        .with_view(Err(WorkError::ProviderUnavailable));
+
+        let outcome =
+            project_pending(&state, &work, &pending, &op("app-6")).expect("projection runs");
+        assert_eq!(
+            outcome,
+            ProjectionOutcome::Unresolved {
+                attempt: op("app-6"),
+                reason: ProjectionUnresolved::Failed(WorkError::ProviderUnavailable)
+            }
+        );
+        assert!(
+            work.closes.borrow().is_empty(),
+            "no mutation may be issued without a real precondition"
+        );
+        assert_eq!(
+            state.attempts.borrow()[0].outcome,
+            ApplicationOutcome::Failed {
+                error: WorkError::ProviderUnavailable
+            }
+        );
+        assert!(state.receipts.borrow().is_empty());
+        assert_eq!(state.pending.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_conflicting_already_present_effect_earns_no_receipt() {
+        // The bead is closed — but under the WRONG reason. The facade
+        // reports observed facts precisely so core can refuse to adopt
+        // a foreign mutation as this operation's effect.
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending_close());
+        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+            status: WorkStatus::Closed {
+                observed_reason: ObservedCloseReason::CancelledObsolete,
+            },
+            revision: rev('7'),
+        }));
+
+        let outcome = project_pending(&state, &work, &pending_close(), &op("app-7"))
+            .expect("projection runs");
+        assert_eq!(
+            outcome,
+            ProjectionOutcome::Unresolved {
+                attempt: op("app-7"),
+                reason: ProjectionUnresolved::ConflictingEffect {
+                    status: WorkStatus::Closed {
+                        observed_reason: ObservedCloseReason::CancelledObsolete,
+                    },
+                    revision: rev('7'),
+                }
+            }
+        );
+        // The attempt records the observed facts; the receipt — which
+        // would attest THIS effect is present — must not exist.
+        assert_eq!(state.attempts.borrow().len(), 1);
+        assert!(state.receipts.borrow().is_empty());
+        assert_eq!(
+            state.pending.borrow().len(),
+            1,
+            "a conflicting effect stays pending: resolution is a decision"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_close_reason_never_satisfies_a_close_projection() {
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending_close());
+        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+            status: WorkStatus::Closed {
+                observed_reason: ObservedCloseReason::UnrecognizedProviderReason,
+            },
+            revision: rev('7'),
+        }));
+
+        let outcome = project_pending(&state, &work, &pending_close(), &op("app-8"))
+            .expect("projection runs");
+        assert!(
+            matches!(
+                outcome,
+                ProjectionOutcome::Unresolved {
+                    reason: ProjectionUnresolved::ConflictingEffect { .. },
+                    ..
+                }
+            ),
+            "an out-of-band close is not this operation's effect"
+        );
+        assert!(state.receipts.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_mark_projection_never_adopts_a_closed_beads_effect() {
+        let pending = PendingApplication {
+            projection: WorkProjection::MarkInProgress,
+            ..pending_close()
+        };
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending.clone());
+        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+            status: WorkStatus::Closed {
+                observed_reason: ObservedCloseReason::AcceptedHandoff,
+            },
+            revision: rev('7'),
+        }));
+
+        let outcome =
+            project_pending(&state, &work, &pending, &op("app-9")).expect("projection runs");
+        assert!(
+            matches!(
+                outcome,
+                ProjectionOutcome::Unresolved {
+                    reason: ProjectionUnresolved::ConflictingEffect { .. },
+                    ..
+                }
+            ),
+            "closed is terminal: it can never satisfy mark-in-progress"
+        );
+        assert!(state.receipts.borrow().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_names_the_unattempted_remainder() {
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending_close());
+        state.pending.borrow_mut().push(PendingApplication {
+            operation: op("op-accept-2"),
+            ..pending_close()
+        });
+        // One attempt identity for two pending projections: the second
+        // must be NAMED as uncovered, never silently dropped.
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "closed".to_owned(),
+        }));
+
+        let pass = reconcile_pending(&state, &work, &[op("app-10")]).expect("reconciles");
+        assert_eq!(pass.reconciled.len(), 1);
+        assert_eq!(pass.reconciled[0].0, op("op-accept"));
+        assert_eq!(
+            pass.unattempted,
+            vec![op("op-accept-2")],
+            "partial passes are legitimate; silent truncation is not"
+        );
+    }
+
+    #[test]
+    fn selection_accepts_only_advice_bound_to_the_current_revision() {
+        let work = ReadyWork {
+            revision: rev('1'),
+            ready: vec![snapshot("ABACUS-b.1", 0), snapshot("ABACUS-b.2", 2)],
+        };
+        // The advisor inverts the fallback order and is bound to the
+        // revision the ready set was read at — so its order governs.
+        let advice = ScriptedAdvice::new(AdviceOutcome::Advice {
+            order: vec![
+                BeadId::new("ABACUS-b.2").expect("valid"),
+                BeadId::new("ABACUS-b.1").expect("valid"),
+            ],
+            bound_to: rev('1'),
+        });
+
+        let selection = select_ready(&work, &advice).expect("selection runs");
+        assert_eq!(selection.revision, rev('1'));
+        assert_eq!(selection.ready.len(), 2);
+        assert_eq!(
+            selection.order,
+            vec![
+                BeadId::new("ABACUS-b.2").expect("valid"),
+                BeadId::new("ABACUS-b.1").expect("valid"),
+            ]
+        );
+
+        // Advice was solicited against exactly the bracketed revision
+        // and eligible set.
+        let asked = advice.asked.borrow();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].0, rev('1'));
+        assert_eq!(asked[0].1.len(), 2);
+    }
+
+    #[test]
+    fn selection_falls_back_deterministically_on_stale_advice() {
+        let work = ReadyWork {
+            revision: rev('1'),
+            ready: vec![snapshot("ABACUS-b.2", 2), snapshot("ABACUS-b.1", 0)],
+        };
+        // Same permutation, but bound to a revision the graph has
+        // moved past: the gate must discard it.
+        let advice = ScriptedAdvice::new(AdviceOutcome::Advice {
+            order: vec![
+                BeadId::new("ABACUS-b.2").expect("valid"),
+                BeadId::new("ABACUS-b.1").expect("valid"),
+            ],
+            bound_to: rev('2'),
+        });
+
+        let selection = select_ready(&work, &advice).expect("selection runs");
+        assert_eq!(
+            selection.order,
+            vec![
+                BeadId::new("ABACUS-b.1").expect("valid"),
+                BeadId::new("ABACUS-b.2").expect("valid"),
+            ],
+            "stale advice yields the priority-then-id fallback"
+        );
+    }
+
+    #[test]
+    fn an_opened_assignment_projects_mark_in_progress_under_its_operation() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "in progress".to_owned(),
+        }));
+
+        let outcome =
+            assign_ready(&state, &work, &opening(), &op("app-1")).expect("assignment runs");
+        assert_eq!(outcome.opening, StateApplied::Applied);
+        assert_eq!(
+            outcome.projection,
+            Some(ProjectionOutcome::Projected { after: rev('9') })
+        );
+
+        // The opening bundle was committed before any provider
+        // mutation, and the mark-in-progress rode the SAME authorizing
+        // operation under the opening's bead revision.
+        assert_eq!(state.openings.borrow().len(), 1);
+        let marks = work.marks.borrow();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].0, bead());
+        assert_eq!(marks[0].1, op("op-assign"));
+        assert_eq!(marks[0].2, rev('e'));
+
+        assert_eq!(state.attempts.borrow().len(), 1);
+        assert_eq!(state.receipts.borrow().len(), 1);
+        assert!(state.pending.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_ambiguous_opening_projection_stays_pending() {
+        let state = RecordingState::default();
+        let work = ScriptedWork::new(Err(WorkError::AmbiguousOutcome));
+
+        let outcome =
+            assign_ready(&state, &work, &opening(), &op("app-2")).expect("assignment runs");
+        assert_eq!(outcome.opening, StateApplied::Applied);
+        assert_eq!(
+            outcome.projection,
+            Some(ProjectionOutcome::Unresolved {
+                attempt: op("app-2"),
+                reason: ProjectionUnresolved::Ambiguous
+            })
+        );
+        assert!(
+            state.receipts.borrow().is_empty(),
+            "an unknown outcome must never manufacture a receipt"
+        );
+        assert_eq!(
+            state.pending.borrow().len(),
+            1,
+            "the projection stays pending and reconcilable"
+        );
+    }
+
+    #[test]
+    fn a_launch_persists_the_envelope_before_any_provider_interaction() {
+        let state = RecordingState::default();
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("sequence runs");
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::Launched {
+                launched: launched_outcome(),
+                bound: StateApplied::Applied,
+            }
+        );
+
+        // The ordering IS the contract: durable Envelope, then launch,
+        // then durable association of the returned handle.
+        assert_eq!(
+            *state.events.borrow(),
+            vec!["persist_envelope", "launch", "bind_runtime_handle"]
+        );
+
+        let envelopes = state.envelopes.borrow();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].0, op("op-persist"));
+        assert_eq!(envelopes[0].1, worker_subject());
+        assert_eq!(envelopes[0].2.content(), "do the assigned work");
+
+        let binds = state.binds.borrow();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].0, op("op-bind"));
+        assert_eq!(binds[0].1, worker_subject());
+        assert_eq!(binds[0].2, launched_outcome().handle);
+    }
+
+    #[test]
+    fn a_failed_envelope_persist_reaches_no_provider() {
+        let state = RecordingState::default();
+        state.fail_persist.set(true);
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+
+        let result = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            &op("op-persist"),
+            &op("op-bind"),
+        );
+        assert_eq!(result, Err(StateError::Unavailable));
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "nothing may reach a live session that is not already durable"
+        );
+        assert_eq!(*state.events.borrow(), vec!["persist_envelope"]);
+    }
+
+    #[test]
+    fn an_ambiguous_launch_binds_nothing_and_echoes_recovery_keys() {
+        let state = RecordingState::default();
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Ambiguous {
+                subject: worker_subject(),
+                correlation: LaunchCorrelation::new("abacus-att-1").expect("valid"),
+            }),
+            Rc::clone(&state.events),
+        );
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("sequence runs");
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::Ambiguous {
+                subject: worker_subject(),
+                correlation: LaunchCorrelation::new("abacus-att-1").expect("valid"),
+            }
+        );
+        assert!(
+            state.binds.borrow().is_empty(),
+            "no handle is known, so nothing may be associated"
+        );
+    }
+
+    #[test]
+    fn a_definite_launch_failure_is_a_typed_outcome() {
+        let state = RecordingState::default();
+        let runtime =
+            ScriptedRuntime::new(Err(RuntimeError::NotPermitted), Rc::clone(&state.events));
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("sequence runs");
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::NotLaunched {
+                error: RuntimeError::NotPermitted
+            }
+        );
+        assert!(state.binds.borrow().is_empty());
+        assert_eq!(
+            state.envelopes.borrow().len(),
+            1,
+            "the persisted Envelope remains for a future launch"
+        );
+    }
+
+    #[test]
+    fn a_bind_failure_surfaces_the_live_handle() {
+        let state = RecordingState::default();
+        state.fail_bind.set(true);
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("sequence runs");
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::LaunchedUnbound {
+                launched: launched_outcome(),
+                bind_error: StateError::Unavailable,
+            },
+            "a live session's handle must never be swallowed by a failed write"
+        );
+    }
+
+    #[test]
+    fn a_worker_report_passes_through_with_its_inband_refusal_intact() {
+        let state = RecordingState::default();
+        // The gate's in-band Abort refusal is a domain outcome, not an
+        // error: it must reach the worker exactly as the seam returned
+        // it, response envelope included.
+        *state.report_answer.borrow_mut() = Some((
+            ReportOutcome::Refused {
+                reason: DirectiveGateRefusal::AbortInForce,
+            },
+            fenced_response(7),
+        ));
+
+        let (outcome, response) =
+            record_report(&state, &worker_action("op-report-1"), &report_draft())
+                .expect("pass-through runs");
+        assert_eq!(
+            outcome,
+            ReportOutcome::Refused {
+                reason: DirectiveGateRefusal::AbortInForce
+            }
+        );
+        assert_eq!(response, fenced_response(7));
+
+        let calls = state.report_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, worker_action("op-report-1"));
+        assert_eq!(calls[0].1, report_draft());
+    }
+
+    #[test]
+    fn worker_evidence_passes_through_unaltered() {
+        let state = RecordingState::default();
+        *state.evidence_answer.borrow_mut() = Some((EvidenceOutcome::Recorded, fenced_response(9)));
+
+        let (outcome, response) =
+            record_evidence(&state, &worker_action("op-evidence-1"), &evidence_fixture())
+                .expect("pass-through runs");
+        assert_eq!(outcome, EvidenceOutcome::Recorded);
+        assert_eq!(response, fenced_response(9));
+
+        let calls = state.evidence_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, worker_action("op-evidence-1"));
+        assert_eq!(calls[0].1, evidence_fixture());
+    }
+
+    #[test]
+    fn a_handoff_submission_passes_through_unaltered() {
+        let state = RecordingState::default();
+        *state.handoff_answer.borrow_mut() = Some((
+            SubmissionOutcome::Recorded {
+                handoff: HandoffId::new("hnd-1").expect("valid"),
+            },
+            fenced_response(11),
+        ));
+
+        let (outcome, response) =
+            submit_handoff(&state, &worker_action("op-handoff-1"), &handoff_record())
+                .expect("pass-through runs");
+        assert_eq!(
+            outcome,
+            SubmissionOutcome::Recorded {
+                handoff: HandoffId::new("hnd-1").expect("valid")
+            }
+        );
+        assert_eq!(response, fenced_response(11));
+
+        let calls = state.handoff_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, worker_action("op-handoff-1"));
+        assert_eq!(calls[0].1, handoff_record());
+    }
+
+    #[test]
+    fn a_replayed_opening_with_no_pending_projection_mutates_nothing() {
+        let state = RecordingState::default();
+        state.open_replay.set(true);
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+
+        let outcome =
+            assign_ready(&state, &work, &opening(), &op("app-3")).expect("assignment runs");
+        assert_eq!(outcome.opening, StateApplied::AlreadyApplied);
+        assert_eq!(
+            outcome.projection, None,
+            "no pending projection remained, so there is nothing to project"
+        );
+        assert!(work.marks.borrow().is_empty());
+        assert!(work.closes.borrow().is_empty());
+        assert!(state.attempts.borrow().is_empty());
     }
 }
