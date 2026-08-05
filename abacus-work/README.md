@@ -57,6 +57,10 @@ The pinned `br` and `bv` representations must be proven compatible in a disposab
 
 ### Read behavior
 
+- Providers return raw bead facts (including raw labels), never a pre-built
+  `BeadSnapshot`; `WorkFacade` is the mandatory normalization boundary. This
+  structurally guarantees the ADR-0002 malformed/conflicting scope-label
+  refusals cannot be bypassed by an adapter.
 - Return a normalized work item without exposing provider payloads.
 - Return a stable content hash/revision over the bead fields that define authorized requirements.
 - Return ready/blocked work with an explicit graph revision/content hash.
@@ -169,10 +173,11 @@ implementation of that factory.
 It enforces, for every adapter: the expected-revision precondition; the
 idempotent already-present effect; single-re-inspection reconciliation of
 an ambiguous outcome; loud failure when an ambiguous mutation did not
-land; terminality of a closed bead in **both** directions (never
-re-closed under a different reason, never reopened); and the
-`set_status` `Err` contract — that an error left the bead and its
-revision untouched.
+land; observation comparison on both independent axes (status-only and
+revision-only drift), including deletion as a typed missing anomaly;
+terminality of a closed bead in **both** directions (never re-closed
+under a different reason, never reopened); and the `set_status` `Err`
+contract — that an error left the bead and its revision untouched.
 
 That last one is the reason the suite exists rather than a checklist.
 `Err` asserts the mutation *definitively did not take effect*, and the

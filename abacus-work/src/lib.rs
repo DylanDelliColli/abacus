@@ -18,7 +18,10 @@ pub mod fake;
 pub mod id_seam;
 pub mod scope_labels;
 
-pub use adapter::{AdviceAnalysis, AdviceProvider, ProviderMutation, TargetStatus, WorkProvider};
+pub use adapter::{
+    AdviceAnalysis, AdviceProvider, ProviderMutation, RawBeadSnapshot, RawBeadStatusView,
+    TargetStatus, WorkProvider,
+};
 pub use facade::{AdviceFacade, MAX_SUMMARY_LEN, WorkFacade};
 pub use fake::{FakeAdvisor, FakeWorkProvider, Script};
 pub use id_seam::{

@@ -11,7 +11,7 @@
 //! facade) instead of being re-derived by every provider adapter. An
 //! adapter reports what it observed; it does not decide what that means.
 
-use abacus_core::ports::{BeadStatusView, CloseReason, WorkError, WorkRevision};
+use abacus_core::ports::{CloseReason, WorkError, WorkRevision, WorkStatus};
 use abacus_core::{BeadId, ContentHash, OperationId};
 
 /// Provider facts before ABACUS applies scope-label normalization.
@@ -21,6 +21,16 @@ pub struct RawBeadSnapshot {
     pub content_hash: ContentHash,
     pub raw_labels: Vec<String>,
     pub priority: u8,
+}
+
+/// Provider inspection facts before the facade normalizes the embedded
+/// snapshot. An adapter cannot manufacture the core-facing scope map or
+/// priority because neither exists in this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBeadStatusView {
+    pub snapshot: RawBeadSnapshot,
+    pub status: WorkStatus,
+    pub revision: WorkRevision,
 }
 
 /// The state a decision-gated mutation drives a bead toward.
@@ -54,14 +64,16 @@ pub enum ProviderMutation {
     Ambiguous,
 }
 
-/// Normalized reads and raw mutations over one work graph.
+/// Raw reads and normalized mutations over one work graph.
 ///
 /// Implementors do NOT enforce expected-revision preconditions and do
-/// NOT interpret ambiguity; see [`ProviderMutation`].
+/// NOT interpret ambiguity; see [`ProviderMutation`]. Snapshot facts stay
+/// raw until the facade so scope-label and priority normalization cannot
+/// be bypassed by an adapter.
 pub trait WorkProvider {
     fn ready(&self) -> Result<(WorkRevision, Vec<RawBeadSnapshot>), WorkError>;
 
-    fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError>;
+    fn inspect(&self, id: &BeadId) -> Result<RawBeadStatusView, WorkError>;
 
     /// Drive `id` to `target`, carrying the authorizing operation
     /// identity for the provider's own audit trail.

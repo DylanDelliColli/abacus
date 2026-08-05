@@ -100,6 +100,35 @@ pub struct BeadStatusView {
     pub revision: WorkRevision,
 }
 
+/// Caller-supplied receipt facts used to detect a provider mutation that
+/// occurred outside the committed ABACUS operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedWorkObservation {
+    pub status: WorkStatus,
+    pub revision: WorkRevision,
+    pub operation: OperationId,
+}
+
+/// The normalized result of comparing provider facts with a caller's
+/// expected receipt. Core correlates the operation against the Ledger; the
+/// work module never reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkObservation {
+    Clean {
+        observed: BeadStatusView,
+    },
+    OutOfBandMutation {
+        expected: ExpectedWorkObservation,
+        observed: BeadStatusView,
+    },
+    /// The expected bead no longer exists in the provider. Deletion is
+    /// itself an out-of-band mutation, not an ordinary inspection error.
+    Missing {
+        id: BeadId,
+        expected: ExpectedWorkObservation,
+    },
+}
+
 /// Bounded curated close reasons (ADR-0001 §9.4). Not chosen freely at
 /// decision sites: `Accept` projects `AcceptedHandoff` and `Cancel`
 /// projects `CancelledObsolete` structurally, so cross-pairing is
@@ -160,6 +189,34 @@ pub trait WorkGraphPort {
 
     /// Read-before-write reconciliation primitive.
     fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError>;
+
+    /// Compare one provider observation with receipt facts supplied by the
+    /// caller. This is a read-only correlation primitive: the work module
+    /// does not consult the Ledger or infer operation identity. A missing
+    /// bead is returned as [`WorkObservation::Missing`]; other inspection
+    /// failures remain [`WorkError`]s.
+    fn compare_observation(
+        &self,
+        id: &BeadId,
+        expected: &ExpectedWorkObservation,
+    ) -> Result<WorkObservation, WorkError> {
+        match self.inspect(id) {
+            Ok(observed)
+                if observed.status == expected.status && observed.revision == expected.revision =>
+            {
+                Ok(WorkObservation::Clean { observed })
+            }
+            Ok(observed) => Ok(WorkObservation::OutOfBandMutation {
+                expected: expected.clone(),
+                observed,
+            }),
+            Err(WorkError::NotFound) => Ok(WorkObservation::Missing {
+                id: id.clone(),
+                expected: expected.clone(),
+            }),
+            Err(error) => Err(error),
+        }
+    }
 
     /// Project an Assignment's authorizing decision (architecture
     /// §2.5): the same operation identity that opened the Assignment.

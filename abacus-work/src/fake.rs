@@ -17,7 +17,8 @@ use abacus_core::ports::{
 use abacus_core::{BeadId, ContentHash, OperationId, ScopeMap};
 
 use crate::adapter::{
-    AdviceAnalysis, AdviceProvider, ProviderMutation, RawBeadSnapshot, TargetStatus, WorkProvider,
+    AdviceAnalysis, AdviceProvider, ProviderMutation, RawBeadSnapshot, RawBeadStatusView,
+    TargetStatus, WorkProvider,
 };
 use crate::contract::{Behavior, Scenario};
 
@@ -140,7 +141,7 @@ impl FakeWorkProvider {
         }
     }
 
-    /// Attach provider labels to the bead returned by `ready`.
+    /// Attach provider labels to the bead returned by reads.
     pub fn with_raw_labels(self, id: &BeadId, labels: Vec<String>) -> Self {
         self.inner
             .borrow_mut()
@@ -251,7 +252,7 @@ impl WorkProvider for FakeWorkProvider {
         Ok((revision, open))
     }
 
-    fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError> {
+    fn inspect(&self, id: &BeadId) -> Result<RawBeadStatusView, WorkError> {
         let mut state = self.inner.borrow_mut();
         state.calls.push(Call::Inspect(id.clone()));
         if state.mutation_attempted
@@ -259,11 +260,25 @@ impl WorkProvider for FakeWorkProvider {
         {
             return Err(error);
         }
-        state
+        let view = state
             .beads
             .get(id.as_str())
             .cloned()
-            .ok_or(WorkError::NotFound)
+            .ok_or(WorkError::NotFound)?;
+        Ok(RawBeadStatusView {
+            snapshot: RawBeadSnapshot {
+                id: view.snapshot.id.clone(),
+                content_hash: view.snapshot.content_hash,
+                raw_labels: state
+                    .raw_labels
+                    .get(view.snapshot.id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+                priority: view.snapshot.priority.value(),
+            },
+            status: view.status,
+            revision: view.revision,
+        })
     }
 
     fn set_status(

@@ -18,7 +18,8 @@ use abacus_core::ports::{
 use abacus_core::{BeadId, OperationId, ScopeKey};
 
 use crate::adapter::{
-    AdviceProvider, ProviderMutation, RawBeadSnapshot, TargetStatus, WorkProvider,
+    AdviceProvider, ProviderMutation, RawBeadSnapshot, RawBeadStatusView, TargetStatus,
+    WorkProvider,
 };
 use crate::scope_labels::normalize_scope_labels;
 
@@ -72,6 +73,19 @@ impl<P: WorkProvider> WorkFacade<P> {
         })
     }
 
+    fn inspect_normalized(&self, id: &BeadId) -> Result<BeadStatusView, WorkError> {
+        let RawBeadStatusView {
+            snapshot,
+            status,
+            revision,
+        } = self.provider.inspect(id)?;
+        Ok(BeadStatusView {
+            snapshot: self.normalize(snapshot)?,
+            status,
+            revision,
+        })
+    }
+
     /// Shared decision-gated mutation path for both projections.
     fn drive(
         &self,
@@ -83,7 +97,7 @@ impl<P: WorkProvider> WorkFacade<P> {
         // Read before write. One inspection serves both the idempotency
         // check and the precondition, so the ordinary path costs one
         // extra read rather than a speculative mutation.
-        let view = self.provider.inspect(id)?;
+        let view = self.inspect_normalized(id)?;
 
         // A closed bead is TERMINAL at this seam. Report the observed
         // facts and let core correlate them against the Ledger; never
@@ -141,7 +155,7 @@ impl<P: WorkProvider> WorkFacade<P> {
                 // inspect before any retry — so a transport failure
                 // during reconciliation cannot be mistaken for a
                 // no-op and turned into a double-apply.
-                let Ok(observed) = self.provider.inspect(id) else {
+                let Ok(observed) = self.inspect_normalized(id) else {
                     return Err(WorkError::AmbiguousOutcome);
                 };
                 if already_satisfies(observed.status, target) {
@@ -208,7 +222,7 @@ impl<P: WorkProvider> WorkGraphPort for WorkFacade<P> {
     }
 
     fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError> {
-        self.provider.inspect(id)
+        self.inspect_normalized(id)
     }
 
     fn mark_in_progress(
@@ -234,7 +248,7 @@ impl<P: WorkProvider> WorkGraphPort for WorkFacade<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::FakeWorkProvider;
+    use crate::fake::{Call, FakeWorkProvider};
 
     #[test]
     fn idempotency_matrix_is_exhaustive() {
@@ -298,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_normalizes_provider_labels_at_the_facade_boundary() {
+    fn facade_normalizes_provider_labels_before_reads_or_mutations() {
         let id = BeadId::new("ABACUS-test").expect("valid bead id");
         let provider = FakeWorkProvider::with_bead(&id, WorkStatus::Open, 1)
             .with_raw_labels(&id, vec!["area:auth".to_owned(), "area:billing".to_owned()]);
@@ -307,11 +321,32 @@ mod tests {
             vec![abacus_core::ScopeKey::new("area").expect("valid scope key")],
         );
 
+        let conflict = WorkError::ScopeLabelConflict {
+            key: "area".to_owned(),
+        };
+        assert_eq!(facade.ready(), Err(conflict.clone()));
+        assert_eq!(facade.inspect(&id), Err(conflict.clone()));
+
+        let expected = abacus_core::ports::ExpectedWorkObservation {
+            status: WorkStatus::Open,
+            revision: crate::fake::rev(1),
+            operation: OperationId::new("op-normalization-test").expect("valid operation id"),
+        };
         assert_eq!(
-            facade.ready(),
-            Err(WorkError::ScopeLabelConflict {
-                key: "area".to_owned()
-            })
+            facade.compare_observation(&id, &expected),
+            Err(conflict.clone())
+        );
+        assert_eq!(
+            facade.mark_in_progress(&id, &expected.operation, &expected.revision),
+            Err(conflict)
+        );
+        assert!(
+            facade
+                .provider()
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, Call::SetStatus { .. })),
+            "scope-label refusal must occur before any provider mutation"
         );
     }
 

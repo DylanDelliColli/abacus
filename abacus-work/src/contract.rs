@@ -13,10 +13,10 @@
 //! actually exists.
 
 use abacus_core::ports::{
-    CloseReason, MutationOutcome, ObservedCloseReason, WorkError, WorkGraphPort, WorkRevision,
-    WorkStatus,
+    CloseReason, ExpectedWorkObservation, MutationOutcome, ObservedCloseReason, WorkError,
+    WorkGraphPort, WorkObservation, WorkRevision, WorkStatus,
 };
-use abacus_core::{BeadId, OperationId};
+use abacus_core::{BeadId, ContentHash, OperationId};
 
 use crate::adapter::WorkProvider;
 use crate::facade::{MAX_SUMMARY_LEN, WorkFacade};
@@ -65,6 +65,20 @@ fn operation() -> OperationId {
     OperationId::new("op-contract-1").expect("valid operation id")
 }
 
+fn revision(seed: u32) -> WorkRevision {
+    WorkRevision(
+        ContentHash::new(&format!("{seed:064x}"))
+            .expect("seeded contract revision is 64 lowercase hex"),
+    )
+}
+
+fn revision_other_than(actual: &WorkRevision) -> WorkRevision {
+    [revision(9_998), revision(9_999)]
+        .into_iter()
+        .find(|candidate| candidate != actual)
+        .expect("two distinct candidates cannot both equal one revision")
+}
+
 /// Read the bead's current revision through the port, so the suite never
 /// assumes how an implementation derives revisions.
 fn current_revision<P: WorkProvider>(facade: &WorkFacade<P>, bead: &BeadId) -> WorkRevision {
@@ -86,6 +100,10 @@ where
 {
     let bead = BeadId::new("ABACUS-omw.1").expect("valid bead id");
 
+    reports_a_matching_observation_as_clean(&build, &bead);
+    reports_status_only_drift_as_out_of_band(&build, &bead);
+    reports_revision_only_drift_as_out_of_band(&build, &bead);
+    reports_a_missing_expected_bead_as_anomaly(&build, &bead);
     applies_on_matching_revision(&build, &bead);
     refuses_a_stale_expected_revision(&build, &bead);
     is_idempotent_when_the_effect_is_present(&build, &bead);
@@ -96,6 +114,111 @@ where
     bounds_the_audit_summary(&build, &bead);
     treats_a_closed_bead_as_terminal(&build, &bead);
     never_reopens_a_closed_bead(&build, &bead);
+}
+
+fn reports_a_matching_observation_as_clean<P: WorkProvider>(
+    build: &impl Fn(&Scenario) -> P,
+    bead: &BeadId,
+) {
+    let facade = WorkFacade::new(build(&Scenario::new(
+        bead.clone(),
+        WorkStatus::Open,
+        7,
+        Behavior::Normal,
+    )));
+    let actual = facade.inspect(bead).expect("bead is present");
+    let expected = ExpectedWorkObservation {
+        status: actual.status,
+        revision: actual.revision.clone(),
+        operation: operation(),
+    };
+
+    assert_eq!(
+        facade.compare_observation(bead, &expected),
+        Ok(WorkObservation::Clean { observed: actual }),
+        "matching status AND revision must be clean"
+    );
+}
+
+fn reports_status_only_drift_as_out_of_band<P: WorkProvider>(
+    build: &impl Fn(&Scenario) -> P,
+    bead: &BeadId,
+) {
+    let facade = WorkFacade::new(build(&Scenario::new(
+        bead.clone(),
+        WorkStatus::InProgress,
+        7,
+        Behavior::Normal,
+    )));
+    let observed = facade.inspect(bead).expect("bead is present");
+    let expected = ExpectedWorkObservation {
+        status: WorkStatus::Open,
+        revision: observed.revision.clone(),
+        operation: operation(),
+    };
+
+    assert_eq!(
+        facade.compare_observation(bead, &expected),
+        Ok(WorkObservation::OutOfBandMutation {
+            expected: expected.clone(),
+            observed,
+        }),
+        "matching revision must not hide status drift"
+    );
+}
+
+fn reports_revision_only_drift_as_out_of_band<P: WorkProvider>(
+    build: &impl Fn(&Scenario) -> P,
+    bead: &BeadId,
+) {
+    let facade = WorkFacade::new(build(&Scenario::new(
+        bead.clone(),
+        WorkStatus::Open,
+        8,
+        Behavior::Normal,
+    )));
+    let observed = facade.inspect(bead).expect("bead is present");
+    let expected = ExpectedWorkObservation {
+        status: observed.status,
+        revision: revision_other_than(&observed.revision),
+        operation: operation(),
+    };
+
+    assert_eq!(
+        facade.compare_observation(bead, &expected),
+        Ok(WorkObservation::OutOfBandMutation {
+            expected: expected.clone(),
+            observed,
+        }),
+        "matching status must not hide revision drift"
+    );
+}
+
+fn reports_a_missing_expected_bead_as_anomaly<P: WorkProvider>(
+    build: &impl Fn(&Scenario) -> P,
+    missing: &BeadId,
+) {
+    let present = BeadId::new("ABACUS-contract.present").expect("valid bead id");
+    let facade = WorkFacade::new(build(&Scenario::new(
+        present,
+        WorkStatus::Open,
+        9,
+        Behavior::Normal,
+    )));
+    let expected = ExpectedWorkObservation {
+        status: WorkStatus::Open,
+        revision: revision(7),
+        operation: operation(),
+    };
+
+    assert_eq!(
+        facade.compare_observation(missing, &expected),
+        Ok(WorkObservation::Missing {
+            id: missing.clone(),
+            expected: expected.clone(),
+        }),
+        "deletion under a receipt holder is an anomaly, not NotFound"
+    );
 }
 
 /// A closed bead is terminal: a close carrying a DIFFERENT curated
@@ -197,7 +320,7 @@ fn refuses_a_stale_expected_revision<P: WorkProvider>(
     )));
     // Any revision that is not the current one is stale by definition.
     let current = current_revision(&facade, bead);
-    let stale = WorkRevision(crate::fake::hash(9_999));
+    let stale = revision_other_than(&current);
     assert_ne!(
         stale, current,
         "test fixture must supply a truly stale revision"
