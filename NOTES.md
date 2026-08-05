@@ -11,6 +11,8 @@ Two rounds of adversarial review from the legacy SABLE repository assessed the A
 
 The reviewer's falsifiable claims stand as the build's success criteria: modules compose; core stabilizes after Phase 2; optional liveness never becomes kernel correctness; planning and delivery extend rather than rewrite execution; verification time stays bounded as capabilities grow.
 
+**Addendum (2026-08-05, operator decision): the doorbell is non-negotiable v1 scope.** The attention service — deterministic ordinary-software liveness deriving attention obligations from workflow state, at-least-once content-free ringing, bounded re-ring, escalation — is required product, arriving by its own ADR exactly as the I12 boundary reading provides (`abacus-ikq` carries the reviewer's full requirements and critical proofs). Kernel correctness still survives its absence; the product does not ship without it. "Safe when absent" is an architecture property, not a licence to omit.
+
 ## 2026-08-04/05 — overnight log (Claude + Codex autonomous)
 
 Running summary for the operator; beads remain authoritative. **MORNING** marks items needing an operator decision.
