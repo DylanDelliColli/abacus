@@ -17,6 +17,7 @@ pub mod evidence;
 pub mod id;
 pub mod lease;
 pub mod lifecycle;
+pub mod signal;
 
 pub use assignment::{
     next_attempt_allowed, recheck_bead_hash, AttemptSequenceError, BeadHashMismatch, DecisionActor,
@@ -28,7 +29,15 @@ pub use evidence::{
     evaluate_red_green_pair, Evidence, OverlayCapture, OverlayFile, PairRefusal, RedGreenPolicy,
     VerificationOutcome,
 };
-pub use id::{ActorId, AssignmentId, AttemptId, BeadId, IdError, ProfileName};
+pub use id::{
+    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, IdError, ProfileName, SignalId,
+};
+pub use signal::{
+    append_idempotent, binding_directives, directive_status, handoff_gate, unresolved,
+    AppendOutcome, ConflictingDuplicate, DirectiveGateRefusal, DirectiveKind, DirectiveStatus,
+    ReportKind, RequestKind, ResponseAction, ResponseKind, ScopeText, SenderFence, Seq, Signal,
+    SignalBody, SubjectError, SubjectRef,
+};
 pub use lease::{validate_fencing, FencingError, FencingToken, Lease, Timestamp};
 pub use lifecycle::{
     assignment_transition, attempt_transition, AssignmentAction, AssignmentState, AttemptAction,
