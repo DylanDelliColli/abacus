@@ -2,9 +2,9 @@
 
 Date: 2026-08-04  
 Host: Linux x86_64  
-Codex CLI: v0.146.0  
+Codex CLI: v0.146.0 (transport probes); v0.146.1 (faithful HPG.5 carriage)\
 Claude Code: v2.1.221  
-Status: Claude direct socket access passes; Codex v0.146.0 direct socket access is denied on Linux; command-scoped host-relay feasibility passes from direct and Herdr-launched Codex sessions; ADR-0003 revision 5 remains Proposed pending the faithful runtime-carriage prototype, production-rule/dynamic-stdin HPG.5 controls, and operator sign-off
+Status: Claude direct socket access passes; Codex v0.146.0 direct socket access is denied on Linux; command-scoped host-relay feasibility passes from direct and Herdr-launched Codex sessions; the production-rule, absent-rule, dynamic-composer, and faithful runtime-carriage HPG.5 controls pass; ADR-0003 revision 5 remains Proposed pending operator sign-off
 
 ## Question
 
@@ -155,9 +155,136 @@ The decision rejects loopback TCP, workspace request files, polling, a broad Cod
 
 Repository initialization may print the exact operator-applied installation/rule surface, but must never edit global agent configuration. The two upstream Codex improvements remain useful future avenues, not v1 dependencies: Linux Unix-socket allowlist parity and named-descriptor preservation through model-issued commands. Either would require a provider repin and this compatibility lane before changing carriage selection.
 
-## Remaining HPG.5 controls
+## HPG.5 production-rule and faithful-carriage validation (2026-08-05)
 
-- obtain operator sign-off on ADR-0003 before marking it Accepted or closing the transport-design bead;
-- from a fresh Codex session, validate the actual operator-installed exact `decision = "allow"` rule rather than the feasibility run's automatic review;
-- repeat from a fresh Codex session with that rule absent and record the exact agent-boundary denial; no ABACUS process should run and no alternate transport or retry may occur;
-- replace the hard-coded feasibility request with the production-shaped live exec session and one runtime-supplied `write_stdin` typed-JSON request/structured response, preserving the exact-command, deadline, one-process/one-connection, and cleanup checks.
+The remaining technical gates ran as disposable prototypes. No probe code is
+production ABACUS. The full runtime leg used a second Herdr v0.8.0/protocol-19
+server with isolated XDG roots and sockets, an initially empty session, and a
+disposable Git repository. The dispatcher hard-coded only those isolated
+Scribe and Herdr sockets. It never addressed the shared production Herdr
+socket, whose log and session contained none of the probe target or launch
+identities.
+
+Artifact identities for the faithful r5 run were:
+
+| Artifact | SHA-256 / identity |
+|---|---|
+| installed fixed-function `abacus` and source | `3031b467fd76c6cc0ce66bd2bcffb579b953de7bb92622e01dfa85cd68f0dba1` |
+| disposable Scribe/auth peer | `b2fec4d2dcfb2f4d78fdc0b6d7f86f9b36703e4f6e0ca2470a0c65a0d3e88e2d` |
+| same-uid process-metadata scanner | `22f877eacaeb9b189c6460f73e000f2ed0383230e86471bef78a657e95b176e6` |
+| selected-artifact plaintext scanner | `83463f08503c066c8f491dd67855b4dcd26fadcd27b7b75da4fad74f7b7cb7f5` |
+| isolated Herdr config | `63a3490edea9742dd0692be9f7092bd3b62067a1a5fc7acfc50bd733752bf79b` |
+| Herdr binary | v0.8.0, protocol 19, 21,776,680 bytes, `b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28` |
+| agent/runtime | Codex v0.146.1; Python 3.13.9 |
+
+The installed dispatcher was byte-identical to its recorded source, mode
+`0555`, outside both disposable agents' writable roots. Its parent was `0755`;
+the isolated Scribe and Herdr sockets were each `0600`. Both public verbs still
+accepted exactly two argv tokens and one bounded JSON line on stdin.
+
+### Fresh loaded-rule and absent-rule controls
+
+A fresh ephemeral Codex session loaded temporary operator-installed allow rules
+for the exact absolute r3 dispatcher path plus the literal `scribe-rpc` and
+`runtime-rpc` verbs. The injected approved-prefix snapshot contained both exact
+surfaces. The agent opened two `scribe-rpc` processes and performed exactly one
+`write_stdin` on each: the first credential-creating opening committed at the
+peer but lost its response and returned typed `ambiguous` (exit 75); the explicit
+reissue carried the returned provisioning, committed nothing new, and returned
+`already-applied` with the identical credential id and 64-hex secret. The peer
+recorded one opening only. This replaces the feasibility probe's hard-coded
+request with the required live exec-session/dynamic-stdin composer behavior.
+
+The first attempted absent-rule control was discarded because its fresh session
+still inherited the temporary rules. The valid r4 control used an isolated Git
+root and `codex exec --ephemeral --ignore-user-config --ignore-rules` with
+`approval_policy="never"`. It requested the same exact host action once, received
+the agent-boundary refusal `Approval policy is currently never. Do not provide
+sandbox_permissions when approval policy is never.`, and stopped. No dispatcher
+process, socket connection, `write_stdin`, alternate transport, or retry
+occurred. The temporary rules were then removed; the global rules file returned
+to its pre-probe SHA-256
+`3a0682587b80e79a4e3a28c57f635c537f1314a0ec68c1b98aacf47037964a93`.
+
+### Faithful `runtime-rpc` chain
+
+The r5 public runtime schema contained exactly `version`, `request_id`,
+`repo_id`, authenticated actor, closed worker-Attempt subject plus credential
+id, operation, bounded deadline, and transient secret. It exposed no executable,
+argv, cwd, environment, Envelope, provider target, pane, or socket coordinate.
+The host side sent the digest and binding to the isolated Scribe peer first;
+only an atomic authorized-and-burned response supplied the already-persisted
+sanitized Envelope and operator-resolved target. The dispatcher then issued a
+newline-delimited `agent.prompt` request directly on the pinned isolated Herdr
+socket. No high-level Herdr argv carried startup material.
+
+Each of three r5 credential openings independently exercised the same
+commit-response-loss and explicit-reissue path as r3: one `write_stdin` per
+process, typed `ambiguous` followed by `already-applied`, identical provisioning,
+and exactly one durable opening. The first runtime setup used Codex's nondefault
+`--no-alt-screen` mode. Authorization, burn, direct socket submission, and the
+process scan passed, but the target did not receive the prompt even though Herdr
+returned `agent_prompted`. This row was discarded: the existing pinned-provider
+record already classifies that launch mode as unsupported. The target was
+cleanly restarted under Codex's supported default TUI before the certification
+rows.
+
+The supported success row then passed the complete chain:
+
+1. one approved `abacus runtime-rpc` process received one dynamic stdin request;
+2. Scribe authenticated the actor and subject binding and atomically burned the
+   one-shot secret before any Herdr request;
+3. the runtime sent exactly one direct-socket `agent.prompt` request;
+4. the command returned typed `submitted`; and
+5. the disposable Codex target returned exactly `HPG5_STARTUP_RECEIVED` and
+   settled back to `idle`.
+
+During the live pre-authorization hold, a same-uid `/proc` scanner inspected 78
+readable `cmdline`/`environ` fields across the composer, Scribe peer, Herdr,
+target agent, and other same-uid processes; four racing/protected fields were
+unreadable and zero contained the secret. The supported row repeated the scan
+with the same 78/4/zero result. A separate exact-plaintext scan of six selected
+ABACUS-owned prototype/state/log artifacts found zero matches for all three
+secrets. As ADR-0003 states, Herdr and Codex necessarily receive startup
+plaintext and the provider-owned terminal/native transcript retains it; that is
+the accepted revocation-bounded residual, not an ABACUS-owned state/log claim.
+
+### Fail-closed and ambiguous-delivery controls
+
+| Control | State/Scribe observation | Herdr observation | Result |
+|---|---|---|---|
+| Public request adds hostile `executable`, `args`, `cwd`, `env`, and `envelope` fields | no request/event | prompt count unchanged | exit 64, typed `unsupported-field` |
+| Actor credential is unauthorized | one typed `refused-credential-invalid` event | prompt count unchanged | exit 1; authorization stopped the chain |
+| Simulated loss after a real Herdr submission | one `authorized-and-burned` event | prompt count increased by exactly one | exit 75, typed `ambiguous` |
+| Explicit reissue of that exact request/secret | one `refused-credential-burned` event | prompt count unchanged | exit 1; no redelivery |
+
+The target's non-secret response marker appeared exactly twice across the
+supported success and the single ambiguous submission. The isolated Herdr log
+recorded three total runtime prompt submissions only because it also retained
+the explicitly discarded no-alt-screen setup row. The shared production Herdr
+log/session recorded zero probe launch or target identities.
+
+The Scribe peer's final eleven-event summary was three opening commits with
+dropped responses, three explicit `already-applied` reissues, three authorized
+one-shot burns (discarded setup, supported success, ambiguous submission), one
+unauthorized-actor refusal, and one burned-secret refusal. The hostile-schema
+request never reached it. Runtime stage records contained only request ids,
+process ids, and closed stage names—never credential plaintext.
+
+Cleanup was exact and post-evidence: the target exited natively; the isolated
+Herdr server and Scribe peer stopped; five named `/tmp/abacus-hpg5-*` roots and
+three exact `/run/user/1000/abacus/abacus-hpg5-*` runtime roots were removed.
+Post-cleanup enumeration returned no HPG.5 directory in either parent, and the
+global rule file still matched its baseline hash with no HPG.5 rule. No probe
+action created, removed, or renamed a shared production Herdr workspace, pane,
+socket, or session; ordinary Claude/Codex coordination continued there
+independently. No agent configuration, hook, or repository source file changed.
+The ordinary provider-owned Codex native transcript remains the explicitly
+accepted residual described above.
+
+## Remaining decision step
+
+All executable HPG.5 preconditions and the faithful disposable runtime-carriage
+gate now pass. ADR-0003 remains Proposed, and the transport-design bead remains
+open, until the operator explicitly signs off; evidence alone does not make that
+governance decision.
