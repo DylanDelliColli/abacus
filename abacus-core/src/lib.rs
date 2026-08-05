@@ -21,6 +21,7 @@ pub mod ports;
 pub mod profile;
 pub mod scope;
 pub mod signal;
+pub mod usecase;
 
 pub use assignment::{
     AttemptCap, AttemptCapError, AttemptCapReached, AttemptPolicy, AttemptSequenceError,
