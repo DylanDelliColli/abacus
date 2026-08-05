@@ -345,6 +345,7 @@ Required behavior:
 - append/read authorized typed Signals with mandatory workflow subjects;
 - append/read ordered attempt-scoped Directives and mechanically return the current binding set in every fenced worker response;
 - append/read current-Attempt Reports and validate responding Directive/decision links;
+- accept an optional same-Attempt Directive response link only on substantive fenced worker actions (Report, Evidence, and Handoff), as part of their idempotent identity; lease renewal remains unlinkable lease machinery;
 - append actor-to-actor Requests and validate their responding fenced-decision links;
 - query per-actor and global unresolved sets derived from immutable Signals lacking their typed responding actions;
 - preserve immutable per-Attempt fenced call/response ordering from which Directive exposure and discharge are derived;
@@ -423,7 +424,7 @@ The worker does not receive direct database credentials or raw provider mutation
 3. The worker records structured progress or blocked-with-reason state as a Report from its current Attempt and lease. Managers query this durable state rather than receiving progress copies over Herdr.
 4. The Assignment's exact decision authority may append a typed, immutable Directive to the active Attempt: amended instructions within the existing bead/scope/policy, pause, abort, or an answer to a Report. Widening edit scope, changing acceptance policy, or rebinding changed bead content requires an explicit Assignment/Attempt decision instead.
 5. An in-scope actor may send another durable actor a Request for arbitration, authority transfer, or reconciliation, always with a mandatory workflow subject. Work-shaped blockers become dependency edges in `br`; unstructured strategy/chatter remains transient in Herdr.
-6. A Report is resolved only by a linked responding Directive or fenced decision. A Request is resolved only by its linked responding fenced decision. Directive discharge follows its closed kind and a later substantive responding workflow action; opening, prompting, or an acknowledgement-only record resolves nothing. `abacus signal unresolved` derives the remaining per-actor/global set.
+6. A Report is resolved only by a linked responding Directive or fenced decision. A Request is resolved only by its linked responding fenced decision. Directive discharge follows its closed kind and a later substantive responding workflow action. Report, Evidence, and Handoff calls may name the committed same-Attempt Directive they substantively answer; lease renewal cannot carry that link. Opening, prompting, renewal, or an acknowledgement-only record resolves nothing. `abacus signal unresolved` derives the remaining per-actor/global set.
 7. Only after Scribe commits a Signal does the facade ask Herdr to carry a best-effort, content-free doorbell such as “workflow signal available; query unresolved.” A Signal body never rides the prompt. Doorbell failure never rolls back the Signal and creates no retry queue.
 8. A Directive binds from commit. Exposure and discharge are derived from immutable call ordering and responding actions: a Directive committed before the worker's latest fenced call was, by construction of step 2, surfaced in that call's response. No `read_at` columns, per-Directive acknowledgement state, or client-asserted seen-head exists.
 9. Scribe/core refuses consequential actions that conflict with the current binding set. Handoff under an undischarged pause or amend Directive receives a distinct ordinary Submission refusal, records no Handoff, and leaves the Attempt active. After abort, Scribe refuses further mutating calls except abort-consistent ones.
@@ -438,6 +439,7 @@ The worker submits:
 
 - assignment and attempt identities;
 - current fencing token;
+- an optional link to the committed same-Attempt Directive this Handoff substantively answers;
 - commit object ID and expected base;
 - proof that the worker worktree is clean;
 - structured commands, raw exit details, and normalized outcomes required by the assignment policy, each with before/after workspace digests;

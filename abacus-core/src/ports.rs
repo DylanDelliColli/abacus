@@ -648,6 +648,17 @@ pub struct FencedCall {
     pub operation: OperationId,
 }
 
+/// A substantive fenced worker action, optionally linked as the
+/// response to a committed Directive on the same Attempt. The link is
+/// part of the action's idempotent identity. Lease renewal deliberately
+/// accepts [`FencedCall`] instead, so a semantically void response link
+/// on lease machinery is unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedAction {
+    pub call: FencedCall,
+    pub responds_to: Option<SignalId>,
+}
+
 /// Every fenced response mechanically surfaces the Attempt's current
 /// binding Directives and Ledger head — present even when empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,9 +852,10 @@ pub struct AssignmentView {
 /// Durable workflow persistence: the Scribe seam, shaped as
 /// transactional use-case operations. `abacus-state` implements it over
 /// SQLite; the 9NH.11 fake implements it for use-case tests. Scribe
-/// allocates all commit ordering; worker mutations ride
-/// [`FencedCall`]/[`FencedResponse`]; "pending"/"unresolved" are
-/// derived queries, never flags (I10).
+/// allocates all commit ordering; substantive worker mutations ride
+/// [`FencedAction`]/[`FencedResponse`], lease renewal rides the bare
+/// [`FencedCall`], and "pending"/"unresolved" are derived queries,
+/// never flags (I10).
 pub trait WorkflowStatePort {
     /// Commit the complete opening bundle in one transaction under the
     /// Assign decision's operation identity.
@@ -884,14 +896,14 @@ pub trait WorkflowStatePort {
     /// Fenced worker Report append; Scribe allocates `Seq`.
     fn fenced_report(
         &self,
-        call: &FencedCall,
+        action: &FencedAction,
         draft: &SignalDraft,
     ) -> Result<(Signal, FencedResponse), StateError>;
 
     /// Fenced worker Evidence append.
     fn fenced_evidence(
         &self,
-        call: &FencedCall,
+        action: &FencedAction,
         evidence: &Evidence,
     ) -> Result<FencedResponse, StateError>;
 
@@ -901,7 +913,7 @@ pub trait WorkflowStatePort {
     /// call's operation idempotently owns whichever outcome occurred.
     fn fenced_submit_handoff(
         &self,
-        call: &FencedCall,
+        action: &FencedAction,
         handoff: &HandoffRecord,
     ) -> Result<(SubmissionOutcome, FencedResponse), StateError>;
 
@@ -1517,7 +1529,10 @@ mod tests {
         validate_profiles,
     };
     use crate::scope::{ScopeExpr, ScopeKey, ScopeValue};
-    use crate::signal::{BoundedText, ReportKind, SignalBody, SubjectRef};
+    use crate::signal::{
+        BoundedText, DirectiveKind, ReportKind, ResponseAction, ResponseKind, SignalBody,
+        SubjectRef, binding_directives, handoff_gate,
+    };
     use std::cell::RefCell;
 
     fn rev(fill: char) -> WorkRevision {
@@ -1817,6 +1832,7 @@ mod tests {
         now: RefCell<Timestamp>,
         next_seq: RefCell<u64>,
         stored_signals: RefCell<Vec<Signal>>,
+        response_actions: RefCell<Vec<ResponseAction>>,
         submissions: RefCell<BTreeMap<String, (String, SubmissionOutcome)>>,
         receipts: RefCell<Vec<String>>,
         decisions: RefCell<Vec<DecisionRecord>>,
@@ -2004,16 +2020,112 @@ mod tests {
             )
         }
 
-        /// NOTE: this outcome fake returns constant directive/head
-        /// fields; only `applied` is behaviorally proven here. The
-        /// production state contract must return the operation's
-        /// causally correct response facts.
-        fn respond(&self, applied: StateApplied) -> FencedResponse {
+        /// FULL substantive-action identity: the response link is an
+        /// input fact, so changing it under the same operation is a
+        /// conflicting duplicate rather than a replay.
+        fn action_identity(action: &FencedAction) -> String {
+            format!(
+                "{}|responds_to={}",
+                Self::call_identity(&action.call),
+                action.responds_to.as_ref().map_or("-", SignalId::as_str)
+            )
+        }
+
+        fn next_ledger_seq(&self) -> Seq {
+            let mut next = self.next_seq.borrow_mut();
+            *next += 1;
+            Seq(*next)
+        }
+
+        fn current_head(&self) -> Seq {
+            Seq(*self.next_seq.borrow())
+        }
+
+        /// A link is accepted only when its target is already a
+        /// committed Directive for this exact Attempt. Directive-kind
+        /// policy deliberately remains in `directive_status`.
+        fn validate_response_target(&self, action: &FencedAction) -> Result<(), StateError> {
+            let Some(target) = &action.responds_to else {
+                return Ok(());
+            };
+            let signals = self.stored_signals.borrow();
+            let signal = signals
+                .iter()
+                .find(|signal| &signal.id == target)
+                .ok_or(StateError::UnknownRecord)?;
+            match (&signal.subject, &signal.body) {
+                (
+                    SubjectRef::Attempt(subject),
+                    SignalBody::Directive {
+                        assignment,
+                        attempt,
+                        ..
+                    },
+                ) if assignment == &action.call.assignment
+                    && subject == &action.call.attempt
+                    && attempt == &action.call.attempt =>
+                {
+                    Ok(())
+                }
+                _ => Err(StateError::IncoherentBundle),
+            }
+        }
+
+        fn response_action(action: &FencedAction, seq: Seq) -> ResponseAction {
+            ResponseAction {
+                seq,
+                kind: ResponseKind::WorkerAction {
+                    attempt: action.call.attempt.clone(),
+                    responds_to: action.responds_to.clone(),
+                },
+            }
+        }
+
+        /// Commit one fenced call ordering position. Only permitted
+        /// substantive actions enter the responding-action log; an
+        /// audited Submission refusal still advances the causal head
+        /// but cannot discharge a Directive.
+        fn commit_fenced_call(&self, action: Option<&FencedAction>, substantive: bool) -> Seq {
+            let seq = self.next_ledger_seq();
+            if substantive && let Some(action) = action {
+                self.response_actions
+                    .borrow_mut()
+                    .push(Self::response_action(action, seq));
+            }
+            seq
+        }
+
+        fn respond(&self, attempt: &AttemptId, applied: StateApplied, head: Seq) -> FencedResponse {
+            let signals = self.stored_signals.borrow();
+            let actions = self.response_actions.borrow();
             FencedResponse {
                 applied,
-                binding_directives: Vec::new(),
-                head: Seq(1),
+                binding_directives: binding_directives(attempt, &signals, &actions)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                head,
             }
+        }
+
+        fn replay_fenced_response(
+            &self,
+            verb: &str,
+            operation: &OperationId,
+            request: &str,
+            attempt: &AttemptId,
+        ) -> Result<Option<FencedResponse>, StateError> {
+            if self.replay(verb, operation, request)?.is_none() {
+                return Ok(None);
+            }
+            // A replay allocates no new ordering position, but its
+            // response still surfaces the causally current binding set
+            // and Ledger head.
+            Ok(Some(self.respond(
+                attempt,
+                StateApplied::AlreadyApplied,
+                self.current_head(),
+            )))
         }
 
         fn commit_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError> {
@@ -2034,9 +2146,7 @@ mod tests {
                 }
                 return Err(StateError::ConflictingOperation);
             }
-            let mut next = self.next_seq.borrow_mut();
-            *next += 1;
-            let committed = draft.clone().commit(Seq(*next));
+            let committed = draft.clone().commit(self.next_ledger_seq());
             self.stored_signals.borrow_mut().push(committed.clone());
             Ok((committed, StateApplied::Applied))
         }
@@ -2469,22 +2579,28 @@ mod tests {
 
         fn fenced_report(
             &self,
-            call: &FencedCall,
+            action: &FencedAction,
             draft: &SignalDraft,
         ) -> Result<(Signal, FencedResponse), StateError> {
-            let request = format!("{}|{draft:?}", Self::call_identity(call));
-            if self
-                .replay("fenced_report", &call.operation, &request)?
-                .is_some()
-                && let Some(existing) = self
+            let call = &action.call;
+            let request = format!("{}|{draft:?}", Self::action_identity(action));
+            if let Some(response) = self.replay_fenced_response(
+                "fenced_report",
+                &call.operation,
+                &request,
+                &call.attempt,
+            )? {
+                let existing = self
                     .stored_signals
                     .borrow()
                     .iter()
-                    .find(|s| s.id == draft.id)
-            {
-                return Ok((existing.clone(), self.respond(StateApplied::AlreadyApplied)));
+                    .find(|signal| signal.id == draft.id)
+                    .cloned()
+                    .ok_or(StateError::Corrupt)?;
+                return Ok((existing, response));
             }
             self.fence(call)?;
+            self.validate_response_target(action)?;
             // A durable record id belongs to exactly one operation.
             if let Some(owner) = self
                 .record_owners
@@ -2509,50 +2625,61 @@ mod tests {
                 format!("signal:{}", draft.id.as_str()),
                 call.operation.as_str().to_owned(),
             );
+            let head = self.commit_fenced_call(Some(action), true);
             self.remember("fenced_report", &call.operation, &request, applied);
-            Ok((signal, self.respond(applied)))
+            Ok((signal, self.respond(&call.attempt, applied, head)))
         }
 
         fn fenced_evidence(
             &self,
-            call: &FencedCall,
+            action: &FencedAction,
             evidence: &Evidence,
         ) -> Result<FencedResponse, StateError> {
-            let request = format!("{}|{evidence:?}", Self::call_identity(call));
-            if self
-                .replay("fenced_evidence", &call.operation, &request)?
-                .is_some()
-            {
-                return Ok(self.respond(StateApplied::AlreadyApplied));
+            let call = &action.call;
+            let request = format!("{}|{evidence:?}", Self::action_identity(action));
+            if let Some(response) = self.replay_fenced_response(
+                "fenced_evidence",
+                &call.operation,
+                &request,
+                &call.attempt,
+            )? {
+                return Ok(response);
             }
             self.fence(call)?;
+            self.validate_response_target(action)?;
+            let head = self.commit_fenced_call(Some(action), true);
             self.remember(
                 "fenced_evidence",
                 &call.operation,
                 &request,
                 StateApplied::Applied,
             );
-            Ok(self.respond(StateApplied::Applied))
+            Ok(self.respond(&call.attempt, StateApplied::Applied, head))
         }
 
         fn fenced_submit_handoff(
             &self,
-            call: &FencedCall,
+            action: &FencedAction,
             handoff: &HandoffRecord,
         ) -> Result<(SubmissionOutcome, FencedResponse), StateError> {
-            let replay_request = format!("{}|{handoff:?}", Self::call_identity(call));
-            if self
-                .replay("fenced_handoff", &call.operation, &replay_request)?
-                .is_some()
-                && let Some((_, stored)) = self
+            let call = &action.call;
+            let replay_request = format!("{}|{handoff:?}", Self::action_identity(action));
+            if let Some(response) = self.replay_fenced_response(
+                "fenced_handoff",
+                &call.operation,
+                &replay_request,
+                &call.attempt,
+            )? {
+                let (_, stored) = self
                     .submissions
                     .borrow()
                     .get(call.operation.as_str())
                     .cloned()
-            {
-                return Ok((stored, self.respond(StateApplied::AlreadyApplied)));
+                    .ok_or(StateError::Corrupt)?;
+                return Ok((stored, response));
             }
             self.fence(call)?;
+            self.validate_response_target(action)?;
             if let Some(owner) = self
                 .record_owners
                 .borrow()
@@ -2568,10 +2695,12 @@ mod tests {
             let content = format!("{handoff:?}");
             if let Some((stored_content, stored_outcome)) = self.submissions.borrow().get(&key) {
                 if *stored_content == content {
-                    return Ok((
-                        stored_outcome.clone(),
-                        self.respond(StateApplied::AlreadyApplied),
-                    ));
+                    let response = self.respond(
+                        &call.attempt,
+                        StateApplied::AlreadyApplied,
+                        self.current_head(),
+                    );
+                    return Ok((stored_outcome.clone(), response));
                 }
                 return Err(StateError::ConflictingOperation);
             }
@@ -2580,11 +2709,26 @@ mod tests {
                     reason: SubmissionRefusalReason::MissingEvidence,
                 }
             } else {
-                SubmissionOutcome::Recorded {
-                    handoff: handoff.id.clone(),
+                // Evaluate the Directive gate against the action as it
+                // would commit at the next position. A valid link may
+                // therefore discharge an amend/answer Directive in the
+                // same transaction whose post-commit state is returned.
+                let candidate = Self::response_action(action, Seq(self.current_head().0 + 1));
+                let signals = self.stored_signals.borrow();
+                let mut actions = self.response_actions.borrow().clone();
+                actions.push(candidate);
+                let binding = binding_directives(&call.attempt, &signals, &actions);
+                match handoff_gate(&binding) {
+                    Ok(()) => SubmissionOutcome::Recorded {
+                        handoff: handoff.id.clone(),
+                    },
+                    Err(reason) => SubmissionOutcome::Refused {
+                        reason: SubmissionRefusalReason::Directive(reason),
+                    },
                 }
             };
-            if matches!(outcome, SubmissionOutcome::Recorded { .. }) {
+            let substantive = matches!(outcome, SubmissionOutcome::Recorded { .. });
+            if substantive {
                 self.handoffs.borrow_mut().push(handoff.clone());
                 self.record_owners.borrow_mut().insert(
                     format!("handoff:{}", handoff.id.as_str()),
@@ -2600,7 +2744,11 @@ mod tests {
                 &replay_request,
                 StateApplied::Applied,
             );
-            Ok((outcome, self.respond(StateApplied::Applied)))
+            let head = self.commit_fenced_call(Some(action), substantive);
+            Ok((
+                outcome,
+                self.respond(&call.attempt, StateApplied::Applied, head),
+            ))
         }
 
         fn renew_lease(
@@ -2612,16 +2760,18 @@ mod tests {
             // Committed replay resolves BEFORE the mutable fence, so a
             // lost-response retry after expiry or token supersession
             // still returns its committed outcome (R5.27).
-            if self
-                .replay("renew_lease", &call.operation, &request)?
-                .is_some()
-            {
+            if let Some(response) = self.replay_fenced_response(
+                "renew_lease",
+                &call.operation,
+                &request,
+                &call.attempt,
+            )? {
                 return Ok((
                     Lease {
                         token: call.token,
                         expires_at: until,
                     },
-                    self.respond(StateApplied::AlreadyApplied),
+                    response,
                 ));
             }
             self.fence(call)?;
@@ -2636,12 +2786,13 @@ mod tests {
                 &request,
                 StateApplied::Applied,
             );
+            let head = self.commit_fenced_call(None, false);
             Ok((
                 Lease {
                     token: call.token,
                     expires_at: until,
                 },
-                self.respond(StateApplied::Applied),
+                self.respond(&call.attempt, StateApplied::Applied, head),
             ))
         }
 
@@ -2911,6 +3062,7 @@ mod tests {
             now: RefCell::new(Timestamp(50)),
             next_seq: RefCell::new(0),
             stored_signals: RefCell::new(Vec::new()),
+            response_actions: RefCell::new(Vec::new()),
             submissions: RefCell::new(BTreeMap::new()),
             receipts: RefCell::new(Vec::new()),
             decisions: RefCell::new(Vec::new()),
@@ -2939,6 +3091,13 @@ mod tests {
         }
     }
 
+    fn good_action(operation: &str) -> FencedAction {
+        FencedAction {
+            call: good_call(operation),
+            responds_to: None,
+        }
+    }
+
     fn worker_authority(capability: &str) -> AuthoritySnapshot {
         AuthoritySnapshot {
             actor: worker_snapshot(),
@@ -2960,6 +3119,40 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn directive_draft(id: &str, attempt: &str, kind: DirectiveKind) -> SignalDraft {
+        let attempt = AttemptId::new(attempt).unwrap();
+        SignalDraft {
+            id: SignalId::new(id).unwrap(),
+            sender: authority("state:directive"),
+            subject: SubjectRef::Attempt(attempt.clone()),
+            body: SignalBody::Directive {
+                assignment: AssignmentId::new("asg-1").unwrap(),
+                attempt,
+                kind,
+            },
+        }
+    }
+
+    fn passing_evidence() -> Evidence {
+        Evidence::new(
+            Argv::new(vec!["cargo".into(), "test".into()]).unwrap(),
+            VerificationSet::new(
+                vec![Argv::new(vec!["cargo".into(), "test".into()]).unwrap()],
+                PathSet::new(vec![WorkPath::new("tests/a.rs").unwrap()]).unwrap(),
+            )
+            .unwrap(),
+            0,
+            VerificationOutcome::Pass,
+            CommitId::new(&"c".repeat(40)).unwrap(),
+            crate::content::WorkspaceDigest::new(&"1".repeat(64)).unwrap(),
+            crate::content::WorkspaceDigest::new(&"1".repeat(64)).unwrap(),
+            None,
+            FileDigestSet::default(),
+            None,
+        )
+        .unwrap()
     }
 
     fn handoff(id: &str, evidence: Vec<OperationId>) -> HandoffRecord {
@@ -3100,24 +3293,30 @@ mod tests {
             None,
         )
         .unwrap();
-        let wrong_actor = FencedCall {
-            actor: ActorId::new("intruder").unwrap(),
-            ..good_call("op-evi")
+        let wrong_actor = FencedAction {
+            call: FencedCall {
+                actor: ActorId::new("intruder").unwrap(),
+                ..good_call("op-evi")
+            },
+            responds_to: None,
         };
         assert_eq!(
             port.fenced_evidence(&wrong_actor, &evidence),
             Err(StateError::ActorMismatch)
         );
-        let stale = FencedCall {
-            token: FencingToken(2),
-            ..good_call("op-evi")
+        let stale = FencedAction {
+            call: FencedCall {
+                token: FencingToken(2),
+                ..good_call("op-evi")
+            },
+            responds_to: None,
         };
         assert_eq!(
             port.fenced_evidence(&stale, &evidence),
             Err(StateError::StaleFencing)
         );
         let response = port
-            .fenced_evidence(&good_call("op-evi"), &evidence)
+            .fenced_evidence(&good_action("op-evi"), &evidence)
             .unwrap();
         assert_eq!(response.applied, StateApplied::Applied);
     }
@@ -3129,7 +3328,7 @@ mod tests {
 
         let refused = handoff("h-1", vec![]);
         let (outcome, response) = port
-            .fenced_submit_handoff(&good_call("op-h1"), &refused)
+            .fenced_submit_handoff(&good_action("op-h1"), &refused)
             .unwrap();
         assert_eq!(
             outcome,
@@ -3139,19 +3338,19 @@ mod tests {
         );
         assert_eq!(response.applied, StateApplied::Applied);
         let (retry_outcome, retry_response) = port
-            .fenced_submit_handoff(&good_call("op-h1"), &refused)
+            .fenced_submit_handoff(&good_action("op-h1"), &refused)
             .unwrap();
         assert_eq!(retry_outcome, outcome);
         assert_eq!(retry_response.applied, StateApplied::AlreadyApplied);
         let different = handoff("h-2", vec![]);
         assert_eq!(
-            port.fenced_submit_handoff(&good_call("op-h1"), &different),
+            port.fenced_submit_handoff(&good_action("op-h1"), &different),
             Err(StateError::ConflictingOperation)
         );
 
         let recorded = handoff("h-3", vec![op("op-evi")]);
         let (outcome, _) = port
-            .fenced_submit_handoff(&good_call("op-h2"), &recorded)
+            .fenced_submit_handoff(&good_action("op-h2"), &recorded)
             .unwrap();
         assert_eq!(
             outcome,
@@ -3160,13 +3359,13 @@ mod tests {
             }
         );
         let (retry_outcome, retry_response) = port
-            .fenced_submit_handoff(&good_call("op-h2"), &recorded)
+            .fenced_submit_handoff(&good_action("op-h2"), &recorded)
             .unwrap();
         assert_eq!(retry_outcome, outcome);
         assert_eq!(retry_response.applied, StateApplied::AlreadyApplied);
         let different = handoff("h-4", vec![op("op-evi")]);
         assert_eq!(
-            port.fenced_submit_handoff(&good_call("op-h2"), &different),
+            port.fenced_submit_handoff(&good_action("op-h2"), &different),
             Err(StateError::ConflictingOperation)
         );
     }
@@ -3194,7 +3393,7 @@ mod tests {
         assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
         let recorded = handoff("h-1", vec![op("op-evi")]);
         let (outcome, _) = port
-            .fenced_submit_handoff(&good_call("op-h-accept"), &recorded)
+            .fenced_submit_handoff(&good_action("op-h-accept"), &recorded)
             .unwrap();
         assert_eq!(
             outcome,
@@ -4688,27 +4887,36 @@ mod tests {
         .unwrap();
 
         // Right actor + right token, FOREIGN Assignment → refused.
-        let foreign_assignment = FencedCall {
-            assignment: AssignmentId::new("asg-other").unwrap(),
-            ..good_call("op-e1")
+        let foreign_assignment = FencedAction {
+            call: FencedCall {
+                assignment: AssignmentId::new("asg-other").unwrap(),
+                ..good_call("op-e1")
+            },
+            responds_to: None,
         };
         assert_eq!(
             port.fenced_evidence(&foreign_assignment, &evidence),
             Err(StateError::IncoherentBundle)
         );
         // Foreign Attempt → refused.
-        let foreign_attempt = FencedCall {
-            attempt: AttemptId::new("att-other").unwrap(),
-            ..good_call("op-e2")
+        let foreign_attempt = FencedAction {
+            call: FencedCall {
+                attempt: AttemptId::new("att-other").unwrap(),
+                ..good_call("op-e2")
+            },
+            responds_to: None,
         };
         assert_eq!(
             port.fenced_evidence(&foreign_attempt, &evidence),
             Err(StateError::IncoherentBundle)
         );
         // Stale token → distinct refusal.
-        let stale = FencedCall {
-            token: FencingToken(2),
-            ..good_call("op-e3")
+        let stale = FencedAction {
+            call: FencedCall {
+                token: FencingToken(2),
+                ..good_call("op-e3")
+            },
+            responds_to: None,
         };
         assert_eq!(
             port.fenced_evidence(&stale, &evidence),
@@ -4720,14 +4928,14 @@ mod tests {
             ..handoff("h-x", vec![op("op-evi")])
         };
         assert_eq!(
-            port.fenced_submit_handoff(&good_call("op-h9"), &other_handoff),
+            port.fenced_submit_handoff(&good_action("op-h9"), &other_handoff),
             Err(StateError::IncoherentBundle)
         );
         // A Report drafted against another Attempt is refused.
         let mut foreign_draft = report_draft("sig-foreign");
         foreign_draft.subject = SubjectRef::Attempt(AttemptId::new("att-other").unwrap());
         assert_eq!(
-            port.fenced_report(&good_call("op-r9"), &foreign_draft)
+            port.fenced_report(&good_action("op-r9"), &foreign_draft)
                 .err(),
             Some(StateError::IncoherentBundle)
         );
@@ -4757,7 +4965,7 @@ mod tests {
         // expired, but the renewal to 200 holds (R5.27).
         *state.now.borrow_mut() = Timestamp(101);
         assert_eq!(
-            port.fenced_evidence(&good_call("op-e4"), &evidence)
+            port.fenced_evidence(&good_action("op-e4"), &evidence)
                 .unwrap()
                 .applied,
             StateApplied::Applied
@@ -4765,13 +4973,13 @@ mod tests {
         // Past the renewed deadline it expires.
         *state.now.borrow_mut() = Timestamp(201);
         assert_eq!(
-            port.fenced_evidence(&good_call("op-e5"), &evidence),
+            port.fenced_evidence(&good_action("op-e5"), &evidence),
             Err(StateError::LeaseExpired)
         );
         // Committed replays still succeed AFTER expiry: the stored
         // outcome is returned without re-mutating (R5.27).
         assert_eq!(
-            port.fenced_evidence(&good_call("op-e4"), &evidence)
+            port.fenced_evidence(&good_action("op-e4"), &evidence)
                 .unwrap()
                 .applied,
             StateApplied::AlreadyApplied
@@ -4904,20 +5112,353 @@ mod tests {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         let draft = report_draft("sig-ok");
-        let (signal, response) = port.fenced_report(&good_call("op-rep"), &draft).unwrap();
+        let (signal, response) = port.fenced_report(&good_action("op-rep"), &draft).unwrap();
         assert_eq!(signal.seq, Seq(1));
         assert_eq!(response.applied, StateApplied::Applied);
         // Exact replay of the same call is absorbed.
-        let (again, replay) = port.fenced_report(&good_call("op-rep"), &draft).unwrap();
+        let (again, replay) = port.fenced_report(&good_action("op-rep"), &draft).unwrap();
         assert_eq!(again, signal);
         assert_eq!(replay.applied, StateApplied::AlreadyApplied);
         // A DIFFERENT draft under the same call operation conflicts —
         // SignalId is record identity, not call ownership.
         let other = report_draft("sig-other");
         assert_eq!(
-            port.fenced_report(&good_call("op-rep"), &other).err(),
+            port.fenced_report(&good_action("op-rep"), &other).err(),
             Some(StateError::ConflictingOperation)
         );
+    }
+
+    #[test]
+    fn every_fenced_response_surfaces_causally_current_directives() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let amend = directive_draft(
+            "dir-current-1",
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("update the implementation").unwrap(),
+            },
+        );
+        port.append_signal(&amend).unwrap();
+
+        let (_, renewal) = port
+            .renew_lease(&good_call("op-current-renew"), Timestamp(150))
+            .unwrap();
+        assert_eq!(
+            renewal
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-current-1"]
+        );
+
+        let (_, report) = port
+            .fenced_report(
+                &good_action("op-current-report"),
+                &report_draft("sig-current"),
+            )
+            .unwrap();
+        assert_eq!(
+            report
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-current-1"]
+        );
+
+        let evidence = passing_evidence();
+        let evidence_action = good_action("op-current-evidence");
+        let evidence_response = port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        assert_eq!(
+            evidence_response
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-current-1"]
+        );
+        let action_count = state.response_actions.borrow().len();
+
+        // Replaying after another Directive commits allocates no new
+        // action position, but still returns the current causal view.
+        let second = directive_draft(
+            "dir-current-2",
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("also update the regression").unwrap(),
+            },
+        );
+        port.append_signal(&second).unwrap();
+        let replay = port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        assert_eq!(replay.applied, StateApplied::AlreadyApplied);
+        assert_eq!(state.response_actions.borrow().len(), action_count);
+        assert_eq!(replay.head, state.current_head());
+        assert_eq!(
+            replay
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-current-1", "dir-current-2"]
+        );
+
+        let (outcome, handoff_response) = port
+            .fenced_submit_handoff(
+                &good_action("op-current-handoff"),
+                &handoff("h-current", vec![op("op-current-evidence")]),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SubmissionOutcome::Refused {
+                reason: SubmissionRefusalReason::Directive(DirectiveGateRefusal::AmendUndischarged)
+            }
+        );
+        assert_eq!(
+            handoff_response
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-current-1", "dir-current-2"]
+        );
+    }
+
+    #[test]
+    fn linked_actions_discharge_only_the_exact_target_and_replay_once() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let report_id = SignalId::new("sig-question").unwrap();
+        port.fenced_report(
+            &good_action("op-question"),
+            &report_draft(report_id.as_str()),
+        )
+        .unwrap();
+        let amend = directive_draft(
+            "dir-amend",
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("incorporate the requested change").unwrap(),
+            },
+        );
+        let answer = directive_draft(
+            "dir-answer",
+            "att-1",
+            DirectiveKind::Answer {
+                report: report_id,
+                answer: BoundedText::new("use the recorded decision").unwrap(),
+            },
+        );
+        port.append_signal(&amend).unwrap();
+        port.append_signal(&answer).unwrap();
+
+        // An ordinary later action does not discharge either kind.
+        let unlinked = port
+            .fenced_evidence(&good_action("op-unlinked"), &passing_evidence())
+            .unwrap();
+        assert_eq!(
+            unlinked
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-amend", "dir-answer"]
+        );
+
+        let linked_amend = FencedAction {
+            call: good_call("op-linked-amend"),
+            responds_to: Some(SignalId::new("dir-amend").unwrap()),
+        };
+        let (_, discharged) = port
+            .fenced_report(&linked_amend, &report_draft("sig-amend-done"))
+            .unwrap();
+        // The response is post-commit: the exact target is already
+        // absent, while the unrelated Answer remains binding.
+        assert_eq!(
+            discharged
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-answer"]
+        );
+        let action_count = state.response_actions.borrow().len();
+        let replay_head = discharged.head;
+        let (_, replay) = port
+            .fenced_report(&linked_amend, &report_draft("sig-amend-done"))
+            .unwrap();
+        assert_eq!(replay.applied, StateApplied::AlreadyApplied);
+        assert_eq!(replay.head, replay_head);
+        assert_eq!(state.response_actions.borrow().len(), action_count);
+
+        // The response link participates in the full operation
+        // identity, independently of the otherwise identical call.
+        let different_link = FencedAction {
+            responds_to: Some(SignalId::new("dir-answer").unwrap()),
+            ..linked_amend.clone()
+        };
+        assert_eq!(
+            port.fenced_report(&different_link, &report_draft("sig-amend-done")),
+            Err(StateError::ConflictingOperation)
+        );
+        assert_eq!(state.response_actions.borrow().len(), action_count);
+
+        let linked_answer = FencedAction {
+            call: good_call("op-linked-answer"),
+            responds_to: Some(SignalId::new("dir-answer").unwrap()),
+        };
+        let final_response = port
+            .fenced_evidence(&linked_answer, &passing_evidence())
+            .unwrap();
+        assert!(final_response.binding_directives.is_empty());
+    }
+
+    #[test]
+    fn response_link_validation_refuses_without_committing() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let evidence = passing_evidence();
+        let future_target = SignalId::new("dir-future").unwrap();
+        let premature = FencedAction {
+            call: good_call("op-premature"),
+            responds_to: Some(future_target.clone()),
+        };
+        assert_eq!(
+            port.fenced_evidence(&premature, &evidence),
+            Err(StateError::UnknownRecord)
+        );
+        assert_eq!(state.current_head(), Seq(0));
+        assert!(state.response_actions.borrow().is_empty());
+
+        port.append_signal(&directive_draft(
+            future_target.as_str(),
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("future instruction").unwrap(),
+            },
+        ))
+        .unwrap();
+        // The refused pre-Directive request claimed no operation and
+        // created no earlier linked action. Reusing its operation for
+        // an unlinked action succeeds and leaves the Directive binding.
+        let unlinked_same_operation = FencedAction {
+            responds_to: None,
+            ..premature
+        };
+        let response = port
+            .fenced_evidence(&unlinked_same_operation, &evidence)
+            .unwrap();
+        assert_eq!(
+            response
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-future"]
+        );
+
+        let foreign_state = fake_state();
+        let foreign_port: &dyn WorkflowStatePort = &foreign_state;
+        foreign_port
+            .append_signal(&directive_draft(
+                "dir-foreign",
+                "att-other",
+                DirectiveKind::Amend {
+                    instruction: BoundedText::new("foreign instruction").unwrap(),
+                },
+            ))
+            .unwrap();
+        let foreign_link = FencedAction {
+            call: good_call("op-foreign-link"),
+            responds_to: Some(SignalId::new("dir-foreign").unwrap()),
+        };
+        assert_eq!(
+            foreign_port.fenced_evidence(&foreign_link, &evidence),
+            Err(StateError::IncoherentBundle)
+        );
+        assert_eq!(foreign_state.current_head(), Seq(1));
+        assert!(foreign_state.response_actions.borrow().is_empty());
+    }
+
+    #[test]
+    fn link_carriage_does_not_replace_directive_kind_policy() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        port.append_signal(&directive_draft(
+            "dir-pause",
+            "att-1",
+            DirectiveKind::Pause {
+                reason: BoundedText::new("wait for operator review").unwrap(),
+            },
+        ))
+        .unwrap();
+        let linked_pause = FencedAction {
+            call: good_call("op-linked-pause"),
+            responds_to: Some(SignalId::new("dir-pause").unwrap()),
+        };
+        let response = port
+            .fenced_evidence(&linked_pause, &passing_evidence())
+            .unwrap();
+        assert_eq!(
+            response
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-pause"]
+        );
+        assert_eq!(
+            state.response_actions.borrow().last().unwrap().kind,
+            ResponseKind::WorkerAction {
+                attempt: AttemptId::new("att-1").unwrap(),
+                responds_to: Some(SignalId::new("dir-pause").unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn linked_handoff_can_discharge_amend_but_refusal_cannot() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        port.append_signal(&directive_draft(
+            "dir-handoff",
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("update before handoff").unwrap(),
+            },
+        ))
+        .unwrap();
+        let candidate = handoff("h-linked", vec![op("op-evidence")]);
+        let (refused, refused_response) = port
+            .fenced_submit_handoff(&good_action("op-handoff-unlinked"), &candidate)
+            .unwrap();
+        assert_eq!(
+            refused,
+            SubmissionOutcome::Refused {
+                reason: SubmissionRefusalReason::Directive(DirectiveGateRefusal::AmendUndischarged)
+            }
+        );
+        assert_eq!(
+            refused_response.binding_directives[0].id.as_str(),
+            "dir-handoff"
+        );
+        assert!(state.response_actions.borrow().is_empty());
+
+        let linked = FencedAction {
+            call: good_call("op-handoff-linked"),
+            responds_to: Some(SignalId::new("dir-handoff").unwrap()),
+        };
+        let (recorded, response) = port.fenced_submit_handoff(&linked, &candidate).unwrap();
+        assert_eq!(
+            recorded,
+            SubmissionOutcome::Recorded {
+                handoff: HandoffId::new("h-linked").unwrap()
+            }
+        );
+        assert!(response.binding_directives.is_empty());
+        assert_eq!(state.response_actions.borrow().len(), 1);
     }
 
     /// R5.28: the idempotency record binds FULL call identity, durable
@@ -4944,7 +5485,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let base = good_call("op-ev");
+        let base = good_action("op-ev");
         assert_eq!(
             port.fenced_evidence(&base, &evidence).unwrap().applied,
             StateApplied::Applied
@@ -4952,16 +5493,25 @@ mod tests {
         // Same operation + payload, but ANY altered call identity
         // field must NOT receive the prior result.
         for altered in [
-            FencedCall {
-                assignment: AssignmentId::new("asg-other").unwrap(),
+            FencedAction {
+                call: FencedCall {
+                    assignment: AssignmentId::new("asg-other").unwrap(),
+                    ..base.call.clone()
+                },
                 ..base.clone()
             },
-            FencedCall {
-                actor: ActorId::new("intruder").unwrap(),
+            FencedAction {
+                call: FencedCall {
+                    actor: ActorId::new("intruder").unwrap(),
+                    ..base.call.clone()
+                },
                 ..base.clone()
             },
-            FencedCall {
-                token: FencingToken(2),
+            FencedAction {
+                call: FencedCall {
+                    token: FencingToken(2),
+                    ..base.call.clone()
+                },
                 ..base.clone()
             },
         ] {
@@ -4979,14 +5529,14 @@ mod tests {
         // A NEW operation may not claim an existing SignalId.
         let draft = report_draft("sig-owned");
         assert_eq!(
-            port.fenced_report(&good_call("op-r1"), &draft)
+            port.fenced_report(&good_action("op-r1"), &draft)
                 .unwrap()
                 .1
                 .applied,
             StateApplied::Applied
         );
         assert_eq!(
-            port.fenced_report(&good_call("op-r2"), &draft).err(),
+            port.fenced_report(&good_action("op-r2"), &draft).err(),
             Some(StateError::ConflictingOperation)
         );
 
@@ -4999,18 +5549,22 @@ mod tests {
 
         // Token supersession: a committed old-token replay is inert,
         // but a NEW operation on the old token is stale.
-        let old_call = good_call("op-old-token");
+        let old_action = good_action("op-old-token");
         assert_eq!(
-            port.fenced_evidence(&old_call, &evidence).unwrap().applied,
+            port.fenced_evidence(&old_action, &evidence)
+                .unwrap()
+                .applied,
             StateApplied::Applied
         );
         *state.current_token.borrow_mut() = FencingToken(4);
         assert_eq!(
-            port.fenced_evidence(&old_call, &evidence).unwrap().applied,
+            port.fenced_evidence(&old_action, &evidence)
+                .unwrap()
+                .applied,
             StateApplied::AlreadyApplied
         );
         assert_eq!(
-            port.fenced_evidence(&good_call("op-after-super"), &evidence),
+            port.fenced_evidence(&good_action("op-after-super"), &evidence),
             Err(StateError::StaleFencing)
         );
     }
@@ -5025,7 +5579,7 @@ mod tests {
         let mut draft = report_draft("shared-id");
         draft.id = SignalId::new("shared-id").unwrap();
         assert_eq!(
-            port.fenced_report(&good_call("op-a"), &draft)
+            port.fenced_report(&good_action("op-a"), &draft)
                 .unwrap()
                 .1
                 .applied,
@@ -5036,7 +5590,9 @@ mod tests {
             id: HandoffId::new("shared-id").unwrap(),
             ..handoff("h-ignored", vec![op("op-evi")])
         };
-        let (outcome, _) = port.fenced_submit_handoff(&good_call("op-b"), &h).unwrap();
+        let (outcome, _) = port
+            .fenced_submit_handoff(&good_action("op-b"), &h)
+            .unwrap();
         assert_eq!(
             outcome,
             SubmissionOutcome::Recorded {
@@ -5045,11 +5601,11 @@ mod tests {
         );
         // Same-kind reuse by a different operation still conflicts.
         assert_eq!(
-            port.fenced_report(&good_call("op-c"), &draft).err(),
+            port.fenced_report(&good_action("op-c"), &draft).err(),
             Some(StateError::ConflictingOperation)
         );
         assert_eq!(
-            port.fenced_submit_handoff(&good_call("op-d"), &h).err(),
+            port.fenced_submit_handoff(&good_action("op-d"), &h).err(),
             Some(StateError::ConflictingOperation)
         );
     }
