@@ -1,0 +1,153 @@
+# ABACUS provider lock, schema v1.
+#
+# Paths are deliberately absent: the composition root resolves executables from
+# explicit configuration, then adapters verify these identities before use.
+# `br` and Herdr mismatches fail closed. `bv` is advice-only and degrades to the
+# deterministic core ordering on any identity or contract mismatch.
+# Fixture-set names identify the checked-in Phase 1 evidence corpus. Adapter-owned
+# minimal fixtures replace/extend that corpus during their implementation phases.
+
+schema_version = 1
+target_os = "linux"
+target_arch = "x86_64"
+validated_on = "2026-08-04"
+
+[providers.br]
+canonical_name = "br"
+role = "work-graph"
+upstream = "Dicklesworthstone/beads_rust"
+version = "0.1.45"
+release = "v0.1.45"
+release_asset = "br-v0.1.45-linux_amd64.tar.gz"
+release_asset_sha256 = "578fa277c123a689bb1077445cb2093e894c250517abc944d4715a4e054ee391"
+binary_sha256 = "a3b59c6bde363efe251c28a7908d169f7b5671a22894e9577d253983750339e3"
+mismatch_policy = "fail-closed"
+machine_interface = "json-cli-plus-jsonl-content-hash"
+fixture_set = "abacus-work/fixtures/br-v0.1.45"
+fixture_set_version = 1
+compatibility_record = "docs/compatibility/2026-08-04-br-bv.md"
+required_operations = [
+  "init",
+  "info",
+  "show",
+  "list",
+  "ready",
+  "create",
+  "update",
+  "label-add",
+  "dependency-add",
+  "dependency-remove",
+  "status-in-progress",
+  "close",
+  # Reserved for explicit operator reconciliation of an out-of-band close.
+  "reopen",
+  "sync-status",
+  "sync-flush",
+  "doctor",
+]
+required_properties = [
+  "case-insensitive-provider-id-mapping",
+  "scope-label-key-colon-value-max-50-bytes",
+  "curated-close-reason",
+  "structured-errors",
+  "explicit-control-checkout",
+]
+
+[providers.bv]
+canonical_name = "bv"
+role = "optional-work-advisor"
+upstream = "Dicklesworthstone/beads_viewer"
+version = "0.18.0"
+release = "v0.18.0"
+tag_commit = "44a8e8dd69cad6d0cb8462d2095ed202d993e040"
+release_asset = "bv_linux_amd64.tar.gz"
+release_asset_sha256 = "b8df409c380cc4db9f07cf0329ee8a4d8e669be812528ef1b3b2e0b1260e9145"
+checksum_asset = "checksums.txt"
+checksum_asset_sha256 = "c4c77bf3a55bc99774931b031a9a7c711448d0d13089e851988fb04ba544f8fa"
+binary_sha256 = "146313a0a48a6c8a1ba9c3e8c49d75fe820b1a6ce75d474519eac6b8ff27b00d"
+mismatch_policy = "deterministic-fallback"
+robot_contract_version = "1.0.0"
+capabilities_sha256 = "9da837d8a2d3a957eb9d94db7e001d9071e5a7bb88343064ef1fce6ecf6b1339"
+capabilities_canonicalization = "compact-key-sorted-json-with-generated_at-removed"
+fixture_set = "compatibility-2026-08-04-br-bv"
+fixture_set_version = 1
+compatibility_record = "docs/compatibility/2026-08-04-br-bv.md"
+required_operations = [
+  "robot-capabilities",
+  "robot-next",
+  "robot-graph",
+]
+required_properties = [
+  "read-only-advice",
+  "br-v0.1.45-compatible",
+  "revision-bracketed",
+  "discard-provider-command-strings",
+]
+
+[providers.herdr]
+canonical_name = "herdr"
+role = "agent-runtime"
+upstream = "herdrdev/herdr"
+version = "0.8.0"
+release = "v0.8.0"
+tag_commit = "346411fa21afd297f5ed3b3fa56f9e3fbf7654b7"
+license = "Apache-2.0"
+release_asset = "herdr-linux-x86_64"
+release_asset_bytes = 21776680
+release_asset_sha256 = "b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28"
+# Herdr publishes this target as a raw executable, so asset and binary hashes match.
+binary_sha256 = "b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28"
+mismatch_policy = "fail-closed"
+api_schema_version = 1
+api_protocol = 19
+api_schema_bytes = 251527
+api_schema_sha256 = "88ff414aa996e390c2db05a37b95d28dbe4e81b98329f6ed7f7a2cc5c6ebf51a"
+fixture_set = "compatibility-2026-08-04-herdr-v0.7.5-to-v0.8.0"
+fixture_set_version = 2
+compatibility_record = "docs/compatibility/2026-08-04-herdr.md"
+supported_agent_kinds = ["claude", "codex"]
+required_operations = [
+  "status-server",
+  "api-snapshot",
+  "workspace-create",
+  "workspace-list",
+  "pane-read-bounded",
+  "pane-process-info",
+  "agent-start",
+  "agent-prompt",
+  # ADR-0003 startup exception: pinned JSON socket method, host-side only.
+  "socket-agent-prompt-startup",
+  "agent-wait",
+  "agent-read",
+  # Blocked-dialog cancellation and diagnostics only; never prompt delivery.
+  "agent-send-keys",
+  "server-live-handoff",
+  "server-stop",
+  "session-list",
+  "session-delete",
+]
+required_properties = [
+  "operator-owned-host-facade",
+  "collision-resistant-named-session",
+  "no-global-integrations",
+  "no-prompt-submit-keystroke-fallback",
+  "startup-material-json-not-argv-env-source-verified",
+  "send-keys-only-for-dialog-cancel-or-diagnostics",
+  "ambiguous-prompt-timeout-no-retry",
+  "generation-fenced-reassociation",
+  "pull-based-status-snapshots",
+]
+
+[providers.herdr.detectors]
+source_policy = "active-remote-manifest-with-no-local-override"
+drift_policy = "detector-dependent-observations-incompatible-until-revalidated"
+
+[providers.herdr.detectors.claude]
+manifest_version = "2026.08.04.1"
+bytes = 3976
+sha256 = "4ed3d5c9bab316bc7664f145c9c2e67f5204862e440e5179258410750206ffba"
+
+[providers.herdr.detectors.codex]
+manifest_version = "2026.07.18.1"
+bytes = 1890
+sha256 = "473928cc50a70d1ac71d06a17a482077a6a2dfe8080225cdce42360cab3d1345"

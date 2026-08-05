@@ -4816,6 +4816,13 @@ mod tests {
             }),
             Err(StateError::IncoherentBundle)
         );
+        // A refused receipt must not clear the derived pending set.
+        assert!(
+            port.pending_applications()
+                .unwrap()
+                .iter()
+                .any(|p| p.operation == op("aa-cancel"))
+        );
         // The exact linked receipt clears exactly that projection.
         assert_eq!(
             port.record_application_receipt(&ApplicationReceipt {

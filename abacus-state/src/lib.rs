@@ -9,6 +9,10 @@
 
 #![forbid(unsafe_code)]
 
+mod migrations;
+
+pub use migrations::{MigrationError, MigrationReport, apply_migrations, latest_schema_version};
+
 #[cfg(test)]
 mod tests {
     // Scaffold placeholder proving the per-module hermetic test target

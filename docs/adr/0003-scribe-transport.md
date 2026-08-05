@@ -1,6 +1,6 @@
 # ADR-0003: Scribe agent transport on Linux
 
-- **Status:** Proposed, revision 5 — substantive composer/schema/AttemptOpening/runtime-sideband changes post-date the revision-4 C2 pass; awaiting focused Codex re-review and consolidated verdict, then operator sign-off.
+- **Status:** Proposed, revision 5 — substantive composer/schema/AttemptOpening/runtime-sideband changes post-date the revision-4 C2 pass; the adversarial seam review is closed and landed, while the faithful runtime-carriage prototype and operator sign-off remain blocking.
 - **Date:** 2026-08-04
 - **Companions:** `docs/compatibility/2026-08-04-scribe-socket.md` (all probe evidence, normative for provider facts), ADR-0001 §3 (Scribe seam), ADR-0002 §5 (reachability-vs-authority doctrine), `abacus-state/README.md`, bead `ABACUS-HPG.7`
 
