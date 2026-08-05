@@ -17,7 +17,7 @@ use abacus_core::ports::{
 use abacus_core::{BeadId, ContentHash, OperationId, ScopeMap};
 
 use crate::adapter::{
-    AdviceAnalysis, AdviceProvider, ProviderMutation, TargetStatus, WorkProvider,
+    AdviceAnalysis, AdviceProvider, ProviderMutation, RawBeadSnapshot, TargetStatus, WorkProvider,
 };
 use crate::contract::{Behavior, Scenario};
 
@@ -100,6 +100,7 @@ impl Script {
 
 struct State {
     beads: BTreeMap<String, BeadStatusView>,
+    raw_labels: BTreeMap<String, Vec<String>>,
     tick: u32,
     script: Script,
     ready_error: Option<WorkError>,
@@ -128,6 +129,7 @@ impl FakeWorkProvider {
         Self {
             inner: RefCell::new(State {
                 beads,
+                raw_labels: BTreeMap::new(),
                 tick,
                 script: Script::new(),
                 ready_error: None,
@@ -136,6 +138,15 @@ impl FakeWorkProvider {
                 calls: Vec::new(),
             }),
         }
+    }
+
+    /// Attach provider labels to the bead returned by `ready`.
+    pub fn with_raw_labels(self, id: &BeadId, labels: Vec<String>) -> Self {
+        self.inner
+            .borrow_mut()
+            .raw_labels
+            .insert(id.as_str().to_owned(), labels);
+        self
     }
 
     /// Materialize a [`Scenario`] from the portable contract suite.
@@ -215,7 +226,7 @@ fn set_stored_status(state: &mut State, id: &BeadId, target: TargetStatus) {
 }
 
 impl WorkProvider for FakeWorkProvider {
-    fn ready(&self) -> Result<(WorkRevision, Vec<BeadSnapshot>), WorkError> {
+    fn ready(&self) -> Result<(WorkRevision, Vec<RawBeadSnapshot>), WorkError> {
         let mut state = self.inner.borrow_mut();
         state.calls.push(Call::Ready);
         if let Some(error) = state.ready_error.clone() {
@@ -226,7 +237,16 @@ impl WorkProvider for FakeWorkProvider {
             .beads
             .values()
             .filter(|view| view.status == WorkStatus::Open)
-            .map(|view| view.snapshot.clone())
+            .map(|view| RawBeadSnapshot {
+                id: view.snapshot.id.clone(),
+                content_hash: view.snapshot.content_hash.clone(),
+                raw_labels: state
+                    .raw_labels
+                    .get(view.snapshot.id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+                priority: view.snapshot.priority.value(),
+            })
             .collect();
         Ok((revision, open))
     }

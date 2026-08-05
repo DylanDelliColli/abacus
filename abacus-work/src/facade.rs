@@ -15,9 +15,12 @@ use abacus_core::ports::{
     AdviceDegradation, AdviceOutcome, BeadSnapshot, BeadStatusView, CloseReason, MutationOutcome,
     ObservedCloseReason, WorkAdvicePort, WorkError, WorkGraphPort, WorkRevision, WorkStatus,
 };
-use abacus_core::{BeadId, OperationId};
+use abacus_core::{BeadId, OperationId, ScopeKey};
 
-use crate::adapter::{AdviceProvider, ProviderMutation, TargetStatus, WorkProvider};
+use crate::adapter::{
+    AdviceProvider, ProviderMutation, RawBeadSnapshot, TargetStatus, WorkProvider,
+};
+use crate::scope_labels::normalize_scope_labels;
 
 /// Upper bound on a normalized mutation summary. Provider text is
 /// already curated by the adapter; this is the last structural guard so
@@ -29,15 +32,44 @@ pub const MAX_SUMMARY_LEN: usize = 256;
 #[derive(Debug, Clone)]
 pub struct WorkFacade<P> {
     provider: P,
+    declared_scope_keys: Vec<ScopeKey>,
 }
 
 impl<P: WorkProvider> WorkFacade<P> {
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            declared_scope_keys: Vec::new(),
+        }
+    }
+
+    /// Construct a facade with the repository-declared scope keys. Provider
+    /// labels remain raw until this boundary, where malformed and conflicting
+    /// labels become deterministic ABACUS refusals.
+    pub fn with_scope_keys(provider: P, declared_scope_keys: Vec<ScopeKey>) -> Self {
+        Self {
+            provider,
+            declared_scope_keys,
+        }
     }
 
     pub fn provider(&self) -> &P {
         &self.provider
+    }
+
+    fn normalize(&self, bead: RawBeadSnapshot) -> Result<BeadSnapshot, WorkError> {
+        let scope_map = normalize_scope_labels(
+            &self.declared_scope_keys,
+            bead.raw_labels.iter().map(String::as_str),
+        )?;
+        let priority = abacus_core::ports::Priority::new(bead.priority)
+            .map_err(|_| WorkError::MalformedOutput)?;
+        Ok(BeadSnapshot {
+            id: bead.id,
+            content_hash: bead.content_hash,
+            scope_map,
+            priority,
+        })
     }
 
     /// Shared decision-gated mutation path for both projections.
@@ -168,7 +200,11 @@ fn bound_summary(raw: String) -> String {
 
 impl<P: WorkProvider> WorkGraphPort for WorkFacade<P> {
     fn ready(&self) -> Result<(WorkRevision, Vec<BeadSnapshot>), WorkError> {
-        self.provider.ready()
+        let (revision, raw) = self.provider.ready()?;
+        raw.into_iter()
+            .map(|bead| self.normalize(bead))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|beads| (revision, beads))
     }
 
     fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError> {
@@ -198,6 +234,7 @@ impl<P: WorkProvider> WorkGraphPort for WorkFacade<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::FakeWorkProvider;
 
     #[test]
     fn idempotency_matrix_is_exhaustive() {
@@ -258,6 +295,24 @@ mod tests {
             WorkStatus::InProgress,
             TargetStatus::Closed(CloseReason::AcceptedHandoff)
         ));
+    }
+
+    #[test]
+    fn ready_normalizes_provider_labels_at_the_facade_boundary() {
+        let id = BeadId::new("ABACUS-test").expect("valid bead id");
+        let provider = FakeWorkProvider::with_bead(&id, WorkStatus::Open, 1)
+            .with_raw_labels(&id, vec!["area:auth".to_owned(), "area:billing".to_owned()]);
+        let facade = WorkFacade::with_scope_keys(
+            provider,
+            vec![abacus_core::ScopeKey::new("area").expect("valid scope key")],
+        );
+
+        assert_eq!(
+            facade.ready(),
+            Err(WorkError::ScopeLabelConflict {
+                key: "area".to_owned()
+            })
+        );
     }
 
     #[test]

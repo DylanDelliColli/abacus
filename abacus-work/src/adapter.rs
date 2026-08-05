@@ -12,7 +12,16 @@
 //! adapter reports what it observed; it does not decide what that means.
 
 use abacus_core::ports::{BeadStatusView, CloseReason, WorkError, WorkRevision};
-use abacus_core::{BeadId, OperationId};
+use abacus_core::{BeadId, ContentHash, OperationId};
+
+/// Provider facts before ABACUS applies scope-label normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawBeadSnapshot {
+    pub id: BeadId,
+    pub content_hash: ContentHash,
+    pub raw_labels: Vec<String>,
+    pub priority: u8,
+}
 
 /// The state a decision-gated mutation drives a bead toward.
 ///
@@ -50,7 +59,7 @@ pub enum ProviderMutation {
 /// Implementors do NOT enforce expected-revision preconditions and do
 /// NOT interpret ambiguity; see [`ProviderMutation`].
 pub trait WorkProvider {
-    fn ready(&self) -> Result<(WorkRevision, Vec<abacus_core::ports::BeadSnapshot>), WorkError>;
+    fn ready(&self) -> Result<(WorkRevision, Vec<RawBeadSnapshot>), WorkError>;
 
     fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError>;
 
