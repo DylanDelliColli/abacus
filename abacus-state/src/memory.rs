@@ -22,59 +22,60 @@ use abacus_core::{
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
-struct CredentialBinding {
-    credential: CredentialId,
-    digest: ContentHash,
-    actor: ActorId,
-    profile: ProfileName,
-    assignment: Option<AssignmentId>,
-    revoked: bool,
+pub(crate) struct CredentialBinding {
+    pub(crate) credential: CredentialId,
+    pub(crate) digest: ContentHash,
+    pub(crate) actor: ActorId,
+    pub(crate) profile: ProfileName,
+    pub(crate) assignment: Option<AssignmentId>,
+    pub(crate) revoked: bool,
 }
 
 #[derive(Clone)]
-struct AttemptEntry {
-    record: AttemptRecord,
-    state: AttemptState,
-    authorizing: OperationId,
+pub(crate) struct AttemptEntry {
+    pub(crate) record: AttemptRecord,
+    pub(crate) state: AttemptState,
+    pub(crate) authorizing: OperationId,
 }
 
 #[derive(Clone)]
-struct AssignmentEntry {
-    record: AssignmentRecord,
-    state: AssignmentState,
-    attempts: Vec<AttemptEntry>,
+pub(crate) struct AssignmentEntry {
+    pub(crate) record: AssignmentRecord,
+    pub(crate) state: AssignmentState,
+    pub(crate) attempts: Vec<AttemptEntry>,
 }
 
-struct State {
-    head: u64,
-    operations: BTreeMap<String, String>,
-    committed_operations: BTreeSet<String>,
-    bootstrap_complete: bool,
-    actor_classes: BTreeMap<String, AuthorityClass>,
-    active_members: BTreeMap<String, BTreeSet<String>>,
-    credentials: BTreeMap<String, CredentialBinding>,
-    credential_owners: BTreeMap<String, String>,
-    assignments: BTreeMap<String, AssignmentEntry>,
-    attempt_owners: BTreeMap<String, String>,
-    signals: Vec<Signal>,
-    response_actions: Vec<ResponseAction>,
-    report_outcomes: BTreeMap<String, ReportOutcome>,
-    evidence: Vec<EvidenceRecord>,
-    evidence_outcomes: BTreeMap<String, EvidenceOutcome>,
-    submissions: BTreeMap<String, (String, SubmissionOutcome)>,
-    handoffs: BTreeMap<String, HandoffRecord>,
-    decisions: BTreeMap<String, DecisionRecord>,
-    envelopes: BTreeMap<String, EnvelopeSnapshot>,
-    handles: BTreeMap<String, RuntimeHandle>,
-    projections: BTreeMap<String, PendingApplication>,
-    application_attempts: BTreeMap<String, Vec<ApplicationAttempt>>,
-    receipts: BTreeMap<String, ApplicationReceipt>,
-    audit_events: BTreeMap<u64, AuditEvent>,
-    runtime_observations: BTreeMap<String, RuntimeObservationRecord>,
+#[derive(Clone)]
+pub(crate) struct State {
+    pub(crate) head: u64,
+    pub(crate) operations: BTreeMap<String, String>,
+    pub(crate) committed_operations: BTreeSet<String>,
+    pub(crate) bootstrap_complete: bool,
+    pub(crate) actor_classes: BTreeMap<String, AuthorityClass>,
+    pub(crate) active_members: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) credentials: BTreeMap<String, CredentialBinding>,
+    pub(crate) credential_owners: BTreeMap<String, String>,
+    pub(crate) assignments: BTreeMap<String, AssignmentEntry>,
+    pub(crate) attempt_owners: BTreeMap<String, String>,
+    pub(crate) signals: Vec<Signal>,
+    pub(crate) response_actions: Vec<ResponseAction>,
+    pub(crate) report_outcomes: BTreeMap<String, ReportOutcome>,
+    pub(crate) evidence: Vec<EvidenceRecord>,
+    pub(crate) evidence_outcomes: BTreeMap<String, EvidenceOutcome>,
+    pub(crate) submissions: BTreeMap<String, (String, SubmissionOutcome)>,
+    pub(crate) handoffs: BTreeMap<String, HandoffRecord>,
+    pub(crate) decisions: BTreeMap<String, DecisionRecord>,
+    pub(crate) envelopes: BTreeMap<String, EnvelopeSnapshot>,
+    pub(crate) handles: BTreeMap<String, RuntimeHandle>,
+    pub(crate) projections: BTreeMap<String, PendingApplication>,
+    pub(crate) application_attempts: BTreeMap<String, Vec<ApplicationAttempt>>,
+    pub(crate) receipts: BTreeMap<String, ApplicationReceipt>,
+    pub(crate) audit_events: BTreeMap<u64, AuditEvent>,
+    pub(crate) runtime_observations: BTreeMap<String, RuntimeObservationRecord>,
 }
 
 impl State {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             head: 0,
             operations: BTreeMap::new(),
@@ -123,8 +124,30 @@ impl<C> InMemoryState<C> {
         }
     }
 
+    pub(crate) fn from_state(clock: C, state: State) -> Self {
+        Self {
+            clock,
+            inner: Mutex::new(state),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<State, StateError> {
+        Ok(self.lock()?.clone())
+    }
+
+    pub(crate) fn restore(&self, state: State) -> Result<(), StateError> {
+        *self.lock()? = state;
+        Ok(())
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, State>, StateError> {
         self.inner.lock().map_err(|_| StateError::Corrupt)
+    }
+
+    fn stored_identity(
+        identity: Result<String, crate::stored::StoredError>,
+    ) -> Result<String, StateError> {
+        identity.map_err(|_| StateError::Corrupt)
     }
 
     fn operation_key(verb: &str, operation: &OperationId) -> String {
@@ -555,7 +578,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
 
         let at = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{opening:?}");
+        let request = Self::stored_identity(crate::stored::assignment_opening_identity(opening))?;
         if Self::replay(
             &state,
             "open_assignment",
@@ -654,7 +677,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         }
         let at = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{opening:?}");
+        let request = Self::stored_identity(crate::stored::attempt_opening_identity(opening))?;
         if Self::replay(
             &state,
             "append_attempt",
@@ -754,7 +777,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
 
         let now = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{record:?}");
+        let request = Self::stored_identity(crate::stored::decision_identity(record))?;
         if Self::replay(&state, "record_decision", &record.operation, &request)? {
             return Ok(StateApplied::AlreadyApplied);
         }
@@ -997,7 +1020,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let activation = &opening.activation;
         let at = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{opening:?}");
+        let request = Self::stored_identity(crate::stored::activation_identity(opening))?;
         if Self::replay(&state, "activate_profile", &activation.operation, &request)? {
             return Ok(StateApplied::AlreadyApplied);
         }
@@ -1241,7 +1264,10 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let call = &action.call;
         let now = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{}|{draft:?}", Self::action_identity(action));
+        let request = Self::stored_identity(crate::stored::report_identity(
+            &Self::action_identity(action),
+            draft,
+        ))?;
         if Self::replay(&state, "fenced_report", &call.operation, &request)? {
             let outcome = state
                 .report_outcomes
@@ -1318,7 +1344,10 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let call = &action.call;
         let now = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{}|{evidence:?}", Self::action_identity(action));
+        let request = Self::stored_identity(crate::stored::evidence_identity(
+            &Self::action_identity(action),
+            evidence,
+        ))?;
         if Self::replay(&state, "fenced_evidence", &call.operation, &request)? {
             let outcome = *state
                 .evidence_outcomes
@@ -1375,7 +1404,10 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let call = &action.call;
         let now = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{}|{handoff:?}", Self::action_identity(action));
+        let request = Self::stored_identity(crate::stored::handoff_identity(
+            &Self::action_identity(action),
+            handoff,
+        ))?;
         if Self::replay(&state, "fenced_handoff", &call.operation, &request)? {
             let (_, outcome) = state
                 .submissions
@@ -1505,7 +1537,10 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<(Lease, FencedResponse), StateError> {
         let now = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{}|{until:?}", Self::call_identity(call));
+        let request = Self::stored_identity(crate::stored::renewal_identity(
+            &Self::call_identity(call),
+            until,
+        ))?;
         if Self::replay(&state, "renew_lease", &call.operation, &request)? {
             return Ok((
                 Lease {
@@ -1562,7 +1597,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let authorizing = Self::subject_authorizing_operation(&state, subject)?;
         let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
-        let request = format!("{key}|{envelope:?}");
+        let request = Self::stored_identity(crate::stored::envelope_identity(&key, envelope))?;
         if Self::replay(&state, "persist_envelope", operation, &request)? {
             return Ok(StateApplied::AlreadyApplied);
         }
@@ -1675,7 +1710,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let at = self.clock.now();
         let mut state = self.lock()?;
         Self::resolve_subject(&state, &record.subject)?;
-        let request = format!("{record:?}");
+        let request = Self::stored_identity(crate::stored::runtime_observation_identity(record))?;
         if Self::replay(&state, "record_runtime_observation", operation, &request)? {
             return Ok(StateApplied::AlreadyApplied);
         }
@@ -1713,7 +1748,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<StateApplied, StateError> {
         let at = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{attempt:?}");
+        let request = Self::stored_identity(crate::stored::application_attempt_identity(attempt))?;
         if Self::replay(&state, "record_application_attempt", &attempt.id, &request)? {
             return Ok(StateApplied::AlreadyApplied);
         }
@@ -1751,7 +1786,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<StateApplied, StateError> {
         let at = self.clock.now();
         let mut state = self.lock()?;
-        let request = format!("{receipt:?}");
+        let request = Self::stored_identity(crate::stored::application_receipt_identity(receipt))?;
         if Self::replay(
             &state,
             "record_application_receipt",

@@ -1,15 +1,20 @@
 # `abacus-state` module contract
 
 Status: migration foundation landed (`ABACUS-9NH.7`, commit `6e91149`) —
-transactional SQLite schema v1/v2 under `src/migrations.rs` with WAL and
+transactional SQLite schema v1-v3 under `src/migrations.rs` with WAL and
 busy-timeout configuration. `ABACUS-9NH.11` adds the public, empty-state
 `InMemoryState` and the portable `run_workflow_state_suite`; both consume an
 injected core `ClockPort`, so lease behavior is hermetic and shared with the
-future SQLite implementation. `ABACUS-9NH.10` extends that public seam and
-canonical fake with the explicit Abort terminal, decision-terminal discharge,
-typed audit lineage, runtime-observation records, and state-owned constant-time
-credential comparison. Scribe itself (process, socket transport,
-client/server, and SQLite-backed Ledger operations) is not yet implemented;
+SQLite implementation. `ABACUS-9NH.10` extends that public seam and canonical
+fake with the explicit Abort terminal, decision-terminal discharge, typed audit
+lineage, runtime-observation records, and state-owned constant-time credential
+comparison. The same slice now provides `SqliteState`: schema-v3 private
+versioned row DTOs, one `BEGIN IMMEDIATE` transaction per port call,
+append-only immutable record paths, checked restart reconstruction, and the
+same portable contract suite as the canonical fake. Relational rows are the
+source of truth; the rebuilt `InMemoryState` aggregate is only a v1
+policy-sharing cache, never a persisted snapshot or command journal. Scribe's
+process lifecycle and client/server transport are not yet implemented;
 everything below describing those remains a design contract.
 
 ## Purpose
@@ -219,7 +224,10 @@ suite covers every port method, including profile lifecycle, clock-driven
 expiry and stale fencing, response linkage, response-bearing abort refusals,
 the explicit and decision-driven terminal-action paths, typed audit lineage,
 derived unresolved/pending queries, runtime associations, and reconciliation
-receipts. The future SQLite fixture must invoke this same suite.
+receipts. `SqliteState` invokes this same suite and a portable restart suite.
+Every future persisted state family or table must add its restart probe in the
+same change so delta completeness remains an enforced property rather than an
+assumption.
 
 The state crate's `InMemoryState` is the canonical behavioral fake for
 cross-module use-case tests. Core retains its seam-local `FakeState` because

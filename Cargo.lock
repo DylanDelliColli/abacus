@@ -12,6 +12,8 @@ version = "0.0.1"
 dependencies = [
  "abacus-core",
  "rusqlite",
+ "serde",
+ "serde_json",
  "subtle",
  "thiserror",
 ]

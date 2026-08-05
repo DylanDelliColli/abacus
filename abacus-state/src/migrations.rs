@@ -7,7 +7,7 @@
 
 use rusqlite::{Connection, Error as SqliteError, OpenFlags, TransactionBehavior};
 
-const LATEST_SCHEMA_VERSION: u32 = 2;
+const LATEST_SCHEMA_VERSION: u32 = 3;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS repository_meta (
@@ -157,6 +157,126 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 "#;
 
+// V3 turns the foundational record tables into the canonical backing store
+// for WorkflowStatePort and adds only the current-state/outcome families that
+// the v1/v2 schema could not yet express. Every `record_json` cell contains a
+// private state-owned DTO envelope whose representation version is checked on
+// load. Immutable record tables are append-only in adapter code.
+const MIGRATION_3: &str = r#"
+ALTER TABLE assignments ADD COLUMN record_version INTEGER;
+ALTER TABLE assignments ADD COLUMN record_json TEXT;
+ALTER TABLE assignments ADD COLUMN current_state TEXT;
+
+ALTER TABLE attempts ADD COLUMN record_version INTEGER;
+ALTER TABLE attempts ADD COLUMN record_json TEXT;
+ALTER TABLE attempts ADD COLUMN authorizing_operation TEXT;
+
+ALTER TABLE signals ADD COLUMN record_version INTEGER;
+ALTER TABLE signals ADD COLUMN record_json TEXT;
+
+ALTER TABLE evidence ADD COLUMN record_version INTEGER;
+ALTER TABLE evidence ADD COLUMN record_json TEXT;
+
+ALTER TABLE handoffs ADD COLUMN record_version INTEGER;
+ALTER TABLE handoffs ADD COLUMN record_json TEXT;
+
+ALTER TABLE decisions ADD COLUMN record_version INTEGER;
+ALTER TABLE decisions ADD COLUMN record_json TEXT;
+ALTER TABLE decisions ADD COLUMN decided_handoff_id TEXT;
+
+ALTER TABLE application_attempts ADD COLUMN record_version INTEGER;
+ALTER TABLE application_attempts ADD COLUMN record_json TEXT;
+
+ALTER TABLE application_receipts ADD COLUMN record_version INTEGER;
+ALTER TABLE application_receipts ADD COLUMN record_json TEXT;
+
+ALTER TABLE envelopes ADD COLUMN record_version INTEGER;
+ALTER TABLE envelopes ADD COLUMN record_json TEXT;
+
+ALTER TABLE idempotency ADD COLUMN operation_id TEXT;
+ALTER TABLE idempotency ADD COLUMN request_identity TEXT;
+
+ALTER TABLE audit_events ADD COLUMN record_version INTEGER;
+ALTER TABLE audit_events ADD COLUMN record_json TEXT;
+
+CREATE TABLE workflow_meta (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    head_seq INTEGER NOT NULL,
+    bootstrap_complete INTEGER NOT NULL CHECK (bootstrap_complete IN (0, 1))
+);
+
+CREATE TABLE actor_classes (
+    actor_id TEXT PRIMARY KEY NOT NULL,
+    authority_class TEXT NOT NULL
+);
+
+CREATE TABLE active_profile_members (
+    profile_name TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    PRIMARY KEY (profile_name, actor_id)
+);
+
+CREATE TABLE credential_bindings (
+    owner_key TEXT PRIMARY KEY NOT NULL,
+    credential_id TEXT NOT NULL UNIQUE,
+    revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)),
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+
+CREATE TABLE response_actions (
+    committed_seq INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL,
+    PRIMARY KEY (committed_seq, ordinal)
+);
+
+CREATE TABLE report_outcomes (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+
+CREATE TABLE evidence_outcomes (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+
+CREATE TABLE submission_outcomes (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    request_identity TEXT NOT NULL,
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+
+CREATE TABLE work_projections (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    committed_seq INTEGER NOT NULL,
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+
+CREATE TABLE runtime_observations (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    record_version INTEGER NOT NULL,
+    record_json TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX idx_idempotency_verb_operation
+    ON idempotency(operation_key);
+CREATE UNIQUE INDEX idx_audit_exact_seq
+    ON audit_events(event_seq);
+CREATE INDEX idx_attempts_reclaimable
+    ON attempts(state, lease_expires_at);
+CREATE INDEX idx_handoffs_pending
+    ON handoffs(attempt_id, committed_seq);
+CREATE UNIQUE INDEX idx_decisions_decided_handoff
+    ON decisions(decided_handoff_id)
+    WHERE decided_handoff_id IS NOT NULL;
+"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     #[error("sqlite error: {0}")]
@@ -209,6 +329,12 @@ pub fn apply_migrations(
         transaction.pragma_update(None, "user_version", 2_u32)?;
         transaction.commit()?;
     }
+    if from_version < 3 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_3)?;
+        transaction.pragma_update(None, "user_version", 3_u32)?;
+        transaction.commit()?;
+    }
     Ok(MigrationReport {
         from_version,
         to_version: LATEST_SCHEMA_VERSION,
@@ -234,10 +360,10 @@ mod tests {
         let path = temporary_db();
         let first = apply_migrations(&path).expect("first migration");
         assert_eq!(first.from_version, 0);
-        assert_eq!(first.to_version, 2);
+        assert_eq!(first.to_version, 3);
         let second = apply_migrations(&path).expect("second migration");
-        assert_eq!(second.from_version, 2);
-        assert_eq!(second.to_version, 2);
+        assert_eq!(second.from_version, 3);
+        assert_eq!(second.to_version, 3);
         let connection = Connection::open(&path).expect("open migrated database");
         let journal: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -266,6 +392,16 @@ mod tests {
             "runtime_handles",
             "idempotency",
             "audit_events",
+            "workflow_meta",
+            "actor_classes",
+            "active_profile_members",
+            "credential_bindings",
+            "response_actions",
+            "report_outcomes",
+            "evidence_outcomes",
+            "submission_outcomes",
+            "work_projections",
+            "runtime_observations",
         ] {
             let present: i64 = connection
                 .query_row(
@@ -294,15 +430,15 @@ mod tests {
         assert!(matches!(
             apply_migrations(&path),
             Err(MigrationError::IncompatibleVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
         let connection = Connection::open(&path).expect("reopen database");
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let journal: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("read journal mode");
@@ -312,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_receives_the_incremental_v2_objects() {
+    fn v1_database_receives_all_incremental_objects() {
         let path = temporary_db();
         let connection = Connection::open(&path).expect("create database");
         connection.execute_batch(MIGRATION_1).expect("apply v1");
@@ -323,7 +459,7 @@ mod tests {
 
         let report = apply_migrations(&path).expect("upgrade v1");
         assert_eq!(report.from_version, 1);
-        assert_eq!(report.to_version, 2);
+        assert_eq!(report.to_version, 3);
         let connection = Connection::open(&path).expect("reopen upgraded database");
         let credential_table: String = connection
             .query_row(
@@ -333,6 +469,58 @@ mod tests {
             )
             .expect("v2 credential table");
         assert_eq!(credential_table, "credentials");
+        let outcome_table: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'submission_outcomes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("v3 outcome table");
+        assert_eq!(outcome_table, "submission_outcomes");
+        drop(connection);
+        std::fs::remove_file(path).expect("remove temporary database");
+    }
+
+    #[test]
+    fn v2_database_receives_v3_rows_and_attention_query_indexes() {
+        let path = temporary_db();
+        let connection = Connection::open(&path).expect("create database");
+        connection.execute_batch(MIGRATION_1).expect("apply v1");
+        connection.execute_batch(MIGRATION_2).expect("apply v2");
+        connection
+            .pragma_update(None, "user_version", 2_u32)
+            .expect("mark v2");
+        drop(connection);
+
+        let report = apply_migrations(&path).expect("upgrade v2");
+        assert_eq!(report.from_version, 2);
+        assert_eq!(report.to_version, 3);
+        let connection = Connection::open(&path).expect("reopen upgraded database");
+        let decided_handoff_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('decisions')
+                 WHERE name = 'decided_handoff_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("decision link column");
+        assert_eq!(decided_handoff_column, 1);
+        for index in [
+            "idx_attempts_reclaimable",
+            "idx_handoffs_pending",
+            "idx_decisions_decided_handoff",
+            "idx_audit_exact_seq",
+            "idx_idempotency_verb_operation",
+        ] {
+            let present: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .expect("index lookup");
+            assert_eq!(present, 1, "missing v3 index {index}");
+        }
         drop(connection);
         std::fs::remove_file(path).expect("remove temporary database");
     }

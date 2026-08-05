@@ -20,6 +20,12 @@ pub trait StateContractHarness {
     fn set_now(&self, now: Timestamp);
 }
 
+/// Additional control for durable implementations whose process-local cache
+/// can be discarded and rebuilt from authoritative storage.
+pub trait RestartStateContractHarness: StateContractHarness {
+    fn restart(&mut self);
+}
+
 /// Run the provider-independent state contract.
 ///
 /// `build` is called for each independent scenario. The returned state must
@@ -43,6 +49,231 @@ where
     runtime_associations_use_the_full_launch_subject(&build);
     audit_lineage_is_transactional_typed_and_filterable(&build);
     projection_receipts_clear_only_proven_success(&build);
+}
+
+/// Exercise restart recovery across every major persisted record family.
+///
+/// This complements [`run_workflow_state_suite`]: the portable suite proves
+/// behavior, while this scenario proves the durable implementation reconstructs
+/// that same behavior from its rows rather than process memory.
+pub fn run_workflow_state_restart_suite<H, F>(build: F)
+where
+    H: RestartStateContractHarness,
+    F: Fn(Timestamp) -> H,
+{
+    let mut harness = build(Timestamp(50));
+    let pause = {
+        let port = harness.port();
+        open(port);
+        let (pause, _) = port
+            .append_signal(&pause("sig-restart-pause"))
+            .expect("pause commits");
+        let (report, response) = port
+            .fenced_report(
+                &action("op-restart-report", None),
+                &report_draft("sig-restart-report"),
+            )
+            .expect("report commits under Pause");
+        assert!(matches!(report, ReportOutcome::Recorded { .. }));
+        assert_eq!(response.binding_directives, vec![pause.clone()]);
+        assert_eq!(
+            port.fenced_evidence(&action("op-restart-evidence", None), &evidence())
+                .expect("evidence commits under Pause")
+                .0,
+            EvidenceOutcome::Recorded
+        );
+        let refusal = handoff("handoff-restart-refused", Vec::new());
+        assert_eq!(
+            port.fenced_submit_handoff(&action("op-restart-refusal", None), &refusal)
+                .expect("ordinary refusal commits")
+                .0,
+            SubmissionOutcome::Refused {
+                reason: SubmissionRefusalReason::MissingEvidence
+            }
+        );
+        let subject = worker_subject();
+        let envelope =
+            EnvelopeSnapshot::new("restart envelope".into(), hash('5')).expect("bounded envelope");
+        assert_eq!(
+            port.persist_envelope(&op("op-restart-envelope"), &subject, &envelope),
+            Ok(StateApplied::Applied)
+        );
+        assert_eq!(
+            port.bind_runtime_handle(
+                &op("op-restart-handle"),
+                &subject,
+                &RuntimeHandle::new("runtime-restart")
+            ),
+            Ok(StateApplied::Applied)
+        );
+        let observation = RuntimeObservationRecord {
+            reporter: lead_authority("state:observe"),
+            subject,
+            observation: LivenessObservation {
+                observed_at: Timestamp(49),
+                kind: LivenessKind::Running,
+            },
+        };
+        assert_eq!(
+            port.record_runtime_observation(&op("op-restart-observation"), &observation),
+            Ok(StateApplied::Applied)
+        );
+        let failed = ApplicationAttempt {
+            id: op("app-restart-failed"),
+            target: op("op-contract-open"),
+            outcome: ApplicationOutcome::Failed {
+                error: WorkError::ScopeLabelMalformed {
+                    label: "malformed:label".into(),
+                },
+            },
+        };
+        assert_eq!(
+            port.record_application_attempt(&failed),
+            Ok(StateApplied::Applied)
+        );
+        let successful = ApplicationAttempt {
+            id: op("app-restart-success"),
+            target: op("op-contract-open"),
+            outcome: ApplicationOutcome::EffectAlreadyPresent {
+                status: WorkStatus::InProgress,
+                revision: revision('9'),
+            },
+        };
+        assert_eq!(
+            port.record_application_attempt(&successful),
+            Ok(StateApplied::Applied)
+        );
+        assert_eq!(
+            port.record_application_receipt(&ApplicationReceipt {
+                target: successful.target,
+                attempt: successful.id,
+                after: revision('9'),
+            }),
+            Ok(StateApplied::Applied)
+        );
+        assert_eq!(
+            port.renew_lease(&call("op-restart-renew"), Timestamp(150))
+                .expect("lease renews")
+                .0
+                .expires_at,
+            Timestamp(150)
+        );
+        pause
+    };
+    let audit_before_restart = harness
+        .port()
+        .audit_events(&AuditQuery::default())
+        .expect("audit reads before restart");
+
+    harness.restart();
+    {
+        let port = harness.port();
+        assert_eq!(
+            port.assignment(&assignment_id())
+                .expect("assignment reloads")
+                .attempts,
+            vec![(attempt_id(), AttemptState::Active)]
+        );
+        assert_eq!(
+            port.signals_for(&attempt_id())
+                .expect("signals reload")
+                .len(),
+            2
+        );
+        assert_eq!(
+            port.evidence_for(&attempt_id())
+                .expect("evidence reloads")
+                .len(),
+            1
+        );
+        assert_eq!(
+            port.envelope(&worker_subject())
+                .expect("envelope reloads")
+                .content(),
+            "restart envelope"
+        );
+        assert_eq!(
+            port.runtime_handle(&worker_subject()),
+            Ok(Some(RuntimeHandle::new("runtime-restart")))
+        );
+        assert_eq!(
+            port.runtime_observation(&op("op-restart-observation"))
+                .expect("observation reloads")
+                .observation
+                .kind,
+            LivenessKind::Running
+        );
+        assert!(
+            port.pending_applications()
+                .expect("receipts reload")
+                .is_empty()
+        );
+        assert_eq!(
+            port.audit_events(&AuditQuery::default())
+                .expect("audit reloads"),
+            audit_before_restart
+        );
+        assert_eq!(
+            port.fenced_evidence(&action("op-restart-evidence", None), &evidence())
+                .expect("evidence replay survives restart")
+                .1
+                .applied,
+            StateApplied::AlreadyApplied
+        );
+        assert_eq!(
+            port.fenced_submit_handoff(
+                &action("op-restart-refusal", None),
+                &handoff("handoff-restart-refused", Vec::new())
+            )
+            .expect("refusal replay survives restart")
+            .1
+            .applied,
+            StateApplied::AlreadyApplied
+        );
+    }
+
+    harness.set_now(Timestamp(151));
+    assert_eq!(
+        harness
+            .port()
+            .fenced_evidence(&action("op-restart-expired", None), &evidence()),
+        Err(StateError::LeaseExpired),
+        "the persisted renewal deadline remains authoritative after restart"
+    );
+    let reclaim = DecisionRecord {
+        operation: op("op-restart-reclaim"),
+        assignment: assignment_id(),
+        authority: lead_authority("state:reclaim"),
+        kind: DecisionKind::Reclaim {
+            attempt: attempt_id(),
+            reason: reason("lease expired after restart"),
+        },
+        resolves: Some(SignalId::new("sig-restart-report").expect("valid signal")),
+    };
+    assert_eq!(
+        harness.port().record_decision(&reclaim),
+        Ok(StateApplied::Applied)
+    );
+    harness.restart();
+    let port = harness.port();
+    assert_eq!(
+        port.assignment(&assignment_id())
+            .expect("assignment reloads")
+            .attempts,
+        vec![(attempt_id(), AttemptState::Expired)]
+    );
+    assert_eq!(port.decision(&reclaim.operation), Ok(reclaim));
+    assert_eq!(
+        port.verify_launch_subject(&worker_subject(), &hash('f')),
+        Err(StateError::CredentialRevoked)
+    );
+    assert!(
+        !port
+            .unresolved_signals(None)
+            .expect("unresolved derivation reloads")
+            .contains(&pause),
+        "the reloaded terminal response action discharges Pause"
+    );
 }
 
 fn op(raw: &str) -> OperationId {

@@ -12,6 +12,9 @@
 pub mod contract;
 mod memory;
 mod migrations;
+mod sqlite;
+mod stored;
 
 pub use memory::{InMemoryState, ManualClock};
 pub use migrations::{MigrationError, MigrationReport, apply_migrations, latest_schema_version};
+pub use sqlite::{SqliteState, SqliteStateOpenError};
