@@ -1,6 +1,10 @@
 # `abacus-work` module contract
 
-Status: design contract; no Rust implementation yet
+Status: crate skeleton landed (ABACUS-omw.1) — internal provider seam,
+facade over the core work ports, hermetic fakes, and the reusable
+contract suite. The `br`/`bv` process adapters (ABACUS-omw.2/.5) and the
+remaining normalization beads are not yet implemented; everything below
+that names a provider command still describes intended behavior.
 
 ## Purpose
 
@@ -153,6 +157,28 @@ Default tests use a fake argv process runner and checked-in fixtures. They cover
 - graph revision changes and stale advice rejection;
 - `bv` unavailable/timeout/partial/malformed paths and deterministic fallback;
 - capability authorization without named-manager assumptions.
+
+### The portable contract suite
+
+`contract::run_work_graph_suite` is generic over any `WorkProvider` and
+names no concrete provider. An adapter proves conformance by calling it
+with a factory that materializes a `Scenario`, rather than restating the
+expectations — `FakeWorkProvider::from_scenario` is the reference
+implementation of that factory.
+
+It enforces, for every adapter: the expected-revision precondition; the
+idempotent already-present effect; single-re-inspection reconciliation of
+an ambiguous outcome; loud failure when an ambiguous mutation did not
+land; terminality of a closed bead in **both** directions (never
+re-closed under a different reason, never reopened); and the
+`set_status` `Err` contract — that an error left the bead and its
+revision untouched.
+
+That last one is the reason the suite exists rather than a checklist.
+`Err` asserts the mutation *definitively did not take effect*, and the
+facade skips reconciliation on that basis; an adapter that reports a
+landed mutation as `Err` would make a retry look safe and double-apply.
+Conformance is checked, not trusted.
 
 No default test invokes installed `br`/`bv`, reads live `.beads`, touches user config, runs Git, or launches a TUI.
 

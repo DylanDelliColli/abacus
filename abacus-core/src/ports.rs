@@ -920,7 +920,10 @@ pub trait WorkflowStatePort {
     /// stored digest never leaves Scribe. **Implementations MUST use a
     /// vetted constant-time comparison** (ADR-0003); core deliberately
     /// contains no cryptographic primitive (I15), so `abacus-state`
-    /// owns that implementation and its contract tests.
+    /// owns that implementation and its contract tests. This supersedes
+    /// the Attempt-only `verify_worker_credential` name: a launch subject
+    /// may be a worker Attempt or an actor activation, so this verb is
+    /// subject-based by design.
     fn verify_launch_subject(
         &self,
         subject: &LaunchSubject,

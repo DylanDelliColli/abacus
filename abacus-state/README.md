@@ -1,6 +1,11 @@
 # `abacus-state` module contract
 
-Status: design contract; no Rust implementation yet
+Status: migration foundation landed (`ABACUS-9NH.7`, commit `6e91149`) —
+transactional SQLite schema v1/v2 under `src/migrations.rs` with WAL and
+busy-timeout configuration, exported from `src/lib.rs`. Scribe itself
+(process, socket transport, client/server, lease and Ledger operations)
+is not yet implemented; everything below describing those remains a
+design contract.
 
 ## Purpose
 
@@ -68,7 +73,7 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 ### Repository and actors
 
 - initialize/inspect repository workflow state;
-- five closed activation cases and nothing else: operator-channel-only bootstrap of the initial/orchestrator actor; actor-authorized rotation for an already-registered same ActorId and class; first-worker registration as an atomic effect of `AssignmentOpening`; operator-channel recovery/root rotation for an already-registered orchestrator (never creates an actor); and operator-channel enrolment of an additional orchestrator actor into another validated profile (unknown actors only, orchestrator class only, occupancy still enforced, bootstrap sentinel untouched) — all operator-channel cases are absent from the agent protocol. No standalone or general enrolment verb exists on the public client;
+- five closed activation cases and nothing else — **four are `ActivationCase` variants** (`OperatorBootstrap`, `ActorAuthorizedRotation`, `OperatorRecovery`, `OperatorOrchestratorEnrolment`); the fifth, first-worker registration, is deliberately **not** a variant because it is an authenticated effect of a transaction rather than a request in its own right, so the enum's cardinality is four by design and not drift. The cases: operator-channel-only bootstrap of the initial/orchestrator actor; actor-authorized rotation for an already-registered same ActorId and class; first-worker registration as an atomic effect of `AssignmentOpening`; operator-channel recovery/root rotation for an already-registered orchestrator (never creates an actor); and operator-channel enrolment of an additional orchestrator actor into another validated profile (unknown actors only, orchestrator class only, occupancy still enforced, bootstrap sentinel untouched) — all operator-channel cases are absent from the agent protocol. No standalone or general enrolment verb exists on the public client;
 - authenticated activation/resume for an already-provisioned actor;
 - atomic worker credential **binding** solely as an effect of `AssignmentOpening` or retry `AttemptOpening`: the caller passes opaque id+digest (`CredentialProvisioning`), Scribe persists digest-only and returns idempotent `StateApplied`, plaintext never crosses in either direction;
 - audit profile activation/change before it authorizes new actions;

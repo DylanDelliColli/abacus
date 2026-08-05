@@ -1,0 +1,7 @@
+[package]
+name = "abacus-work"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+abacus-core = { path = "../abacus-core" }

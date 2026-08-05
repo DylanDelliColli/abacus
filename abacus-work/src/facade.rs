@@ -1,0 +1,343 @@
+//! The work facade: core ports implemented over the provider seam.
+//!
+//! This is where the module's depth lives. Provider adapters report
+//! observations; the facade decides what they mean:
+//!
+//! - expected-revision preconditions (optimistic concurrency);
+//! - idempotent re-application of an already-present effect;
+//! - read-before-write reconciliation of an ambiguous mutation;
+//! - bounding of audit-safe summaries;
+//! - rejection of advice whose graph binding is stale or ineligible.
+
+use std::collections::BTreeSet;
+
+use abacus_core::ports::{
+    AdviceDegradation, AdviceOutcome, BeadSnapshot, BeadStatusView, CloseReason, MutationOutcome,
+    ObservedCloseReason, WorkAdvicePort, WorkError, WorkGraphPort, WorkRevision, WorkStatus,
+};
+use abacus_core::{BeadId, OperationId};
+
+use crate::adapter::{AdviceProvider, ProviderMutation, TargetStatus, WorkProvider};
+
+/// Upper bound on a normalized mutation summary. Provider text is
+/// already curated by the adapter; this is the last structural guard so
+/// an unbounded provider string cannot reach audit (module contract:
+/// "refusal of arbitrary/unbounded provider text").
+pub const MAX_SUMMARY_LEN: usize = 256;
+
+/// Implements [`WorkGraphPort`] over any [`WorkProvider`].
+#[derive(Debug, Clone)]
+pub struct WorkFacade<P> {
+    provider: P,
+}
+
+impl<P: WorkProvider> WorkFacade<P> {
+    pub fn new(provider: P) -> Self {
+        Self { provider }
+    }
+
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    /// Shared decision-gated mutation path for both projections.
+    fn drive(
+        &self,
+        id: &BeadId,
+        target: TargetStatus,
+        operation: &OperationId,
+        expected: &WorkRevision,
+    ) -> Result<MutationOutcome, WorkError> {
+        // Read before write. One inspection serves both the idempotency
+        // check and the precondition, so the ordinary path costs one
+        // extra read rather than a speculative mutation.
+        let view = self.provider.inspect(id)?;
+
+        // A closed bead is TERMINAL at this seam. Report the observed
+        // facts and let core correlate them against the Ledger; never
+        // mutate. Without this, `close` on an already-cancelled bead
+        // would silently re-close it as accepted, and `mark_in_progress`
+        // would silently REOPEN it — both are the "silent adoption or
+        // reversal" the module contract forbids. `MutationOutcome`'s own
+        // contract says an already-present effect reports observed
+        // normalized facts and that correlating origin is core's job, so
+        // a mismatched close reason surfaces here and fails loud there.
+        if matches!(view.status, WorkStatus::Closed { .. }) {
+            return Ok(MutationOutcome::EffectAlreadyPresent {
+                status: view.status,
+                revision: view.revision,
+            });
+        }
+
+        // Idempotency is checked BEFORE the revision precondition on
+        // purpose: a landed effect has already advanced the revision, so
+        // the caller's `expected` is necessarily stale. Checking the
+        // precondition first would report `RevisionConflict` for a
+        // benign replay and push the caller toward a retry that must
+        // never happen.
+        if already_satisfies(view.status, target) {
+            return Ok(MutationOutcome::EffectAlreadyPresent {
+                status: view.status,
+                revision: view.revision,
+            });
+        }
+
+        if view.revision != *expected {
+            return Err(WorkError::RevisionConflict);
+        }
+
+        match self.provider.set_status(id, target, operation)? {
+            ProviderMutation::Applied {
+                before,
+                after,
+                summary,
+            } => Ok(MutationOutcome::Applied {
+                before,
+                after,
+                summary: bound_summary(summary),
+            }),
+            // The command may or may not have landed. Inspect once and
+            // let the observed state decide. Never re-issue: a blind
+            // retry of a landed mutation is the double-apply this whole
+            // seam exists to prevent.
+            ProviderMutation::Ambiguous => {
+                // If reconciliation ITSELF fails, the underlying error
+                // must NOT surface: `ProviderUnavailable` or `Busy` reads
+                // as "nothing happened, safe to retry later", when the
+                // mutation may already have landed. `AmbiguousOutcome`
+                // carries the only actionable truth — outcome unknown,
+                // inspect before any retry — so a transport failure
+                // during reconciliation cannot be mistaken for a
+                // no-op and turned into a double-apply.
+                let Ok(observed) = self.provider.inspect(id) else {
+                    return Err(WorkError::AmbiguousOutcome);
+                };
+                if already_satisfies(observed.status, target) {
+                    Ok(MutationOutcome::EffectAlreadyPresent {
+                        status: observed.status,
+                        revision: observed.revision,
+                    })
+                } else {
+                    Err(WorkError::AmbiguousOutcome)
+                }
+            }
+        }
+    }
+}
+
+/// True when `status` already satisfies `target`, making the mutation a
+/// no-op that must report `EffectAlreadyPresent` rather than reapply.
+fn already_satisfies(status: WorkStatus, target: TargetStatus) -> bool {
+    match (status, target) {
+        (WorkStatus::InProgress, TargetStatus::InProgress) => true,
+        (WorkStatus::Closed { observed_reason }, TargetStatus::Closed(reason)) => {
+            same_reason(observed_reason, reason)
+        }
+        _ => false,
+    }
+}
+
+/// A close is only a replay of the SAME decision when the observed
+/// reason matches the curated one. `UnrecognizedProviderReason` never
+/// matches: an out-of-band close is not this operation's effect, and
+/// treating it as one would silently adopt a foreign mutation.
+fn same_reason(observed: ObservedCloseReason, curated: CloseReason) -> bool {
+    matches!(
+        (observed, curated),
+        (
+            ObservedCloseReason::AcceptedHandoff,
+            CloseReason::AcceptedHandoff
+        ) | (
+            ObservedCloseReason::CancelledObsolete,
+            CloseReason::CancelledObsolete
+        )
+    )
+}
+
+/// Bound an audit summary without splitting a UTF-8 character.
+fn bound_summary(raw: String) -> String {
+    if raw.len() <= MAX_SUMMARY_LEN {
+        return raw;
+    }
+    let mut end = MAX_SUMMARY_LEN;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_owned()
+}
+
+impl<P: WorkProvider> WorkGraphPort for WorkFacade<P> {
+    fn ready(&self) -> Result<(WorkRevision, Vec<BeadSnapshot>), WorkError> {
+        self.provider.ready()
+    }
+
+    fn inspect(&self, id: &BeadId) -> Result<BeadStatusView, WorkError> {
+        self.provider.inspect(id)
+    }
+
+    fn mark_in_progress(
+        &self,
+        id: &BeadId,
+        operation: &OperationId,
+        expected: &WorkRevision,
+    ) -> Result<MutationOutcome, WorkError> {
+        self.drive(id, TargetStatus::InProgress, operation, expected)
+    }
+
+    fn close(
+        &self,
+        id: &BeadId,
+        reason: CloseReason,
+        operation: &OperationId,
+        expected: &WorkRevision,
+    ) -> Result<MutationOutcome, WorkError> {
+        self.drive(id, TargetStatus::Closed(reason), operation, expected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idempotency_matrix_is_exhaustive() {
+        let accepted = WorkStatus::Closed {
+            observed_reason: ObservedCloseReason::AcceptedHandoff,
+        };
+        let cancelled = WorkStatus::Closed {
+            observed_reason: ObservedCloseReason::CancelledObsolete,
+        };
+        let foreign = WorkStatus::Closed {
+            observed_reason: ObservedCloseReason::UnrecognizedProviderReason,
+        };
+
+        assert!(already_satisfies(
+            WorkStatus::InProgress,
+            TargetStatus::InProgress
+        ));
+        assert!(already_satisfies(
+            accepted,
+            TargetStatus::Closed(CloseReason::AcceptedHandoff)
+        ));
+        assert!(already_satisfies(
+            cancelled,
+            TargetStatus::Closed(CloseReason::CancelledObsolete)
+        ));
+
+        // Open is never already-satisfied.
+        assert!(!already_satisfies(
+            WorkStatus::Open,
+            TargetStatus::InProgress
+        ));
+        assert!(!already_satisfies(
+            WorkStatus::Open,
+            TargetStatus::Closed(CloseReason::AcceptedHandoff)
+        ));
+        // Cross-paired close reasons are distinct effects.
+        assert!(!already_satisfies(
+            accepted,
+            TargetStatus::Closed(CloseReason::CancelledObsolete)
+        ));
+        assert!(!already_satisfies(
+            cancelled,
+            TargetStatus::Closed(CloseReason::AcceptedHandoff)
+        ));
+        // An out-of-band close is never adopted as our effect.
+        assert!(!already_satisfies(
+            foreign,
+            TargetStatus::Closed(CloseReason::AcceptedHandoff)
+        ));
+        assert!(!already_satisfies(
+            foreign,
+            TargetStatus::Closed(CloseReason::CancelledObsolete)
+        ));
+        // A closed bead does not satisfy an in-progress target.
+        assert!(!already_satisfies(accepted, TargetStatus::InProgress));
+        // ...nor does in-progress satisfy a close.
+        assert!(!already_satisfies(
+            WorkStatus::InProgress,
+            TargetStatus::Closed(CloseReason::AcceptedHandoff)
+        ));
+    }
+
+    #[test]
+    fn short_summary_is_unchanged() {
+        let raw = "ABACUS-omw.1 -> InProgress".to_owned();
+        assert_eq!(bound_summary(raw.clone()), raw);
+    }
+
+    #[test]
+    fn long_summary_is_truncated_to_the_bound() {
+        let raw = "a".repeat(MAX_SUMMARY_LEN * 2);
+        let bounded = bound_summary(raw);
+        assert_eq!(bounded.len(), MAX_SUMMARY_LEN);
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        // 'é' is two bytes, so the naive byte cut at MAX_SUMMARY_LEN
+        // lands mid-character and would panic on a raw slice.
+        let raw = "é".repeat(MAX_SUMMARY_LEN);
+        let bounded = bound_summary(raw);
+
+        assert!(bounded.len() <= MAX_SUMMARY_LEN);
+        // Round-trips as valid UTF-8 with no replacement character.
+        assert!(!bounded.contains('\u{fffd}'));
+        assert!(bounded.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn boundary_length_summary_is_kept_whole() {
+        let raw = "b".repeat(MAX_SUMMARY_LEN);
+        assert_eq!(bound_summary(raw.clone()), raw);
+    }
+}
+
+/// Implements [`WorkAdvicePort`] over any [`AdviceProvider`].
+#[derive(Debug, Clone)]
+pub struct AdviceFacade<A> {
+    advisor: A,
+}
+
+impl<A: AdviceProvider> AdviceFacade<A> {
+    pub fn new(advisor: A) -> Self {
+        Self { advisor }
+    }
+}
+
+impl<A: AdviceProvider> WorkAdvicePort for AdviceFacade<A> {
+    fn advise(&self, revision: &WorkRevision, ready: &[BeadId]) -> AdviceOutcome {
+        let analysis = match self.advisor.analyze(revision, ready) {
+            Ok(analysis) => analysis,
+            // Degradation is a noted outcome, never an error: core owns
+            // the deterministic fallback (I8).
+            Err(reason) => return AdviceOutcome::Degraded { reason },
+        };
+
+        // Advice is only meaningful against the graph the caller asked
+        // about. A different analyzed revision means the advisor raced
+        // the graph, so the ordering is stale by construction.
+        if analysis.analyzed != *revision {
+            return AdviceOutcome::Degraded {
+                reason: AdviceDegradation::Malformed,
+            };
+        }
+
+        // An advisor may only rank what it was given, and may rank each
+        // bead once. Anything else is a malformed ranking, not a hint
+        // worth partially trusting.
+        let mut seen = BTreeSet::new();
+        for id in &analysis.order {
+            if !ready.contains(id) || !seen.insert(id.as_str()) {
+                return AdviceOutcome::Degraded {
+                    reason: AdviceDegradation::Malformed,
+                };
+            }
+        }
+
+        AdviceOutcome::Advice {
+            order: analysis.order,
+            bound_to: analysis.analyzed,
+        }
+    }
+}
