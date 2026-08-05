@@ -843,11 +843,14 @@ pub enum AuditSubmissionRefusal {
     RedGreen,
 }
 
-/// Payload-free classification of an application attempt outcome.
+/// Payload-free classification of an application attempt outcome,
+/// mirroring the provenance the recorded outcome carries (ADR-0001
+/// effect-provenance amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuditApplicationOutcome {
     Applied,
-    EffectAlreadyPresent,
+    FoundPresent,
+    ObservedAfterAmbiguous,
     Failed,
     Ambiguous,
 }
@@ -972,8 +975,9 @@ impl AuditKind {
     pub fn application(outcome: &ApplicationOutcome) -> Self {
         let outcome = match outcome {
             ApplicationOutcome::Applied { .. } => AuditApplicationOutcome::Applied,
-            ApplicationOutcome::EffectAlreadyPresent { .. } => {
-                AuditApplicationOutcome::EffectAlreadyPresent
+            ApplicationOutcome::FoundPresent { .. } => AuditApplicationOutcome::FoundPresent,
+            ApplicationOutcome::ObservedAfterAmbiguous { .. } => {
+                AuditApplicationOutcome::ObservedAfterAmbiguous
             }
             ApplicationOutcome::Failed { .. } => AuditApplicationOutcome::Failed,
             ApplicationOutcome::Ambiguous => AuditApplicationOutcome::Ambiguous,
@@ -1080,14 +1084,26 @@ pub enum SubmissionOutcome {
 }
 
 /// Outcome of one work-status application attempt: recorded immutably
-/// whatever happened; only confirmed success also yields a receipt.
+/// whatever happened, mirroring the mutation's provenance so the
+/// Ledger's attempt history states what each attempt actually proved
+/// (ADR-0001 effect-provenance amendment). Only `Applied` is
+/// receipt-eligible — at composition AND at receipt validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplicationOutcome {
+    /// The provider attested application of this attempt's submission.
     Applied {
         before: WorkRevision,
         after: WorkRevision,
     },
-    EffectAlreadyPresent {
+    /// Observed facts found before anything was submitted; whose
+    /// effect this is cannot be proven, so never receipted.
+    FoundPresent {
+        status: WorkStatus,
+        revision: WorkRevision,
+    },
+    /// Satisfying facts observed after this attempt's own ambiguous
+    /// submission: possibly applied, never confirmed, never receipted.
+    ObservedAfterAmbiguous {
         status: WorkStatus,
         revision: WorkRevision,
     },
@@ -1204,9 +1220,24 @@ pub enum WorkProjection {
     Close { reason: CloseReason },
 }
 
-/// A committed projection awaiting its successful application receipt,
-/// carrying the typed projection plus the identities reconciliation
-/// needs without a second read.
+/// The recoverable crash window's derived recovery basis (ADR-0001
+/// effect-provenance amendment): a previously recorded `Applied`
+/// attempt that lacks only its receipt. When more than one exists for
+/// the target, this is deterministically the EARLIEST Ledger-order
+/// `Applied` attempt — the first confirmed application is the recovery
+/// basis, and later history never rewrites it. The portable state
+/// contract requires that choice identically of every implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptCandidate {
+    /// The original applied attempt the recovered receipt credits.
+    pub attempt: OperationId,
+    pub after: WorkRevision,
+}
+
+/// A committed projection in the ACTIONABLE pending set — lacking a
+/// successful receipt AND not causally superseded — carrying the typed
+/// projection plus the identities reconciliation needs without a
+/// second read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApplication {
     /// The authorizing operation identity — also the application
@@ -1223,6 +1254,23 @@ pub struct PendingApplication {
     /// carry `None`: reconciliation must inspect fresh rather than
     /// reuse an older revision and call it authorized.
     pub authorized_revision: Option<WorkRevision>,
+    /// Present when the recoverable crash window applies: recovery
+    /// records this receipt directly, issuing no work mutation and
+    /// consuming no fresh attempt identity.
+    pub receipt_candidate: Option<ReceiptCandidate>,
+}
+
+/// A projection excluded from the actionable pending set by causal
+/// supersession: a `MarkInProgress` projection followed in Ledger
+/// order by a committed Close projection for the exact same Assignment
+/// (ADR-0001 effect-provenance amendment). A derived disposition — not
+/// a receipt, attempt, mutation, decision, or waiver — preserving both
+/// operations and their history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupersededApplication {
+    pub application: PendingApplication,
+    /// The later committed close projection's operation identity.
+    pub superseded_by: OperationId,
 }
 
 /// Composed current state of an Assignment as recorded.
@@ -1418,8 +1466,18 @@ pub trait WorkflowStatePort {
     /// actor through this).
     fn active_occupants(&self, profile: &ProfileName) -> Result<Vec<ActorId>, StateError>;
 
-    /// Derived reconciliation set, typed: decisions lacking receipts.
+    /// The derived ACTIONABLE reconciliation set: committed projections
+    /// lacking a successful receipt AND not causally superseded
+    /// (ADR-0001 effect-provenance amendment), in Ledger commit order,
+    /// each carrying its `receipt_candidate` when the recoverable
+    /// crash window applies.
     fn pending_applications(&self) -> Result<Vec<PendingApplication>, StateError>;
+
+    /// The derived superseded view: projections excluded from the
+    /// actionable set by causal supersession, each with its
+    /// `superseded_by` operation. Query-exposed history — reconciling
+    /// or receipting these is not possible and not needed.
+    fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError>;
 
     /// Derived unresolved-Signal set, per recipient or global.
     fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError>;
@@ -2724,6 +2782,7 @@ mod tests {
                     projection: WorkProjection::MarkInProgress,
                     committed_at: seq,
                     authorized_revision: Some(opening.bead_revision.clone()),
+                    receipt_candidate: None,
                 },
             );
             self.append_audit(
@@ -2940,6 +2999,7 @@ mod tests {
                             // No revision is authorized at close time
                             // here; reconciliation inspects fresh.
                             authorized_revision: None,
+                            receipt_candidate: None,
                         },
                     );
                 }
@@ -3818,12 +3878,16 @@ mod tests {
             let Some((_, outcome)) = recorded.iter().find(|(id, _)| id == &receipt.attempt) else {
                 return Err(StateError::IncoherentBundle);
             };
+            // Only a provider-attested application is receipt-eligible
+            // (ADR-0001 effect-provenance amendment): a receipt can no
+            // more be manufactured from an observation here than at
+            // composition.
             let revision_matches = match outcome {
                 ApplicationOutcome::Applied { after, .. } => after == &receipt.after,
-                ApplicationOutcome::EffectAlreadyPresent { revision, .. } => {
-                    revision == &receipt.after
-                }
-                ApplicationOutcome::Failed { .. } | ApplicationOutcome::Ambiguous => false,
+                ApplicationOutcome::FoundPresent { .. }
+                | ApplicationOutcome::ObservedAfterAmbiguous { .. }
+                | ApplicationOutcome::Failed { .. }
+                | ApplicationOutcome::Ambiguous => false,
             };
             if !revision_matches {
                 return Err(StateError::IncoherentBundle);
@@ -3944,6 +4008,10 @@ mod tests {
                 pending.sort_by_key(|p| p.committed_at);
                 pending
             })
+        }
+
+        fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError> {
+            unimplemented!("core port tests never query the superseded view")
         }
 
         fn unresolved_signals(

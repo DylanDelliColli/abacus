@@ -16,9 +16,9 @@ use crate::ports::{
     AssignmentOpening, BeadSnapshot, CloseReason, DecisionKind, DecisionReason, DecisionRecord,
     EphemeralLaunchSecret, EvidenceOutcome, FencedAction, FencedResponse, HandoffRecord,
     LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec, LaunchSubject, MutationOutcome,
-    ObservedCloseReason, PendingApplication, ReportOutcome, RuntimeError, RuntimePort,
-    StateApplied, StateError, SubmissionOutcome, WorkAdvicePort, WorkError, WorkGraphPort,
-    WorkProjection, WorkRevision, WorkStatus, WorkflowStatePort, appraise_advice,
+    ObservedCloseReason, PendingApplication, ReceiptCandidate, ReportOutcome, RuntimeError,
+    RuntimePort, StateApplied, StateError, SubmissionOutcome, WorkAdvicePort, WorkError,
+    WorkGraphPort, WorkProjection, WorkRevision, WorkStatus, WorkflowStatePort, appraise_advice,
 };
 use crate::{
     AssignmentId, AuthoritySnapshot, BeadId, Evidence, HandoffId, OperationId, SignalDraft,
@@ -61,6 +61,15 @@ pub enum ProjectionOutcome {
     /// The provider effect is confirmed and its receipt is recorded,
     /// clearing this projection from the pending set.
     Projected { after: WorkRevision },
+    /// The recoverable crash window: a previously recorded `Applied`
+    /// attempt lacked only its receipt, which is now recorded directly
+    /// — no provider mutation was issued and no fresh attempt identity
+    /// was consumed. `attempt` names the ORIGINAL applied attempt the
+    /// receipt credits.
+    ReceiptRecovered {
+        attempt: OperationId,
+        after: WorkRevision,
+    },
     /// The attempt is recorded immutably, but no receipt exists: the
     /// projection stays pending and reconcilable.
     Unresolved {
@@ -108,6 +117,14 @@ where
     S: WorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
+    // The recoverable crash window outranks everything else: a
+    // previously recorded Applied attempt lacking only its receipt is
+    // recovered directly — no provider mutation, no fresh attempt
+    // identity (ADR-0001 effect-provenance amendment).
+    if let Some(candidate) = &pending.receipt_candidate {
+        return recover_receipt(state, pending, candidate);
+    }
+
     let expected = match pending.authorized_revision.clone() {
         Some(revision) => revision,
         // The authorizing decision bound no bead revision (the Accept
@@ -141,18 +158,22 @@ where
         }
     };
 
-    // INTERIM (Phase 1b pending): the recorded ApplicationOutcome does
-    // not yet mirror provenance — both already-present provenances
-    // record as EffectAlreadyPresent until the Ledger mirror lands in
-    // the coordinated state window. Return values below are NOT lossy.
+    // The recorded outcome mirrors the mutation's provenance, so the
+    // Ledger's attempt history states what each attempt actually
+    // proved (ADR-0001 effect-provenance amendment).
     let outcome = match &mutation {
         Ok(MutationOutcome::Applied { before, after, .. }) => ApplicationOutcome::Applied {
             before: before.clone(),
             after: after.clone(),
         },
-        Ok(MutationOutcome::FoundBeforeSubmission { status, revision })
-        | Ok(MutationOutcome::ObservedAfterAmbiguousSubmission { status, revision }) => {
-            ApplicationOutcome::EffectAlreadyPresent {
+        Ok(MutationOutcome::FoundBeforeSubmission { status, revision }) => {
+            ApplicationOutcome::FoundPresent {
+                status: *status,
+                revision: revision.clone(),
+            }
+        }
+        Ok(MutationOutcome::ObservedAfterAmbiguousSubmission { status, revision }) => {
+            ApplicationOutcome::ObservedAfterAmbiguous {
                 status: *status,
                 revision: revision.clone(),
             }
@@ -309,10 +330,20 @@ where
     W: WorkGraphPort + ?Sized,
 {
     let pending = state.pending_applications()?;
-    let mut reconciled = Vec::with_capacity(pending.len().min(attempt_operations.len()));
+    let mut reconciled = Vec::with_capacity(pending.len());
     let mut unattempted = Vec::new();
     let mut attempts = attempt_operations.iter();
     for item in &pending {
+        // Receipt recovery is mutation-free and consumes no fresh
+        // attempt identity, so a candidate never competes with the
+        // supplied attempt operations.
+        if let Some(candidate) = &item.receipt_candidate {
+            reconciled.push((
+                item.operation.clone(),
+                recover_receipt(state, item, candidate)?,
+            ));
+            continue;
+        }
         match attempts.next() {
             Some(attempt) => {
                 let outcome = project_pending(state, work, item, attempt)?;
@@ -324,6 +355,28 @@ where
     Ok(ReconciliationPass {
         reconciled,
         unattempted,
+    })
+}
+
+/// Record the receipt a previously `Applied` attempt already earned
+/// (the recoverable crash window): mutation-free, crediting the
+/// ORIGINAL attempt identity.
+fn recover_receipt<S>(
+    state: &S,
+    pending: &PendingApplication,
+    candidate: &ReceiptCandidate,
+) -> Result<ProjectionOutcome, StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+{
+    state.record_application_receipt(&ApplicationReceipt {
+        target: pending.operation.clone(),
+        attempt: candidate.attempt.clone(),
+        after: candidate.after.clone(),
+    })?;
+    Ok(ProjectionOutcome::ReceiptRecovered {
+        attempt: candidate.attempt.clone(),
+        after: candidate.after.clone(),
     })
 }
 
@@ -695,6 +748,7 @@ mod tests {
             },
             committed_at: Seq(1),
             authorized_revision: Some(rev('e')),
+            receipt_candidate: None,
         }
     }
 
@@ -1217,6 +1271,10 @@ mod tests {
             Ok(self.pending.borrow().clone())
         }
 
+        fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError> {
+            unimplemented!("no scenario queries the superseded view")
+        }
+
         fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError> {
             self.openings.borrow_mut().push(opening.clone());
             if self.open_replay.get() {
@@ -1232,6 +1290,7 @@ mod tests {
                 projection: WorkProjection::MarkInProgress,
                 committed_at: Seq(1),
                 authorized_revision: Some(opening.bead_revision.clone()),
+                receipt_candidate: None,
             });
             Ok(StateApplied::Applied)
         }
@@ -1482,11 +1541,103 @@ mod tests {
             "our submission may have landed - possibly applied is not confirmation"
         );
         assert_eq!(state.attempts.borrow().len(), 1);
+        assert_eq!(
+            state.attempts.borrow()[0].outcome,
+            ApplicationOutcome::ObservedAfterAmbiguous {
+                status: WorkStatus::InProgress,
+                revision: rev('7'),
+            },
+            "the Ledger's attempt history states what this attempt proved"
+        );
         assert!(
             state.receipts.borrow().is_empty(),
             "an ambiguous observation must never manufacture a receipt"
         );
         assert_eq!(state.pending.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_receipt_candidate_recovers_without_provider_mutation() {
+        let pending = PendingApplication {
+            receipt_candidate: Some(ReceiptCandidate {
+                attempt: op("app-orig"),
+                after: rev('9'),
+            }),
+            ..pending_close()
+        };
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending.clone());
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "must not be issued".to_owned(),
+        }));
+
+        let outcome =
+            project_pending(&state, &work, &pending, &op("app-fresh")).expect("recovery runs");
+        assert_eq!(
+            outcome,
+            ProjectionOutcome::ReceiptRecovered {
+                attempt: op("app-orig"),
+                after: rev('9'),
+            }
+        );
+
+        // Mutation-free, crediting the ORIGINAL applied attempt: no
+        // provider call, no fresh attempt record, and the receipt names
+        // the candidate's attempt — not the caller-supplied fresh one.
+        assert!(work.closes.borrow().is_empty());
+        assert!(work.marks.borrow().is_empty());
+        assert!(state.attempts.borrow().is_empty());
+        assert_eq!(state.receipts.borrow().len(), 1);
+        assert_eq!(state.receipts.borrow()[0].attempt, op("app-orig"));
+        assert_eq!(state.receipts.borrow()[0].target, op("op-accept"));
+        assert!(state.pending.borrow().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_recovers_candidates_without_consuming_attempt_identities() {
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(PendingApplication {
+            receipt_candidate: Some(ReceiptCandidate {
+                attempt: op("app-orig"),
+                after: rev('8'),
+            }),
+            ..pending_close()
+        });
+        state.pending.borrow_mut().push(PendingApplication {
+            operation: op("op-accept-2"),
+            ..pending_close()
+        });
+        let work = ScriptedWork::new(Ok(MutationOutcome::Applied {
+            before: rev('e'),
+            after: rev('9'),
+            summary: "closed".to_owned(),
+        }));
+
+        // ONE attempt identity for two pending items: the candidate
+        // consumes none, so the single identity covers the second.
+        let pass = reconcile_pending(&state, &work, &[op("app-1")]).expect("reconciles");
+        assert_eq!(pass.reconciled.len(), 2);
+        assert_eq!(
+            pass.reconciled[0],
+            (
+                op("op-accept"),
+                ProjectionOutcome::ReceiptRecovered {
+                    attempt: op("app-orig"),
+                    after: rev('8'),
+                }
+            )
+        );
+        assert_eq!(
+            pass.reconciled[1],
+            (
+                op("op-accept-2"),
+                ProjectionOutcome::Projected { after: rev('9') }
+            )
+        );
+        assert!(pass.unattempted.is_empty());
+        assert!(state.pending.borrow().is_empty());
     }
 
     #[test]
@@ -1692,9 +1843,18 @@ mod tests {
                 }
             }
         );
-        // The attempt records the observed facts; the receipt — which
-        // would attest THIS effect is present — must not exist.
+        // The attempt records the observed facts WITH their provenance;
+        // the receipt — which would attest THIS effect — must not exist.
         assert_eq!(state.attempts.borrow().len(), 1);
+        assert_eq!(
+            state.attempts.borrow()[0].outcome,
+            ApplicationOutcome::FoundPresent {
+                status: WorkStatus::Closed {
+                    observed_reason: ObservedCloseReason::CancelledObsolete,
+                },
+                revision: rev('7'),
+            }
+        );
         assert!(state.receipts.borrow().is_empty());
         assert_eq!(
             state.pending.borrow().len(),
