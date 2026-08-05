@@ -1,5 +1,9 @@
 # ABACUS — Codex implementation handoff
 
+> Current successor handoff: read the late-shift addendum in
+> `SHIFT-REPORT-2026-08-05-CODEX.md` first.
+> The older material below records the initial bootstrap and is historical.
+
 Date: 2026-08-04  
 Repository root: `/home/ddc/dev-environment/abacus`
 
