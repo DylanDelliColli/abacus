@@ -138,19 +138,33 @@ pub enum CloseReason {
     CancelledObsolete,
 }
 
-/// Outcome of a decision-gated work mutation. The provider cannot
-/// attest ABACUS operation identity: an already-present effect reports
-/// observed normalized facts, and correlating origin is core's job
-/// against the Ledger.
+/// Outcome of a decision-gated work mutation, carrying exactly the
+/// provenance the facade possesses (ADR-0001 effect-provenance
+/// amendment): what THIS call did. The provider cannot attest ABACUS
+/// operation identity on any effect, so neither already-present
+/// observation is confirmed application — correlating origin is
+/// core's job against the Ledger, and only [`MutationOutcome::Applied`]
+/// is receipt-eligible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationOutcome {
+    /// The provider attested application of this call's submission.
     Applied {
         before: WorkRevision,
         after: WorkRevision,
         /// Audit-safe normalized summary.
         summary: String,
     },
-    EffectAlreadyPresent {
+    /// The read-before-write or terminal gate found these observed
+    /// facts before anything was submitted: this call issued nothing.
+    FoundBeforeSubmission {
+        status: WorkStatus,
+        revision: WorkRevision,
+    },
+    /// This call submitted, the provider's outcome was lost, and the
+    /// post-ambiguity re-inspection observed facts satisfying the
+    /// target: a typed ambiguous observation, never confirmed
+    /// application.
+    ObservedAfterAmbiguousSubmission {
         status: WorkStatus,
         revision: WorkRevision,
     },
@@ -2004,7 +2018,7 @@ mod tests {
         ) -> Result<MutationOutcome, WorkError> {
             let view = self.inspect(id)?;
             if let WorkStatus::Closed { .. } = view.status {
-                return Ok(MutationOutcome::EffectAlreadyPresent {
+                return Ok(MutationOutcome::FoundBeforeSubmission {
                     status: view.status,
                     revision: view.revision,
                 });
@@ -2035,7 +2049,7 @@ mod tests {
                 &op("op-1"),
                 &rev('9')
             ),
-            Ok(MutationOutcome::EffectAlreadyPresent {
+            Ok(MutationOutcome::FoundBeforeSubmission {
                 status: WorkStatus::Closed {
                     observed_reason: ObservedCloseReason::AcceptedHandoff
                 },

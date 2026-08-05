@@ -104,12 +104,12 @@ impl<P: WorkProvider> WorkFacade<P> {
         // mutate. Without this, `close` on an already-cancelled bead
         // would silently re-close it as accepted, and `mark_in_progress`
         // would silently REOPEN it — both are the "silent adoption or
-        // reversal" the module contract forbids. `MutationOutcome`'s own
-        // contract says an already-present effect reports observed
-        // normalized facts and that correlating origin is core's job, so
-        // a mismatched close reason surfaces here and fails loud there.
+        // reversal" the module contract forbids. Nothing has been
+        // submitted by this call, and that provenance is part of the
+        // outcome: `FoundBeforeSubmission` is never receipt-eligible,
+        // so a foreign effect can never be adopted as this operation's.
         if matches!(view.status, WorkStatus::Closed { .. }) {
-            return Ok(MutationOutcome::EffectAlreadyPresent {
+            return Ok(MutationOutcome::FoundBeforeSubmission {
                 status: view.status,
                 revision: view.revision,
             });
@@ -122,7 +122,7 @@ impl<P: WorkProvider> WorkFacade<P> {
         // benign replay and push the caller toward a retry that must
         // never happen.
         if already_satisfies(view.status, target) {
-            return Ok(MutationOutcome::EffectAlreadyPresent {
+            return Ok(MutationOutcome::FoundBeforeSubmission {
                 status: view.status,
                 revision: view.revision,
             });
@@ -159,7 +159,12 @@ impl<P: WorkProvider> WorkFacade<P> {
                     return Err(WorkError::AmbiguousOutcome);
                 };
                 if already_satisfies(observed.status, target) {
-                    Ok(MutationOutcome::EffectAlreadyPresent {
+                    // THIS call submitted the mutation; the observation
+                    // is still not proof it was ours (a foreign matching
+                    // mutation can win the race before this inspection),
+                    // so the provenance-typed outcome stays ambiguous
+                    // and is never receipt-eligible.
+                    Ok(MutationOutcome::ObservedAfterAmbiguousSubmission {
                         status: observed.status,
                         revision: observed.revision,
                     })
@@ -172,7 +177,7 @@ impl<P: WorkProvider> WorkFacade<P> {
 }
 
 /// True when `status` already satisfies `target`, making the mutation a
-/// no-op that must report `EffectAlreadyPresent` rather than reapply.
+/// no-op that must report its observed facts rather than reapply.
 fn already_satisfies(status: WorkStatus, target: TargetStatus) -> bool {
     match (status, target) {
         (WorkStatus::InProgress, TargetStatus::InProgress) => true,

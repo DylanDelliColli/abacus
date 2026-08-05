@@ -242,13 +242,15 @@ fn treats_a_closed_bead_as_terminal<P: WorkProvider>(
     let expected = current_revision(&facade, bead);
 
     match facade.close(bead, CloseReason::AcceptedHandoff, &operation(), &expected) {
-        Ok(MutationOutcome::EffectAlreadyPresent { status, .. }) => {
+        Ok(MutationOutcome::FoundBeforeSubmission { status, .. }) => {
             assert_eq!(
                 status, cancelled,
                 "the OBSERVED close reason must be reported, not the requested one"
             );
         }
-        other => panic!("a closed bead is terminal; expected observed facts, got {other:?}"),
+        other => panic!(
+            "a closed bead is terminal; expected found-before-submission facts, got {other:?}"
+        ),
     }
 
     assert_eq!(
@@ -274,8 +276,8 @@ fn never_reopens_a_closed_bead<P: WorkProvider>(build: &impl Fn(&Scenario) -> P,
 
     let outcome = facade.mark_in_progress(bead, &operation(), &expected);
     assert!(
-        matches!(outcome, Ok(MutationOutcome::EffectAlreadyPresent { .. })),
-        "expected observed facts for a terminal bead, got {outcome:?}"
+        matches!(outcome, Ok(MutationOutcome::FoundBeforeSubmission { .. })),
+        "expected found-before-submission facts for a terminal bead, got {outcome:?}"
     );
     assert_eq!(
         facade.inspect(bead).expect("bead is still present").status,
@@ -346,10 +348,10 @@ fn is_idempotent_when_the_effect_is_present<P: WorkProvider>(
     let current = current_revision(&facade, bead);
 
     match facade.mark_in_progress(bead, &operation(), &current) {
-        Ok(MutationOutcome::EffectAlreadyPresent { status, .. }) => {
+        Ok(MutationOutcome::FoundBeforeSubmission { status, .. }) => {
             assert_eq!(status, WorkStatus::InProgress);
         }
-        other => panic!("expected EffectAlreadyPresent for a present effect, got {other:?}"),
+        other => panic!("expected FoundBeforeSubmission for a present effect, got {other:?}"),
     }
 }
 
@@ -366,14 +368,16 @@ fn reconciles_an_ambiguous_landed_mutation<P: WorkProvider>(
     let expected = current_revision(&facade, bead);
 
     match facade.mark_in_progress(bead, &operation(), &expected) {
-        Ok(MutationOutcome::EffectAlreadyPresent { status, .. }) => {
+        Ok(MutationOutcome::ObservedAfterAmbiguousSubmission { status, .. }) => {
             assert_eq!(
                 status,
                 WorkStatus::InProgress,
                 "reconciliation must observe the landed effect"
             );
         }
-        other => panic!("expected reconciliation to EffectAlreadyPresent, got {other:?}"),
+        other => {
+            panic!("expected reconciliation to ObservedAfterAmbiguousSubmission, got {other:?}")
+        }
     }
 }
 

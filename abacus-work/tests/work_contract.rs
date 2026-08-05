@@ -114,11 +114,11 @@ fn already_in_target_state_is_idempotent() {
         .expect("idempotent replay succeeds");
 
     match outcome {
-        MutationOutcome::EffectAlreadyPresent { status, revision } => {
+        MutationOutcome::FoundBeforeSubmission { status, revision } => {
             assert_eq!(status, WorkStatus::InProgress);
             assert_eq!(revision, rev(2));
         }
-        other => panic!("expected EffectAlreadyPresent, got {other:?}"),
+        other => panic!("expected FoundBeforeSubmission, got {other:?}"),
     }
     assert_eq!(
         mutation_count(&facade.provider().calls()),
@@ -128,7 +128,7 @@ fn already_in_target_state_is_idempotent() {
 }
 
 #[test]
-fn ambiguous_outcome_that_landed_reconciles_to_effect_already_present() {
+fn ambiguous_outcome_that_landed_is_observed_not_confirmed() {
     let provider = FakeWorkProvider::with_bead(&bead(), WorkStatus::Open, 1)
         .scripted(Script::new().ambiguous_applied());
     let facade = WorkFacade::new(provider);
@@ -137,11 +137,15 @@ fn ambiguous_outcome_that_landed_reconciles_to_effect_already_present() {
         .mark_in_progress(&bead(), &operation(), &rev(1))
         .expect("reconciliation resolves the ambiguity");
 
+    // This call DID submit; the observation is typed as exactly that -
+    // observed after an ambiguous submission - because a foreign
+    // matching mutation could have won the race, and only Applied is
+    // receipt-eligible downstream.
     match outcome {
-        MutationOutcome::EffectAlreadyPresent { status, .. } => {
+        MutationOutcome::ObservedAfterAmbiguousSubmission { status, .. } => {
             assert_eq!(status, WorkStatus::InProgress);
         }
-        other => panic!("expected EffectAlreadyPresent, got {other:?}"),
+        other => panic!("expected ObservedAfterAmbiguousSubmission, got {other:?}"),
     }
     assert_eq!(
         mutation_count(&facade.provider().calls()),
@@ -225,7 +229,7 @@ fn close_is_idempotent_only_for_the_matching_observed_reason() {
         .expect("provider is reachable");
 
     match outcome {
-        MutationOutcome::EffectAlreadyPresent { status, .. } => {
+        MutationOutcome::FoundBeforeSubmission { status, .. } => {
             assert_eq!(
                 status,
                 WorkStatus::Closed {
@@ -262,7 +266,7 @@ fn a_closed_bead_is_never_silently_reopened() {
         .expect("provider is reachable");
 
     assert!(
-        matches!(outcome, MutationOutcome::EffectAlreadyPresent { .. }),
+        matches!(outcome, MutationOutcome::FoundBeforeSubmission { .. }),
         "expected observed facts for a terminal bead, got {outcome:?}"
     );
     assert_eq!(

@@ -35,12 +35,21 @@ pub enum ProjectionUnresolved {
     /// The outcome is unknown: the mutation may have landed. Inspect
     /// before any retry — never re-issue blindly.
     Ambiguous,
-    /// The provider reports an already-present effect that does NOT
-    /// satisfy this projection (closed under a different reason, or
-    /// terminal where in-progress was intended): an out-of-band
-    /// mutation this operation must not adopt as its own. Re-driving
-    /// cannot resolve it — resolution is a decision, not a retry.
+    /// The provider reports an already-present effect this operation
+    /// must not adopt as its own: found before anything was submitted
+    /// (whether or not the facts match the intended projection — br
+    /// cannot attest whose effect it is), or observed with facts that
+    /// do not satisfy the projection. Re-driving cannot resolve it —
+    /// resolution is a decision, not a retry (ADR-0001
+    /// effect-provenance amendment).
     ConflictingEffect {
+        status: WorkStatus,
+        revision: WorkRevision,
+    },
+    /// This operation's own submission was ambiguous and a later
+    /// observation found the intended facts in place: possibly
+    /// applied, never confirmed. Stays pending; never a receipt.
+    PossiblyApplied {
         status: WorkStatus,
         revision: WorkRevision,
     },
@@ -132,48 +141,67 @@ where
         }
     };
 
-    let outcome = match mutation {
-        Ok(MutationOutcome::Applied { before, after, .. }) => {
-            ApplicationOutcome::Applied { before, after }
-        }
-        Ok(MutationOutcome::EffectAlreadyPresent { status, revision }) => {
-            ApplicationOutcome::EffectAlreadyPresent { status, revision }
+    // INTERIM (Phase 1b pending): the recorded ApplicationOutcome does
+    // not yet mirror provenance — both already-present provenances
+    // record as EffectAlreadyPresent until the Ledger mirror lands in
+    // the coordinated state window. Return values below are NOT lossy.
+    let outcome = match &mutation {
+        Ok(MutationOutcome::Applied { before, after, .. }) => ApplicationOutcome::Applied {
+            before: before.clone(),
+            after: after.clone(),
+        },
+        Ok(MutationOutcome::FoundBeforeSubmission { status, revision })
+        | Ok(MutationOutcome::ObservedAfterAmbiguousSubmission { status, revision }) => {
+            ApplicationOutcome::EffectAlreadyPresent {
+                status: *status,
+                revision: revision.clone(),
+            }
         }
         Err(WorkError::AmbiguousOutcome) => ApplicationOutcome::Ambiguous,
-        Err(error) => ApplicationOutcome::Failed { error },
+        Err(error) => ApplicationOutcome::Failed {
+            error: error.clone(),
+        },
     };
 
     let attempt = ApplicationAttempt {
         id: attempt_operation.clone(),
         target: pending.operation.clone(),
-        outcome: outcome.clone(),
+        outcome,
     };
     state.record_application_attempt(&attempt)?;
 
-    // Only a confirmed effect yields the receipt that clears the
-    // projection. An already-present effect counts ONLY when the
-    // observed facts satisfy this projection: the facade reports what
-    // it saw precisely so this correlation can refuse to adopt an
-    // out-of-band mutation as this operation's own.
-    let after = match outcome {
-        ApplicationOutcome::Applied { after, .. } => after,
-        ApplicationOutcome::EffectAlreadyPresent { status, revision } => {
-            if effect_satisfies(&pending.projection, status) {
-                revision
-            } else {
-                return Ok(ProjectionOutcome::Unresolved {
-                    attempt: attempt_operation.clone(),
-                    reason: ProjectionUnresolved::ConflictingEffect { status, revision },
-                });
-            }
+    // Only a provider-attested application yields the receipt that
+    // clears the projection (ADR-0001 effect-provenance amendment). An
+    // effect found before submission cannot be proven ours however
+    // well the facts match; an observation after our own ambiguous
+    // submission is possibly applied, never confirmed. Both stay
+    // pending — resolution is a decision, not a retry.
+    let after = match mutation {
+        Ok(MutationOutcome::Applied { after, .. }) => after,
+        Ok(MutationOutcome::FoundBeforeSubmission { status, revision }) => {
+            return Ok(ProjectionOutcome::Unresolved {
+                attempt: attempt_operation.clone(),
+                reason: ProjectionUnresolved::ConflictingEffect { status, revision },
+            });
         }
-        ApplicationOutcome::Ambiguous => {
+        Ok(MutationOutcome::ObservedAfterAmbiguousSubmission { status, revision }) => {
+            let reason = if effect_satisfies(&pending.projection, status) {
+                ProjectionUnresolved::PossiblyApplied { status, revision }
+            } else {
+                ProjectionUnresolved::ConflictingEffect { status, revision }
+            };
+            return Ok(ProjectionOutcome::Unresolved {
+                attempt: attempt_operation.clone(),
+                reason,
+            });
+        }
+        Err(WorkError::AmbiguousOutcome) => {
             return Ok(ProjectionOutcome::Unresolved {
                 attempt: attempt_operation.clone(),
                 reason: ProjectionUnresolved::Ambiguous,
             });
         }
-        ApplicationOutcome::Failed { error } => {
+        Err(error) => {
             return Ok(ProjectionOutcome::Unresolved {
                 attempt: attempt_operation.clone(),
                 reason: ProjectionUnresolved::Failed(error),
@@ -610,11 +638,12 @@ where
     state.fenced_submit_handoff(action, handoff)
 }
 
-/// True when observed provider facts satisfy the intended projection —
-/// the correlation `MutationOutcome`'s contract assigns to core. An
-/// unrecognized provider close reason never matches: adopting an
-/// out-of-band close as this operation's effect is the silent-adoption
-/// defect this gate exists to refuse.
+/// True when observed provider facts satisfy the intended projection.
+/// Under the effect-provenance amendment this gate classifies ONLY the
+/// observed-after-ambiguous-submission outcome (satisfying facts →
+/// possibly applied; anything else → conflict) — matching facts alone
+/// never earn a receipt for any provenance. An unrecognized provider
+/// close reason never matches.
 fn effect_satisfies(projection: &WorkProjection, status: WorkStatus) -> bool {
     match (projection, status) {
         (WorkProjection::MarkInProgress, WorkStatus::InProgress) => true,
@@ -1398,22 +1427,90 @@ mod tests {
     }
 
     #[test]
-    fn an_already_present_effect_still_earns_its_receipt() {
+    fn a_found_present_effect_never_earns_a_receipt_even_when_facts_match() {
         let state = RecordingState::default();
         state.pending.borrow_mut().push(pending_close());
-        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+        let work = ScriptedWork::new(Ok(MutationOutcome::FoundBeforeSubmission {
             status: WorkStatus::Closed {
                 observed_reason: ObservedCloseReason::AcceptedHandoff,
             },
             revision: rev('7'),
         }));
 
+        // The observed facts match the intended projection exactly —
+        // and it does not matter: nothing was submitted by this call,
+        // br cannot attest whose effect this is, and only Applied is
+        // receipt-eligible (ADR-0001 effect-provenance amendment).
         assert_eq!(
             project_pending(&state, &work, &pending_close(), &op("app-2")).expect("runs"),
-            ProjectionOutcome::Projected { after: rev('7') },
-            "the effect IS present, which is what the receipt attests"
+            ProjectionOutcome::Unresolved {
+                attempt: op("app-2"),
+                reason: ProjectionUnresolved::ConflictingEffect {
+                    status: WorkStatus::Closed {
+                        observed_reason: ObservedCloseReason::AcceptedHandoff,
+                    },
+                    revision: rev('7'),
+                }
+            }
         );
-        assert_eq!(state.receipts.borrow().len(), 1);
+        assert!(state.receipts.borrow().is_empty());
+        assert_eq!(state.pending.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_observed_after_ambiguous_submission_is_possibly_applied_not_confirmed() {
+        let pending = PendingApplication {
+            projection: WorkProjection::MarkInProgress,
+            ..pending_close()
+        };
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending.clone());
+        let work = ScriptedWork::new(Ok(MutationOutcome::ObservedAfterAmbiguousSubmission {
+            status: WorkStatus::InProgress,
+            revision: rev('7'),
+        }));
+
+        assert_eq!(
+            project_pending(&state, &work, &pending, &op("app-11")).expect("runs"),
+            ProjectionOutcome::Unresolved {
+                attempt: op("app-11"),
+                reason: ProjectionUnresolved::PossiblyApplied {
+                    status: WorkStatus::InProgress,
+                    revision: rev('7'),
+                }
+            },
+            "our submission may have landed - possibly applied is not confirmation"
+        );
+        assert_eq!(state.attempts.borrow().len(), 1);
+        assert!(
+            state.receipts.borrow().is_empty(),
+            "an ambiguous observation must never manufacture a receipt"
+        );
+        assert_eq!(state.pending.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_observed_after_ambiguous_submission_with_foreign_facts_conflicts() {
+        let state = RecordingState::default();
+        state.pending.borrow_mut().push(pending_close());
+        // Composition does not trust the facade's satisfaction check:
+        // facts that do not satisfy the intended close are a conflict
+        // regardless of submission provenance.
+        let work = ScriptedWork::new(Ok(MutationOutcome::ObservedAfterAmbiguousSubmission {
+            status: WorkStatus::Closed {
+                observed_reason: ObservedCloseReason::CancelledObsolete,
+            },
+            revision: rev('7'),
+        }));
+
+        assert!(matches!(
+            project_pending(&state, &work, &pending_close(), &op("app-12")).expect("runs"),
+            ProjectionOutcome::Unresolved {
+                reason: ProjectionUnresolved::ConflictingEffect { .. },
+                ..
+            }
+        ),);
+        assert!(state.receipts.borrow().is_empty());
     }
 
     #[test]
@@ -1574,7 +1671,7 @@ mod tests {
         // a foreign mutation as this operation's effect.
         let state = RecordingState::default();
         state.pending.borrow_mut().push(pending_close());
-        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+        let work = ScriptedWork::new(Ok(MutationOutcome::FoundBeforeSubmission {
             status: WorkStatus::Closed {
                 observed_reason: ObservedCloseReason::CancelledObsolete,
             },
@@ -1610,7 +1707,7 @@ mod tests {
     fn an_unrecognized_close_reason_never_satisfies_a_close_projection() {
         let state = RecordingState::default();
         state.pending.borrow_mut().push(pending_close());
-        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+        let work = ScriptedWork::new(Ok(MutationOutcome::FoundBeforeSubmission {
             status: WorkStatus::Closed {
                 observed_reason: ObservedCloseReason::UnrecognizedProviderReason,
             },
@@ -1640,7 +1737,7 @@ mod tests {
         };
         let state = RecordingState::default();
         state.pending.borrow_mut().push(pending.clone());
-        let work = ScriptedWork::new(Ok(MutationOutcome::EffectAlreadyPresent {
+        let work = ScriptedWork::new(Ok(MutationOutcome::FoundBeforeSubmission {
             status: WorkStatus::Closed {
                 observed_reason: ObservedCloseReason::AcceptedHandoff,
             },

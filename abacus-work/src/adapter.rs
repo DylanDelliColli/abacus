@@ -47,8 +47,8 @@ pub enum TargetStatus {
 /// What a provider adapter observed about its own mutation.
 ///
 /// Deliberately smaller than [`abacus_core::ports::MutationOutcome`]:
-/// an adapter cannot report `EffectAlreadyPresent`, because deciding
-/// that an effect was already present requires a read-before-write
+/// an adapter cannot report an already-present effect (either
+/// provenance), because deciding that requires the read-before-write
 /// comparison the facade owns. An adapter that cannot tell whether its
 /// command took effect returns [`ProviderMutation::Ambiguous`] and the
 /// facade reconciles — never the adapter, and never by retrying blind.
