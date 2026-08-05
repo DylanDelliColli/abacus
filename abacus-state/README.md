@@ -130,7 +130,8 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
   projection carries the earliest Ledger-order `Applied` attempt as its
   mutation-free receipt-recovery candidate;
 - expose receiptless causally superseded projections separately with the exact later
-  close operation that superseded each one;
+  close operation that superseded each one, and atomically refuse any new receipt
+  for such a projection so a stale recovery candidate cannot outrun supersession;
 - query the complete audit lineage.
 
 ### Observation and watchdog access

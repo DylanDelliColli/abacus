@@ -300,6 +300,14 @@ fn restart_preserves_application_derivations<H: RestartStateContractHarness>(
     };
     let superseded_target = op("op-restart-superseded-open");
     let superseding_operation = op("op-restart-superseding-close");
+    let superseded_applied = ApplicationAttempt {
+        id: op("app-restart-superseded-applied"),
+        target: superseded_target.clone(),
+        outcome: ApplicationOutcome::Applied {
+            before: revision('e'),
+            after: revision('9'),
+        },
+    };
 
     {
         let port = harness.port();
@@ -354,14 +362,7 @@ fn restart_preserves_application_derivations<H: RestartStateContractHarness>(
             Ok(StateApplied::Applied)
         );
         assert_eq!(
-            port.record_application_attempt(&ApplicationAttempt {
-                id: op("app-restart-superseded-applied"),
-                target: superseded_target.clone(),
-                outcome: ApplicationOutcome::Applied {
-                    before: revision('e'),
-                    after: revision('9'),
-                },
-            }),
+            port.record_application_attempt(&superseded_applied),
             Ok(StateApplied::Applied)
         );
         assert_eq!(
@@ -430,6 +431,31 @@ fn restart_preserves_application_derivations<H: RestartStateContractHarness>(
             .audit_events(&AuditQuery::default())
             .expect("application provenance audit reloads"),
         audit_before
+    );
+
+    let head_before_superseded_receipt = harness
+        .port()
+        .assignment(&assignment_id())
+        .expect("assignment reloads before receipt refusal")
+        .head;
+    assert_eq!(
+        harness
+            .port()
+            .record_application_receipt(&ApplicationReceipt {
+                target: superseded_target,
+                attempt: superseded_applied.id,
+                after: revision('9'),
+            }),
+        Err(StateError::IncoherentBundle),
+        "restart reconstruction must preserve supersession at receipt validation"
+    );
+    assert_eq!(
+        harness
+            .port()
+            .assignment(&assignment_id())
+            .expect("receipt refusal preserves state")
+            .head,
+        head_before_superseded_receipt
     );
 
     assert_eq!(
@@ -2636,7 +2662,7 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
             .expect("pending query succeeds")[0]
             .receipt_candidate,
         Some(ReceiptCandidate {
-            attempt: superseded_applied.id,
+            attempt: superseded_applied.id.clone(),
             after: revision('6'),
         })
     );
@@ -2675,6 +2701,34 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
     assert_eq!(superseded[0].application.operation, op("zz-contract-open"));
     assert_eq!(superseded[0].superseded_by, first_cancel.operation);
     assert_eq!(superseded[0].application.receipt_candidate, None);
+
+    let head_before_superseded_receipt = ordering
+        .assignment(&assignment_id())
+        .expect("assignment remains queryable")
+        .head;
+    assert_eq!(
+        ordering.record_application_receipt(&ApplicationReceipt {
+            target: late_key_opening.authorizing.operation.clone(),
+            attempt: superseded_applied.id,
+            after: revision('6'),
+        }),
+        Err(StateError::IncoherentBundle),
+        "a stale recovery candidate cannot mint a receipt after causal supersession"
+    );
+    assert_eq!(
+        ordering
+            .assignment(&assignment_id())
+            .expect("refusal preserves the assignment")
+            .head,
+        head_before_superseded_receipt,
+        "the superseded-receipt refusal commits nothing"
+    );
+    assert_eq!(
+        ordering
+            .superseded_applications()
+            .expect("superseded query remains stable"),
+        superseded
+    );
 
     let second_cancel = DecisionRecord {
         operation: op("aa-contract-cancel-second"),

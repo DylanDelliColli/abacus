@@ -1841,8 +1841,17 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         )? {
             return Ok(StateApplied::AlreadyApplied);
         }
-        if !state.projections.contains_key(receipt.target.as_str()) {
-            return Err(StateError::UnknownRecord);
+        let projection = state
+            .projections
+            .get(receipt.target.as_str())
+            .ok_or(StateError::UnknownRecord)?;
+        // Replay wins above: a receipt committed before a later Close
+        // remains an immutable historical fact. A NEW receipt must not
+        // cross the opposite Ledger ordering, though. Re-derive causal
+        // supersession under this same lock so a candidate read just
+        // before the Close cannot mint a receipt just after it.
+        if Self::superseding_projection(&state, projection).is_some() {
+            return Err(StateError::IncoherentBundle);
         }
         let attempt = state
             .application_attempts
