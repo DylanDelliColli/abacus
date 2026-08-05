@@ -339,6 +339,25 @@ pub enum DirectiveGateRefusal {
     AbortInForce,
 }
 
+/// May an honest Report or Evidence be appended under the current
+/// binding set? Pause and Amend still permit those records; only Abort
+/// stops substantive worker mutation.
+pub fn worker_append_gate(binding: &[&Signal]) -> Result<(), DirectiveGateRefusal> {
+    if binding.iter().any(|signal| {
+        matches!(
+            &signal.body,
+            SignalBody::Directive {
+                kind: DirectiveKind::Abort { .. },
+                ..
+            }
+        )
+    }) {
+        Err(DirectiveGateRefusal::AbortInForce)
+    } else {
+        Ok(())
+    }
+}
+
 /// May a Handoff be submitted under the current binding set? The
 /// refusal names the most constraining condition — abort outranks
 /// pause outranks amend.
@@ -672,6 +691,24 @@ mod tests {
             Err(DirectiveGateRefusal::AmendUndischarged)
         );
         assert_eq!(handoff_gate(&[]), Ok(()));
+    }
+
+    #[test]
+    fn worker_append_gate_refuses_only_abort() {
+        let amend_sig = directive("sig-append-amend", 3, amend());
+        let pause_sig = directive("sig-append-pause", 5, pause());
+        let abort_sig = directive("sig-append-abort", 7, abort());
+
+        let honest_updates = vec![pause_sig, amend_sig];
+        let binding = binding_directives(&attempt(), &honest_updates, &[]);
+        assert_eq!(worker_append_gate(&binding), Ok(()));
+
+        let aborted = vec![abort_sig];
+        let binding = binding_directives(&attempt(), &aborted, &[]);
+        assert_eq!(
+            worker_append_gate(&binding),
+            Err(DirectiveGateRefusal::AbortInForce)
+        );
     }
 
     #[test]

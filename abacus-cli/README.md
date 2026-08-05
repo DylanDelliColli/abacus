@@ -164,7 +164,7 @@ Authored agents normally receive smaller task-specific instructions, not the who
 
 `abacus signal directive` is restricted to the Assignment's exact decision authority and the `state:issue_directive` capability; its closed forms are amend, pause, abort, and answer. `abacus signal report` records structured progress or blocked-with-reason state from the current Attempt under its current lease token and `state:report`. `abacus signal request` carries an in-scope arbitration, authority-transfer, reconciliation, or other bounded decision ask under `state:request`; the responding command resolves it only by recording a linked fenced decision. Every form requires a typed bead/Assignment/Attempt/scope subject and rejects a subject-free body.
 
-`abacus signal list` reads immutable records. `abacus signal unresolved --actor <id>` and its authorized global form derive Signals lacking their typed responding actions; neither command creates an inbox, `read_at`, per-Directive acknowledgement, or escalation state. `abacus assignment sync` is an orientation/latency convenience only. Correctness never depends on a worker remembering to call it because Scribe mechanically includes current binding Directives in every fenced response. A fenced response renders those Directives even when the requested Handoff or mutation is refused; amend/pause produce distinct Submission-refusal reasons at Handoff, and abort permits only abort-consistent mutations.
+`abacus signal list` reads immutable records. `abacus signal unresolved --actor <id>` and its authorized global form derive Signals lacking their typed responding actions; neither command creates an inbox, `read_at`, per-Directive acknowledgement, or escalation state. `abacus assignment sync` is an orientation/latency convenience only. Correctness never depends on a worker remembering to call it because Scribe mechanically includes current binding Directives in every fenced response. A fenced response renders those Directives even when the requested operation is refused: amend/pause produce distinct Submission-refusal reasons at Handoff, while Abort produces concrete in-band refusals for Report/Evidence and records no payload or responding action. Lease renewal remains available after Abort as the discovery path; the explicit abort-consistent terminal action is a separate lifecycle operation.
 
 ### Evidence wrapper
 
@@ -237,7 +237,7 @@ Default tests cover:
 - per-framework normalization into `pass`/`assert-fail`/`execution-error`, including collection and execution failures that can never satisfy red;
 - red-green policy-refusal rendering for missing red, wrong-commit red, passing red, `red-errored`, `red-stale`, out-of-policy overlay paths, and green-only submissions, with no CLI or Rust default and no coverage/threshold surface;
 - Signal validation/subject routing, commit-before-content-free-doorbell ordering, per-actor/global derived unresolved presentation, and absence of client read/ack/head inputs;
-- mechanical Directive surfacing on every fenced success/refusal response, amend/pause Handoff-refusal rendering, abort mutation refusal, and structured Report parsing;
+- mechanical Directive surfacing on every fenced success/refusal response, amend/pause Handoff-refusal rendering, response-bearing Abort refusal for Report/Evidence, post-Abort renewal discovery, and structured Report parsing;
 - command handlers with fake core/state/work/runtime/commit interfaces;
 - Scribe connection/start races through a fake state client;
 - no implicit push, global hook, or user-home mutation.

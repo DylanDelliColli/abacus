@@ -53,6 +53,6 @@ pub use signal::{
     AppendOutcome, ConflictingDuplicate, DirectiveGateRefusal, DirectiveKind, DirectiveStatus,
     ReportKind, RequestKind, ResponseAction, ResponseKind, Seq, Signal, SignalBody, SignalDraft,
     SubjectError, SubjectRef, append_idempotent, binding_directives, directive_status,
-    handoff_gate, unresolved,
+    handoff_gate, unresolved, worker_append_gate,
 };
 pub use signal::{AuthoritySnapshot, BoundedText, BoundedTextError, SemanticPhase};

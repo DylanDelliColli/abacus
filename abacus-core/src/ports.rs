@@ -668,6 +668,24 @@ pub struct FencedResponse {
     pub head: Seq,
 }
 
+/// Outcome of a fenced worker Report append. A binding Abort is an
+/// audited domain refusal, not a protocol failure: the operation owns
+/// the refusal and the caller still receives its [`FencedResponse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportOutcome {
+    Recorded { signal: Box<Signal> },
+    Refused { reason: DirectiveGateRefusal },
+}
+
+/// Outcome of a fenced worker Evidence append. Evidence has no
+/// separately identified state record at this seam, so the recorded
+/// variant carries no payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceOutcome {
+    Recorded,
+    Refused { reason: DirectiveGateRefusal },
+}
+
 /// Distinct Submission-refusal reasons (CONTEXT §2/§6): audited,
 /// creating no Handoff and leaving the Attempt active.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,19 +911,21 @@ pub trait WorkflowStatePort {
     /// returns the committed Signal — identically on idempotent retry.
     fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError>;
 
-    /// Fenced worker Report append; Scribe allocates `Seq`.
+    /// Fenced worker Report append; Scribe allocates `Seq`. A binding
+    /// Abort is returned in-band with the response envelope.
     fn fenced_report(
         &self,
         action: &FencedAction,
         draft: &SignalDraft,
-    ) -> Result<(Signal, FencedResponse), StateError>;
+    ) -> Result<(ReportOutcome, FencedResponse), StateError>;
 
-    /// Fenced worker Evidence append.
+    /// Fenced worker Evidence append. A binding Abort is returned
+    /// in-band with the response envelope.
     fn fenced_evidence(
         &self,
         action: &FencedAction,
         evidence: &Evidence,
-    ) -> Result<FencedResponse, StateError>;
+    ) -> Result<(EvidenceOutcome, FencedResponse), StateError>;
 
     /// Fenced Handoff submission: records the immutable Handoff and the
     /// Attempt's `Submitted` transition, or audits a Submission refusal
@@ -1531,7 +1551,7 @@ mod tests {
     use crate::scope::{ScopeExpr, ScopeKey, ScopeValue};
     use crate::signal::{
         BoundedText, DirectiveKind, ReportKind, ResponseAction, ResponseKind, SignalBody,
-        SubjectRef, binding_directives, handoff_gate,
+        SubjectRef, binding_directives, handoff_gate, worker_append_gate,
     };
     use std::cell::RefCell;
 
@@ -1832,7 +1852,10 @@ mod tests {
         now: RefCell<Timestamp>,
         next_seq: RefCell<u64>,
         stored_signals: RefCell<Vec<Signal>>,
+        evidence_records: RefCell<Vec<EvidenceRecord>>,
         response_actions: RefCell<Vec<ResponseAction>>,
+        reports: RefCell<BTreeMap<String, ReportOutcome>>,
+        evidence_outcomes: RefCell<BTreeMap<String, EvidenceOutcome>>,
         submissions: RefCell<BTreeMap<String, (String, SubmissionOutcome)>>,
         receipts: RefCell<Vec<String>>,
         decisions: RefCell<Vec<DecisionRecord>>,
@@ -2083,8 +2106,8 @@ mod tests {
 
         /// Commit one fenced call ordering position. Only permitted
         /// substantive actions enter the responding-action log; an
-        /// audited Submission refusal still advances the causal head
-        /// but cannot discharge a Directive.
+        /// audited domain refusal still advances the causal head but
+        /// cannot discharge a Directive.
         fn commit_fenced_call(&self, action: Option<&FencedAction>, substantive: bool) -> Seq {
             let seq = self.next_ledger_seq();
             if substantive && let Some(action) = action {
@@ -2581,7 +2604,7 @@ mod tests {
             &self,
             action: &FencedAction,
             draft: &SignalDraft,
-        ) -> Result<(Signal, FencedResponse), StateError> {
+        ) -> Result<(ReportOutcome, FencedResponse), StateError> {
             let call = &action.call;
             let request = format!("{}|{draft:?}", Self::action_identity(action));
             if let Some(response) = self.replay_fenced_response(
@@ -2590,14 +2613,13 @@ mod tests {
                 &request,
                 &call.attempt,
             )? {
-                let existing = self
-                    .stored_signals
+                let outcome = self
+                    .reports
                     .borrow()
-                    .iter()
-                    .find(|signal| signal.id == draft.id)
+                    .get(call.operation.as_str())
                     .cloned()
                     .ok_or(StateError::Corrupt)?;
-                return Ok((existing, response));
+                return Ok((outcome, response));
             }
             self.fence(call)?;
             self.validate_response_target(action)?;
@@ -2620,21 +2642,52 @@ mod tests {
             if !subject_ok || draft.sender.actor.actor != call.actor {
                 return Err(StateError::IncoherentBundle);
             }
+
+            let gate = {
+                let signals = self.stored_signals.borrow();
+                let actions = self.response_actions.borrow();
+                let binding = binding_directives(&call.attempt, &signals, &actions);
+                worker_append_gate(&binding)
+            };
+            if let Err(reason) = gate {
+                let outcome = ReportOutcome::Refused { reason };
+                self.reports
+                    .borrow_mut()
+                    .insert(call.operation.as_str().to_owned(), outcome.clone());
+                self.remember(
+                    "fenced_report",
+                    &call.operation,
+                    &request,
+                    StateApplied::Applied,
+                );
+                let head = self.commit_fenced_call(Some(action), false);
+                return Ok((
+                    outcome,
+                    self.respond(&call.attempt, StateApplied::Applied, head),
+                ));
+            }
+
             let (signal, applied) = self.commit_signal(draft)?;
             self.record_owners.borrow_mut().insert(
                 format!("signal:{}", draft.id.as_str()),
                 call.operation.as_str().to_owned(),
             );
+            let outcome = ReportOutcome::Recorded {
+                signal: Box::new(signal),
+            };
+            self.reports
+                .borrow_mut()
+                .insert(call.operation.as_str().to_owned(), outcome.clone());
             let head = self.commit_fenced_call(Some(action), true);
             self.remember("fenced_report", &call.operation, &request, applied);
-            Ok((signal, self.respond(&call.attempt, applied, head)))
+            Ok((outcome, self.respond(&call.attempt, applied, head)))
         }
 
         fn fenced_evidence(
             &self,
             action: &FencedAction,
             evidence: &Evidence,
-        ) -> Result<FencedResponse, StateError> {
+        ) -> Result<(EvidenceOutcome, FencedResponse), StateError> {
             let call = &action.call;
             let request = format!("{}|{evidence:?}", Self::action_identity(action));
             if let Some(response) = self.replay_fenced_response(
@@ -2643,18 +2696,48 @@ mod tests {
                 &request,
                 &call.attempt,
             )? {
-                return Ok(response);
+                let outcome = self
+                    .evidence_outcomes
+                    .borrow()
+                    .get(call.operation.as_str())
+                    .copied()
+                    .ok_or(StateError::Corrupt)?;
+                return Ok((outcome, response));
             }
             self.fence(call)?;
             self.validate_response_target(action)?;
-            let head = self.commit_fenced_call(Some(action), true);
+
+            let outcome = {
+                let signals = self.stored_signals.borrow();
+                let actions = self.response_actions.borrow();
+                let binding = binding_directives(&call.attempt, &signals, &actions);
+                match worker_append_gate(&binding) {
+                    Ok(()) => EvidenceOutcome::Recorded,
+                    Err(reason) => EvidenceOutcome::Refused { reason },
+                }
+            };
+            let substantive = matches!(outcome, EvidenceOutcome::Recorded);
+            if substantive {
+                self.evidence_records.borrow_mut().push(EvidenceRecord {
+                    operation: call.operation.clone(),
+                    attempt: call.attempt.clone(),
+                    evidence: evidence.clone(),
+                });
+            }
+            self.evidence_outcomes
+                .borrow_mut()
+                .insert(call.operation.as_str().to_owned(), outcome);
+            let head = self.commit_fenced_call(Some(action), substantive);
             self.remember(
                 "fenced_evidence",
                 &call.operation,
                 &request,
                 StateApplied::Applied,
             );
-            Ok(self.respond(&call.attempt, StateApplied::Applied, head))
+            Ok((
+                outcome,
+                self.respond(&call.attempt, StateApplied::Applied, head),
+            ))
         }
 
         fn fenced_submit_handoff(
@@ -2958,8 +3041,14 @@ mod tests {
             Err(StateError::UnknownRecord)
         }
 
-        fn evidence_for(&self, _attempt: &AttemptId) -> Result<Vec<EvidenceRecord>, StateError> {
-            Ok(Vec::new())
+        fn evidence_for(&self, attempt: &AttemptId) -> Result<Vec<EvidenceRecord>, StateError> {
+            Ok(self
+                .evidence_records
+                .borrow()
+                .iter()
+                .filter(|record| &record.attempt == attempt)
+                .cloned()
+                .collect())
         }
 
         fn signals_for(&self, _attempt: &AttemptId) -> Result<Vec<Signal>, StateError> {
@@ -3062,7 +3151,10 @@ mod tests {
             now: RefCell::new(Timestamp(50)),
             next_seq: RefCell::new(0),
             stored_signals: RefCell::new(Vec::new()),
+            evidence_records: RefCell::new(Vec::new()),
             response_actions: RefCell::new(Vec::new()),
+            reports: RefCell::new(BTreeMap::new()),
+            evidence_outcomes: RefCell::new(BTreeMap::new()),
             submissions: RefCell::new(BTreeMap::new()),
             receipts: RefCell::new(Vec::new()),
             decisions: RefCell::new(Vec::new()),
@@ -3315,9 +3407,10 @@ mod tests {
             port.fenced_evidence(&stale, &evidence),
             Err(StateError::StaleFencing)
         );
-        let response = port
+        let (outcome, response) = port
             .fenced_evidence(&good_action("op-evi"), &evidence)
             .unwrap();
+        assert_eq!(outcome, EvidenceOutcome::Recorded);
         assert_eq!(response.applied, StateApplied::Applied);
     }
 
@@ -4967,6 +5060,7 @@ mod tests {
         assert_eq!(
             port.fenced_evidence(&good_action("op-e4"), &evidence)
                 .unwrap()
+                .1
                 .applied,
             StateApplied::Applied
         );
@@ -4981,6 +5075,7 @@ mod tests {
         assert_eq!(
             port.fenced_evidence(&good_action("op-e4"), &evidence)
                 .unwrap()
+                .1
                 .applied,
             StateApplied::AlreadyApplied
         );
@@ -5112,12 +5207,15 @@ mod tests {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         let draft = report_draft("sig-ok");
-        let (signal, response) = port.fenced_report(&good_action("op-rep"), &draft).unwrap();
+        let (outcome, response) = port.fenced_report(&good_action("op-rep"), &draft).unwrap();
+        let ReportOutcome::Recorded { signal } = outcome else {
+            panic!("valid report was refused")
+        };
         assert_eq!(signal.seq, Seq(1));
         assert_eq!(response.applied, StateApplied::Applied);
         // Exact replay of the same call is absorbed.
         let (again, replay) = port.fenced_report(&good_action("op-rep"), &draft).unwrap();
-        assert_eq!(again, signal);
+        assert_eq!(again, ReportOutcome::Recorded { signal });
         assert_eq!(replay.applied, StateApplied::AlreadyApplied);
         // A DIFFERENT draft under the same call operation conflicts —
         // SignalId is record identity, not call ownership.
@@ -5170,7 +5268,9 @@ mod tests {
 
         let evidence = passing_evidence();
         let evidence_action = good_action("op-current-evidence");
-        let evidence_response = port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        let (evidence_outcome, evidence_response) =
+            port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        assert_eq!(evidence_outcome, EvidenceOutcome::Recorded);
         assert_eq!(
             evidence_response
                 .binding_directives
@@ -5191,7 +5291,8 @@ mod tests {
             },
         );
         port.append_signal(&second).unwrap();
-        let replay = port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        let (replay_outcome, replay) = port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        assert_eq!(replay_outcome, EvidenceOutcome::Recorded);
         assert_eq!(replay.applied, StateApplied::AlreadyApplied);
         assert_eq!(state.response_actions.borrow().len(), action_count);
         assert_eq!(replay.head, state.current_head());
@@ -5227,6 +5328,229 @@ mod tests {
     }
 
     #[test]
+    fn abort_refuses_report_and_evidence_as_operation_owned_outcomes() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let abort_id = SignalId::new("dir-abort-appends").unwrap();
+        port.append_signal(&directive_draft(
+            abort_id.as_str(),
+            "att-1",
+            DirectiveKind::Abort {
+                reason: BoundedText::new("stop substantive work").unwrap(),
+            },
+        ))
+        .unwrap();
+
+        let report_action = good_action("op-abort-report");
+        let report = report_draft("sig-must-not-commit");
+        let (report_outcome, report_response) =
+            port.fenced_report(&report_action, &report).unwrap();
+        assert_eq!(
+            report_outcome,
+            ReportOutcome::Refused {
+                reason: DirectiveGateRefusal::AbortInForce
+            }
+        );
+        assert_eq!(report_response.applied, StateApplied::Applied);
+        assert_eq!(report_response.head, Seq(2));
+        assert_eq!(report_response.binding_directives[0].id, abort_id.clone());
+        assert!(
+            state
+                .stored_signals
+                .borrow()
+                .iter()
+                .all(|signal| signal.id != report.id)
+        );
+        assert!(state.response_actions.borrow().is_empty());
+
+        let evidence_action = good_action("op-abort-evidence");
+        let evidence = passing_evidence();
+        let (evidence_outcome, evidence_response) =
+            port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        assert_eq!(
+            evidence_outcome,
+            EvidenceOutcome::Refused {
+                reason: DirectiveGateRefusal::AbortInForce
+            }
+        );
+        assert_eq!(evidence_response.applied, StateApplied::Applied);
+        assert_eq!(evidence_response.head, Seq(3));
+        assert_eq!(evidence_response.binding_directives[0].id, abort_id);
+        assert!(state.evidence_records.borrow().is_empty());
+        assert!(state.response_actions.borrow().is_empty());
+
+        // A newer Directive makes the causal envelope newer without
+        // changing either stored refusal or allocating a replay call.
+        port.append_signal(&directive_draft(
+            "dir-after-refusal",
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("record this on recovery").unwrap(),
+            },
+        ))
+        .unwrap();
+        let head = state.current_head();
+        let signal_count = state.stored_signals.borrow().len();
+
+        let (report_replay_outcome, report_replay) =
+            port.fenced_report(&report_action, &report).unwrap();
+        assert_eq!(report_replay_outcome, report_outcome);
+        assert_eq!(report_replay.applied, StateApplied::AlreadyApplied);
+        assert_eq!(report_replay.head, head);
+        assert_eq!(
+            report_replay
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-abort-appends", "dir-after-refusal"]
+        );
+
+        let (evidence_replay_outcome, evidence_replay) =
+            port.fenced_evidence(&evidence_action, &evidence).unwrap();
+        assert_eq!(evidence_replay_outcome, evidence_outcome);
+        assert_eq!(evidence_replay.applied, StateApplied::AlreadyApplied);
+        assert_eq!(evidence_replay.head, head);
+        assert_eq!(
+            evidence_replay
+                .binding_directives
+                .iter()
+                .map(|signal| signal.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dir-abort-appends", "dir-after-refusal"]
+        );
+        assert_eq!(state.current_head(), head);
+        assert_eq!(state.stored_signals.borrow().len(), signal_count);
+        assert!(state.evidence_records.borrow().is_empty());
+        assert!(state.response_actions.borrow().is_empty());
+
+        // The response link participates in identity even when the
+        // operation owns a refusal rather than a recorded payload.
+        let differently_linked = FencedAction {
+            responds_to: Some(SignalId::new("dir-abort-appends").unwrap()),
+            ..report_action
+        };
+        assert_eq!(
+            port.fenced_report(&differently_linked, &report),
+            Err(StateError::ConflictingOperation)
+        );
+        assert_eq!(state.current_head(), head);
+    }
+
+    #[test]
+    fn renewal_survives_abort_and_non_abort_directives_allow_appends() {
+        let aborted = fake_state();
+        let aborted_port: &dyn WorkflowStatePort = &aborted;
+        aborted_port
+            .append_signal(&directive_draft(
+                "dir-renew-abort",
+                "att-1",
+                DirectiveKind::Abort {
+                    reason: BoundedText::new("stop after observing this").unwrap(),
+                },
+            ))
+            .unwrap();
+        let (lease, renewal) = aborted_port
+            .renew_lease(&good_call("op-renew-after-abort"), Timestamp(150))
+            .unwrap();
+        assert_eq!(lease.expires_at, Timestamp(150));
+        assert_eq!(renewal.applied, StateApplied::Applied);
+        assert_eq!(renewal.binding_directives[0].id.as_str(), "dir-renew-abort");
+        assert!(aborted.response_actions.borrow().is_empty());
+
+        let active = fake_state();
+        let active_port: &dyn WorkflowStatePort = &active;
+        active_port
+            .append_signal(&directive_draft(
+                "dir-append-amend",
+                "att-1",
+                DirectiveKind::Amend {
+                    instruction: BoundedText::new("keep reporting while updating").unwrap(),
+                },
+            ))
+            .unwrap();
+        active_port
+            .append_signal(&directive_draft(
+                "dir-append-pause",
+                "att-1",
+                DirectiveKind::Pause {
+                    reason: BoundedText::new("pause handoff only").unwrap(),
+                },
+            ))
+            .unwrap();
+
+        let (report_outcome, report_response) = active_port
+            .fenced_report(
+                &good_action("op-report-under-pause"),
+                &report_draft("sig-report-under-pause"),
+            )
+            .unwrap();
+        assert!(matches!(report_outcome, ReportOutcome::Recorded { .. }));
+        assert_eq!(report_response.binding_directives.len(), 2);
+
+        let (evidence_outcome, evidence_response) = active_port
+            .fenced_evidence(&good_action("op-evidence-under-amend"), &passing_evidence())
+            .unwrap();
+        assert_eq!(evidence_outcome, EvidenceOutcome::Recorded);
+        assert_eq!(evidence_response.binding_directives.len(), 2);
+        assert_eq!(active.evidence_records.borrow().len(), 1);
+        assert_eq!(active.response_actions.borrow().len(), 2);
+    }
+
+    #[test]
+    fn validation_precedes_abort_gate_and_claims_no_operation() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        port.append_signal(&directive_draft(
+            "dir-validation-abort",
+            "att-1",
+            DirectiveKind::Abort {
+                reason: BoundedText::new("stop work").unwrap(),
+            },
+        ))
+        .unwrap();
+        let head_before = state.current_head();
+        let invalid = FencedAction {
+            call: good_call("op-invalid-after-abort"),
+            responds_to: Some(SignalId::new("dir-does-not-exist").unwrap()),
+        };
+        let evidence = passing_evidence();
+        assert_eq!(
+            port.fenced_evidence(&invalid, &evidence),
+            Err(StateError::UnknownRecord)
+        );
+        assert_eq!(state.current_head(), head_before);
+        assert!(
+            !state
+                .operations
+                .borrow()
+                .contains_key("fenced_evidence:op-invalid-after-abort")
+        );
+        assert!(
+            !state
+                .evidence_outcomes
+                .borrow()
+                .contains_key("op-invalid-after-abort")
+        );
+
+        // Reusing the operation with valid input reaches the ordinary
+        // domain gate, proving the malformed request claimed nothing.
+        let valid = FencedAction {
+            responds_to: None,
+            ..invalid
+        };
+        let (outcome, response) = port.fenced_evidence(&valid, &evidence).unwrap();
+        assert_eq!(
+            outcome,
+            EvidenceOutcome::Refused {
+                reason: DirectiveGateRefusal::AbortInForce
+            }
+        );
+        assert_eq!(response.head, Seq(head_before.0 + 1));
+        assert!(state.response_actions.borrow().is_empty());
+    }
+
+    #[test]
     fn linked_actions_discharge_only_the_exact_target_and_replay_once() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
@@ -5255,9 +5579,10 @@ mod tests {
         port.append_signal(&answer).unwrap();
 
         // An ordinary later action does not discharge either kind.
-        let unlinked = port
+        let (unlinked_outcome, unlinked) = port
             .fenced_evidence(&good_action("op-unlinked"), &passing_evidence())
             .unwrap();
+        assert_eq!(unlinked_outcome, EvidenceOutcome::Recorded);
         assert_eq!(
             unlinked
                 .binding_directives
@@ -5309,9 +5634,10 @@ mod tests {
             call: good_call("op-linked-answer"),
             responds_to: Some(SignalId::new("dir-answer").unwrap()),
         };
-        let final_response = port
+        let (final_outcome, final_response) = port
             .fenced_evidence(&linked_answer, &passing_evidence())
             .unwrap();
+        assert_eq!(final_outcome, EvidenceOutcome::Recorded);
         assert!(final_response.binding_directives.is_empty());
     }
 
@@ -5347,9 +5673,10 @@ mod tests {
             responds_to: None,
             ..premature
         };
-        let response = port
+        let (outcome, response) = port
             .fenced_evidence(&unlinked_same_operation, &evidence)
             .unwrap();
+        assert_eq!(outcome, EvidenceOutcome::Recorded);
         assert_eq!(
             response
                 .binding_directives
@@ -5398,9 +5725,10 @@ mod tests {
             call: good_call("op-linked-pause"),
             responds_to: Some(SignalId::new("dir-pause").unwrap()),
         };
-        let response = port
+        let (outcome, response) = port
             .fenced_evidence(&linked_pause, &passing_evidence())
             .unwrap();
+        assert_eq!(outcome, EvidenceOutcome::Recorded);
         assert_eq!(
             response
                 .binding_directives
@@ -5487,7 +5815,7 @@ mod tests {
         .unwrap();
         let base = good_action("op-ev");
         assert_eq!(
-            port.fenced_evidence(&base, &evidence).unwrap().applied,
+            port.fenced_evidence(&base, &evidence).unwrap().1.applied,
             StateApplied::Applied
         );
         // Same operation + payload, but ANY altered call identity
@@ -5522,7 +5850,7 @@ mod tests {
         }
         // The exact original call still replays.
         assert_eq!(
-            port.fenced_evidence(&base, &evidence).unwrap().applied,
+            port.fenced_evidence(&base, &evidence).unwrap().1.applied,
             StateApplied::AlreadyApplied
         );
 
@@ -5553,6 +5881,7 @@ mod tests {
         assert_eq!(
             port.fenced_evidence(&old_action, &evidence)
                 .unwrap()
+                .1
                 .applied,
             StateApplied::Applied
         );
@@ -5560,6 +5889,7 @@ mod tests {
         assert_eq!(
             port.fenced_evidence(&old_action, &evidence)
                 .unwrap()
+                .1
                 .applied,
             StateApplied::AlreadyApplied
         );
