@@ -22,7 +22,10 @@ fn validate_hex(raw: &str, allowed_lens: &[usize]) -> Result<(), ContentError> {
     if !allowed_lens.contains(&raw.len()) {
         return Err(ContentError::BadLength);
     }
-    if !raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(ContentError::NotHex);
     }
     Ok(())

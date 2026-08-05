@@ -36,7 +36,9 @@ impl BeadId {
         if raw.len() > MAX_ID_LEN {
             return Err(IdError::TooLong);
         }
-        let suffix = raw.strip_prefix(BEAD_ID_PREFIX).ok_or(IdError::MissingPrefix)?;
+        let suffix = raw
+            .strip_prefix(BEAD_ID_PREFIX)
+            .ok_or(IdError::MissingPrefix)?;
         if suffix.is_empty() {
             return Err(IdError::InvalidStructure);
         }
@@ -44,7 +46,10 @@ impl BeadId {
             if segment.is_empty() {
                 return Err(IdError::InvalidStructure);
             }
-            if !segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            if !segment
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            {
                 return Err(IdError::InvalidCharacter);
             }
         }
@@ -76,7 +81,10 @@ fn validate_opaque(raw: &str) -> Result<(), IdError> {
     if raw.len() > MAX_ID_LEN {
         return Err(IdError::TooLong);
     }
-    if !raw.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
         return Err(IdError::InvalidCharacter);
     }
     let first = raw.as_bytes()[0];
@@ -89,7 +97,7 @@ fn validate_opaque(raw: &str) -> Result<(), IdError> {
 macro_rules! opaque_id {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(String);
 
         impl $name {
@@ -132,11 +140,22 @@ opaque_id! {
     /// idempotency key for appends (core contract: idempotently appended).
     SignalId
 }
+opaque_id! {
+    /// ABACUS operation/idempotency identity carried by every decision-
+    /// gated mutation (architecture §2/§6 saga; work-contract
+    /// idempotency rules). Committed with the authorizing decision and
+    /// required by the provider mutation it projects.
+    OperationId
+}
+opaque_id! {
+    /// Immutable Handoff identity: what Accept/Reject decisions bind to.
+    HandoffId
+}
 
 /// Namespaced capability identifier, `module:verb` (core contract:
 /// capabilities use validated namespaced IDs; descriptors are declared
 /// by owning modules and supplied via the composition-root registry).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapabilityId(String);
 
 impl CapabilityId {
@@ -186,7 +205,13 @@ mod tests {
 
     #[test]
     fn bead_id_valid_forms() {
-        for raw in ["ABACUS-hpg", "ABACUS-9nh", "ABACUS-hpg.1", "ABACUS-9nh.11", "ABACUS-a.b.c"] {
+        for raw in [
+            "ABACUS-hpg",
+            "ABACUS-9nh",
+            "ABACUS-hpg.1",
+            "ABACUS-9nh.11",
+            "ABACUS-a.b.c",
+        ] {
             let id = BeadId::new(raw).unwrap();
             assert_eq!(id.as_str(), raw);
             assert_eq!(format!("{id}"), raw);
@@ -228,10 +253,22 @@ mod tests {
         assert_eq!(CapabilityId::new("assign"), Err(IdError::InvalidStructure));
         assert_eq!(CapabilityId::new(":assign"), Err(IdError::InvalidStructure));
         assert_eq!(CapabilityId::new("state:"), Err(IdError::InvalidStructure));
-        assert_eq!(CapabilityId::new("state:Assign"), Err(IdError::InvalidCharacter));
-        assert_eq!(CapabilityId::new("state:-assign"), Err(IdError::InvalidStructure));
-        assert_eq!(CapabilityId::new("st_ate:assign"), Err(IdError::InvalidCharacter));
-        assert_eq!(CapabilityId::new("state:as sign"), Err(IdError::InvalidCharacter));
+        assert_eq!(
+            CapabilityId::new("state:Assign"),
+            Err(IdError::InvalidCharacter)
+        );
+        assert_eq!(
+            CapabilityId::new("state:-assign"),
+            Err(IdError::InvalidStructure)
+        );
+        assert_eq!(
+            CapabilityId::new("st_ate:assign"),
+            Err(IdError::InvalidCharacter)
+        );
+        assert_eq!(
+            CapabilityId::new("state:as sign"),
+            Err(IdError::InvalidCharacter)
+        );
     }
 
     #[test]
@@ -245,6 +282,9 @@ mod tests {
         assert_eq!(ActorId::new("-lead"), Err(IdError::InvalidStructure));
         assert_eq!(ActorId::new("Claude"), Err(IdError::InvalidCharacter));
         assert_eq!(ActorId::new("cl aude"), Err(IdError::InvalidCharacter));
-        assert_eq!(ActorId::new(&"a".repeat(MAX_ID_LEN + 1)), Err(IdError::TooLong));
+        assert_eq!(
+            ActorId::new(&"a".repeat(MAX_ID_LEN + 1)),
+            Err(IdError::TooLong)
+        );
     }
 }

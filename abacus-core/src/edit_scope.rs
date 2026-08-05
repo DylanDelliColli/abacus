@@ -16,6 +16,8 @@ pub struct WorkPath(String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PathError {
     Empty,
+    /// Paths are bounded protocol payload: at most 256 bytes.
+    TooLong,
     Absolute,
     DotSegment,
     EmptySegment,
@@ -26,6 +28,9 @@ impl WorkPath {
     pub fn new(raw: &str) -> Result<Self, PathError> {
         if raw.is_empty() {
             return Err(PathError::Empty);
+        }
+        if raw.len() > 256 {
+            return Err(PathError::TooLong);
         }
         if raw.starts_with('/') {
             return Err(PathError::Absolute);
@@ -118,6 +123,7 @@ mod tests {
     fn path_normalization_rules() {
         assert!(WorkPath::new("abacus-core/src/lib.rs").is_ok());
         assert_eq!(WorkPath::new(""), Err(PathError::Empty));
+        assert_eq!(WorkPath::new(&"a/".repeat(129)), Err(PathError::TooLong));
         assert_eq!(WorkPath::new("/etc/passwd"), Err(PathError::Absolute));
         assert_eq!(WorkPath::new("a//b"), Err(PathError::EmptySegment));
         assert_eq!(WorkPath::new("a/"), Err(PathError::EmptySegment));
@@ -128,14 +134,20 @@ mod tests {
 
     #[test]
     fn conformance_covers_exact_files_and_directories() {
-        let scope = EditScope::new(vec![p("abacus-core/src"), p("docs/test-baselines.md")]).unwrap();
+        let scope =
+            EditScope::new(vec![p("abacus-core/src"), p("docs/test-baselines.md")]).unwrap();
         assert_eq!(
             scope.conforms(&[p("abacus-core/src/lib.rs"), p("docs/test-baselines.md")]),
             Ok(())
         );
         // Prefix similarity without a directory boundary must not cover.
         let out = scope.conforms(&[p("abacus-core/src-extra/x.rs")]);
-        assert_eq!(out, Err(EditScopeError::OutOfScope(vec![p("abacus-core/src-extra/x.rs")])));
+        assert_eq!(
+            out,
+            Err(EditScopeError::OutOfScope(vec![p(
+                "abacus-core/src-extra/x.rs"
+            )]))
+        );
     }
 
     #[test]
@@ -144,7 +156,10 @@ mod tests {
         let result = scope.conforms(&[p("docs/a.md"), p("src/x.rs"), p("Cargo.toml")]);
         assert_eq!(
             result,
-            Err(EditScopeError::OutOfScope(vec![p("src/x.rs"), p("Cargo.toml")]))
+            Err(EditScopeError::OutOfScope(vec![
+                p("src/x.rs"),
+                p("Cargo.toml")
+            ]))
         );
     }
 

@@ -18,29 +18,41 @@ pub mod id;
 pub mod lease;
 pub mod lifecycle;
 pub mod ports;
+pub mod profile;
+pub mod scope;
 pub mod signal;
 
 pub use assignment::{
-    next_attempt_allowed, recheck_bead_hash, AttemptSequenceError, BeadHashMismatch, DecisionActor,
+    AttemptCap, AttemptCapError, AttemptCapReached, AttemptPolicy, AttemptSequenceError,
+    BeadHashMismatch, DecisionActor, next_attempt_allowed, recheck_bead_hash, retry_within_cap,
 };
 pub use authority::AuthorityClass;
 pub use content::{CommitId, ContentError, ContentHash, WorkspaceDigest};
 pub use edit_scope::{EditScope, EditScopeError, PathError, WorkPath};
 pub use evidence::{
-    evaluate_red_green_pair, Evidence, OverlayCapture, OverlayFile, PairRefusal, RedGreenPolicy,
-    VerificationOutcome,
+    Argv, CollectionError, Evidence, EvidenceShapeError, FileDigestSet, OverlayCapture,
+    OverlayFile, PairRefusal, PathSet, RedGreenPolicy, VerificationOutcome, VerificationSet,
+    evaluate_red_green_pair,
 };
 pub use id::{
-    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, IdError, ProfileName, SignalId,
+    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, HandoffId, IdError, OperationId,
+    ProfileName, SignalId,
 };
-pub use signal::{
-    append_idempotent, binding_directives, directive_status, handoff_gate, unresolved,
-    AppendOutcome, ConflictingDuplicate, DirectiveGateRefusal, DirectiveKind, DirectiveStatus,
-    ReportKind, RequestKind, ResponseAction, ResponseKind, ScopeText, SenderFence, Seq, Signal,
-    SignalBody, SubjectError, SubjectRef,
-};
-pub use lease::{validate_fencing, FencingError, FencingToken, Lease, Timestamp};
+pub use lease::{FencingError, FencingToken, Lease, Timestamp, validate_fencing};
 pub use lifecycle::{
-    assignment_transition, attempt_transition, AssignmentAction, AssignmentState, AttemptAction,
-    AttemptState, TransitionError,
+    AssignmentAction, AssignmentState, AttemptAction, AttemptState, TransitionError,
+    assignment_transition, attempt_transition,
 };
+pub use profile::{
+    AuthorizationRefusal, AuthorizationTarget, Bundle, CapabilityDescriptor, CheckClass, Grant,
+    OccupancyClass, ProfileConfigError, ProfileSpec, RouteOutcome, ValidatedProfileSet,
+    validate_profiles,
+};
+pub use scope::{Atom, ScopeError, ScopeExpr, ScopeKey, ScopeMap, ScopeValue, Selector};
+pub use signal::{
+    AppendOutcome, ConflictingDuplicate, DirectiveGateRefusal, DirectiveKind, DirectiveStatus,
+    ReportKind, RequestKind, ResponseAction, ResponseKind, Seq, Signal, SignalBody, SignalDraft,
+    SubjectError, SubjectRef, append_idempotent, binding_directives, directive_status,
+    handoff_gate, unresolved,
+};
+pub use signal::{AuthoritySnapshot, BoundedText, BoundedTextError, SemanticPhase};

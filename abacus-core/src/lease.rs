@@ -49,7 +49,10 @@ pub enum FencingError {
 }
 
 /// Validate a presented fencing token against the current one.
-pub fn validate_fencing(current: FencingToken, presented: FencingToken) -> Result<(), FencingError> {
+pub fn validate_fencing(
+    current: FencingToken,
+    presented: FencingToken,
+) -> Result<(), FencingError> {
     match presented.cmp(&current) {
         core::cmp::Ordering::Equal => Ok(()),
         core::cmp::Ordering::Less => Err(FencingError::StaleToken),
@@ -73,13 +76,22 @@ mod tests {
     fn fencing_accepts_only_the_current_token() {
         let current = FencingToken(3);
         assert_eq!(validate_fencing(current, FencingToken(3)), Ok(()));
-        assert_eq!(validate_fencing(current, FencingToken(2)), Err(FencingError::StaleToken));
-        assert_eq!(validate_fencing(current, FencingToken(4)), Err(FencingError::UnknownToken));
+        assert_eq!(
+            validate_fencing(current, FencingToken(2)),
+            Err(FencingError::StaleToken)
+        );
+        assert_eq!(
+            validate_fencing(current, FencingToken(4)),
+            Err(FencingError::UnknownToken)
+        );
     }
 
     #[test]
     fn expiry_is_strictly_after_deadline() {
-        let lease = Lease { token: FencingToken(1), expires_at: Timestamp(100) };
+        let lease = Lease {
+            token: FencingToken(1),
+            expires_at: Timestamp(100),
+        };
         assert!(!lease.is_expired(Timestamp(99)));
         assert!(!lease.is_expired(Timestamp(100)));
         assert!(lease.is_expired(Timestamp(101)));

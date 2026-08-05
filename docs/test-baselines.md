@@ -11,6 +11,6 @@ Times are warm-cache wall clock on the baseline development machine
 
 | Target | Tests | Warm wall time | Recorded | Note |
 | --- | --- | --- | --- | --- |
-| `cargo test -p abacus-core` | 35 (id, authority, lifecycle, lease, content, edit-scope, evidence, signal, ports) | 0.22s | 2026-08-04 | ABACUS-9NH.5 |
+| `cargo test -p abacus-core` | 66 (full domain through ports rev 8: aggregate acceptance, activation-consuming authorize, state reads, worktree view) | 0.20s | 2026-08-04 | ABACUS-9NH.5/.6 |
 | `cargo test -p abacus-state` | 1 (scaffold placeholder) | 0.12s | 2026-08-04 | ABACUS-9NH.1 scaffold |
 | `cargo test --workspace` | 2 (scaffold placeholders) | 0.13s | 2026-08-04 | ABACUS-9NH.1 scaffold |
