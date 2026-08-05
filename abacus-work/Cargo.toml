@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 abacus-core = { path = "../abacus-core" }
+# Operator-authorized 2026-08-05 for br provider JSON parsing (omw.2).
+# Scope: this crate only; abacus-core stays dependency-free.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

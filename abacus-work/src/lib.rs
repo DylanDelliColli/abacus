@@ -12,6 +12,9 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod br_parse;
+pub mod br_process;
+pub mod br_provider;
 pub mod contract;
 pub mod facade;
 pub mod fake;
