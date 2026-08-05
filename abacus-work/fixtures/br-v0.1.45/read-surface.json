@@ -1,0 +1,75 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "ready_omits_labels_show_carries_them",
+  "setup": {
+    "beads": [
+      {
+        "id": "br-fixture-capture-98m",
+        "labels": ["area:auth", "module:payments"],
+        "priority": 1,
+        "status": "open"
+      },
+      {
+        "id": "br-fixture-capture-364",
+        "labels": ["area:auth", "area:billing"],
+        "priority": 2,
+        "status": "open"
+      },
+      {
+        "id": "br-fixture-capture-xlw",
+        "priority": 3,
+        "status": "open",
+        "deps": ["blocks:br-fixture-capture-98m"]
+      }
+    ]
+  },
+  "commands": [
+    {
+      "argv": ["br", "ready", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout_facts": {
+        "returned_ids": ["br-fixture-capture-98m", "br-fixture-capture-364"],
+        "blocked_bead_excluded": "br-fixture-capture-xlw",
+        "fields_per_item": [
+          "created_at",
+          "created_by",
+          "id",
+          "issue_type",
+          "priority",
+          "status",
+          "title",
+          "updated_at"
+        ],
+        "labels_field_present": false,
+        "default_limit": 20,
+        "unlimited_requires": "--limit 0"
+      }
+    },
+    {
+      "argv": ["br", "show", "br-fixture-capture-98m", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout_facts": {
+        "labels": ["area:auth", "module:payments"],
+        "dependents_included": true,
+        "shape": "single-element JSON array wrapping the issue object"
+      }
+    }
+  ],
+  "verified_postcondition": {
+    "ready_excludes_blocked": true,
+    "ready_carries_no_labels": true,
+    "show_carries_labels_and_dependents": true
+  },
+  "expected_adapter": {
+    "ready_invocation_must_pass": "--limit 0",
+    "raw_label_source": "one show call per ready id; ready output alone cannot populate RawBeadSnapshot.raw_labels",
+    "n_plus_one_bracketing": "read sync-status jsonl_content_hash before the ready call and after the last show call; a hash mismatch invalidates the batch and must surface as a revision conflict, never as silently mixed generations",
+    "normalization": "raw label strings cross to WorkFacade untouched; the adapter never constructs a scope map or priority"
+  }
+}

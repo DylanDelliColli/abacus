@@ -1,0 +1,60 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "jsonl_content_hash_as_work_revision",
+  "setup": {
+    "workspace_state": "three beads, all prior mutations flushed"
+  },
+  "commands": [
+    {
+      "argv": ["br", "sync", "--status", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout": {
+        "dirty_count": 0,
+        "last_export_time": "2026-08-05T13:48:59.561268596+00:00",
+        "last_import_time": "2026-08-05T13:47:04.425862127+00:00",
+        "jsonl_content_hash": "1faf9ae20cc759d02fface7b63bc9bbb412bd28af99f7d604ea9c6ab303eaa48",
+        "jsonl_exists": true,
+        "jsonl_newer": false,
+        "db_newer": false
+      }
+    },
+    {
+      "argv": [
+        "br",
+        "reopen",
+        "br-fixture-capture-98m",
+        "--actor=omw2-fixture",
+        "--json"
+      ],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "note": "any mutation; br exports to JSONL automatically after each mutation"
+    },
+    {
+      "argv": ["br", "sync", "--status", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout_facts": {
+        "dirty_count": 0,
+        "jsonl_content_hash": "0d68cacaedf73f96d6eef77c164c0b00d1891e703c1da60591aaee1d6f29249e"
+      }
+    }
+  ],
+  "verified_postcondition": {
+    "hash_is_64_lowercase_hex": true,
+    "hash_advanced_across_one_mutation": true,
+    "dirty_count_returned_to_zero_without_manual_flush": true
+  },
+  "expected_adapter": {
+    "work_revision_source": "jsonl_content_hash, which satisfies the 64-hex ContentHash domain type directly",
+    "validity_condition": "the hash speaks for the graph only when dirty_count is 0 and db_newer is false; otherwise the database holds unexported mutations and the hash is stale",
+    "stale_handling": "on dirty_count above 0 or db_newer true, either request a flush-only export and re-read, or refuse the read as unbracketable; never return a stale hash as the current WorkRevision",
+    "bracketing": "read hash, perform the read batch, read hash again; a mismatch means the graph moved during the batch and must surface with revision-conflict semantics",
+    "sync_status_is_read_only": true
+  }
+}

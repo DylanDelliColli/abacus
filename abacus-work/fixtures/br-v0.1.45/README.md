@@ -33,3 +33,29 @@ Fixture catalog:
   intact JSONL supports an explicit successful rebuild.
 - scope-label-constraints.json — provider label syntax/cardinality facts used
   by the scope-expression design.
+
+Happy-path and observation-surface fixtures captured 2026-08-05 in a
+disposable scratchpad workspace against the same pinned binary
+(`br 0.1.45`), for the omw.2 adapter:
+
+- read-surface.json — `ready --json` omits labels and defaults to
+  `--limit 20`; `show --json` carries labels and dependents. The adapter
+  needs `--limit 0` plus one `show` per ready id, revision-bracketed.
+- status-mutations.json — update/close/reopen output shapes; free-text
+  close reasons round-trip verbatim, so curated reasons need exact
+  canonical renderings; `Z` and `+00:00` timestamp forms both occur;
+  mutation outputs carry no revision material.
+- deletion-tombstone.json — deletion yields `status: "tombstone"` at exit
+  0, never an error; a never-existing id yields exit 3 `ISSUE_NOT_FOUND`.
+  Both normalize to `NotFound` so `compare_observation` reports the typed
+  `Missing` anomaly.
+- revision-bracketing.json — `sync --status --json` exposes
+  `jsonl_content_hash` (64-hex, direct `ContentHash` fit) as the
+  `WorkRevision` source, valid only at `dirty_count` 0 with `db_newer`
+  false; br auto-exports after each mutation.
+- output-schemas.json — one emission of `br schema` (all output-type JSON
+  Schemas) at the pinned version. br marks this surface "not a stable
+  API" and stamps a per-emission `generated_at`, so it is pin-change
+  drift evidence for the adapter's parse types — never a runtime
+  verification surface. Runtime verification stays on the checksummed
+  binary identity and `br --version`.

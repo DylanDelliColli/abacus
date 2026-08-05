@@ -1,0 +1,75 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "deletion_is_tombstone_not_error",
+  "setup": {
+    "deleted_bead": "br-fixture-capture-364",
+    "never_existing_bead": "br-fixture-capture-nonexistent"
+  },
+  "commands": [
+    {
+      "argv": [
+        "br",
+        "delete",
+        "br-fixture-capture-364",
+        "--actor=omw2-fixture",
+        "--json"
+      ],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout": {
+        "deleted": ["br-fixture-capture-364"],
+        "deleted_count": 1,
+        "dependencies_removed": 0,
+        "labels_removed": 0,
+        "events_removed": 0,
+        "references_updated": 0,
+        "orphaned_issues": []
+      }
+    },
+    {
+      "argv": ["br", "show", "br-fixture-capture-364", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout_facts": {
+        "status": "tombstone",
+        "deleted_at_present": true,
+        "deleted_by": "omw2-fixture",
+        "delete_reason": "delete",
+        "original_type_preserved": true,
+        "labels_retained": ["area:auth", "area:billing"]
+      }
+    },
+    {
+      "argv": ["br", "show", "br-fixture-capture-nonexistent", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 3,
+      "stdout": {
+        "error": {
+          "code": "ISSUE_NOT_FOUND",
+          "message": "Issue not found: br-fixture-capture-nonexistent",
+          "hint": "Run 'br list' to see available issues.",
+          "retryable": false,
+          "context": {
+            "searched_id": "br-fixture-capture-nonexistent"
+          }
+        }
+      }
+    }
+  ],
+  "verified_postcondition": {
+    "deleted_bead_show_exits_zero_with_tombstone_status": true,
+    "never_existing_bead_show_exits_three_with_structured_error": true,
+    "tombstone_retains_labels_and_deletion_metadata": true
+  },
+  "expected_adapter": {
+    "tombstone_status": "not_found",
+    "issue_not_found_error": "not_found",
+    "rationale": "WorkStatus is a closed set with no tombstone arm, and a deleted bead no longer exists as work; both provider shapes normalize to WorkError::NotFound so WorkGraphPort::compare_observation reports the typed Missing anomaly to a receipt holder",
+    "never_map_tombstone_to_closed": true,
+    "tombstone_metadata_note": "deleted_at, deleted_by, and delete_reason stay adapter-internal for now; omw.6 self-repair anomaly evidence may surface them later through a normalized shape"
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "fixture_version": 1,
+  "provider": {
+    "name": "br",
+    "version": "0.1.45"
+  },
+  "case": "status_update_close_reopen_shapes",
+  "setup": {
+    "bead": "br-fixture-capture-98m",
+    "initial_status": "open"
+  },
+  "commands": [
+    {
+      "argv": [
+        "br",
+        "update",
+        "br-fixture-capture-98m",
+        "--status=in_progress",
+        "--actor=omw2-fixture",
+        "--json"
+      ],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout": [
+        {
+          "id": "br-fixture-capture-98m",
+          "title": "Adapter ready-path bead",
+          "status": "in_progress",
+          "priority": 1,
+          "updated_at": "2026-08-05T13:48:35.608039553Z"
+        }
+      ]
+    },
+    {
+      "argv": [
+        "br",
+        "close",
+        "br-fixture-capture-98m",
+        "--reason=Accepted handoff for fixture capture",
+        "--actor=omw2-fixture",
+        "--json"
+      ],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout": [
+        {
+          "id": "br-fixture-capture-98m",
+          "title": "Adapter ready-path bead",
+          "status": "closed",
+          "closed_at": "2026-08-05T13:48:42.126676545+00:00",
+          "close_reason": "Accepted handoff for fixture capture"
+        }
+      ]
+    },
+    {
+      "argv": ["br", "show", "br-fixture-capture-98m", "--json"],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout_facts": {
+        "status": "closed",
+        "closed_at": "2026-08-05T13:48:42.126676545Z-form-in-show",
+        "close_reason_round_trips_verbatim": true,
+        "labels_still_present": true
+      }
+    },
+    {
+      "argv": [
+        "br",
+        "reopen",
+        "br-fixture-capture-98m",
+        "--actor=omw2-fixture",
+        "--json"
+      ],
+      "working_directory": "<repo>",
+      "exit_code": 0,
+      "stdout": {
+        "reopened": [
+          {
+            "id": "br-fixture-capture-98m",
+            "title": "Adapter ready-path bead",
+            "status": "open"
+          }
+        ]
+      }
+    }
+  ],
+  "verified_postcondition": {
+    "close_reason_is_free_text": true,
+    "close_reason_round_trips_verbatim_through_show": true,
+    "timestamp_offset_forms_differ": "created_at and updated_at use Z; the close command's closed_at uses +00:00; show renders closed_at with Z",
+    "mutation_outputs_carry_no_revision_material": true
+  },
+  "expected_adapter": {
+    "curated_reason_rendering": "close writes exactly abacus:accepted-handoff or abacus:cancelled-obsolete as the provider reason; observation maps those two exact strings back to the curated variants and every other observed reason to unrecognized_provider_reason",
+    "timestamp_parsing": "accept both Z and +00:00 RFC3339 offset forms on every timestamp field",
+    "revision_source": "mutation outputs omit revisions; before and after WorkRevision values come from sync-status jsonl_content_hash reads bracketing the mutation"
+  }
+}
