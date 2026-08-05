@@ -22,7 +22,7 @@ use abacus_core::ports::WorkError;
 use abacus_core::ports::WorkStatus;
 use serde_json::Value;
 
-use crate::adapter::{RawBeadSnapshot, RawBeadStatusView};
+use crate::adapter::{ProviderMutation, RawBeadSnapshot, RawBeadStatusView, TargetStatus};
 use crate::br_parse::{
     BrIssueDto, BrIssueStatus, RevisionReading, classify_error, issue_status, parse_error_document,
     parse_sync_status, revision_reading,
@@ -196,6 +196,127 @@ where
         }
         Ok((opening, snapshots))
     }
+
+    fn mutation_args(
+        provider_id: &crate::id_seam::ProviderBeadId,
+        target: &TargetStatus,
+        operation: &abacus_core::OperationId,
+    ) -> Vec<String> {
+        let actor = format!("--actor={}", operation.as_str());
+        match target {
+            TargetStatus::InProgress => vec![
+                "update".to_owned(),
+                provider_id.as_str().to_owned(),
+                "--status=in_progress".to_owned(),
+                actor,
+                "--json".to_owned(),
+            ],
+            TargetStatus::Closed(reason) => {
+                let rendered = match reason {
+                    abacus_core::ports::CloseReason::AcceptedHandoff => {
+                        crate::br_parse::CLOSE_REASON_ACCEPTED
+                    }
+                    abacus_core::ports::CloseReason::CancelledObsolete => {
+                        crate::br_parse::CLOSE_REASON_CANCELLED
+                    }
+                };
+                vec![
+                    "close".to_owned(),
+                    provider_id.as_str().to_owned(),
+                    format!("--reason={rendered}"),
+                    actor,
+                    "--json".to_owned(),
+                ]
+            }
+        }
+    }
+
+    /// Issue one decision-gated mutation. The `Err` contract is
+    /// load-bearing: `Err` asserts the mutation DEFINITIVELY did not
+    /// take effect, so it is returned only before the command is issued
+    /// (pin gate, unbracketable revision, spawn failure) or on a
+    /// structured provider refusal whose fixture verified
+    /// `mutation: not_applied`. Every uncertain shape after issuing —
+    /// deadline, output bound, unreadable output, a failed after-hash
+    /// read — is `Ok(Ambiguous)` so the facade reconciles by
+    /// re-inspection instead of inviting a blind retry.
+    fn set_status_raw(
+        &self,
+        id: &BeadId,
+        target: TargetStatus,
+        operation: &abacus_core::OperationId,
+    ) -> Result<ProviderMutation, WorkError> {
+        self.ensure_pinned()?;
+        let before = self.current_revision()?;
+        let provider_id = to_provider(id);
+        let args = Self::mutation_args(&provider_id, &target, operation);
+        let request = BrRequest { args };
+        let observation = match self.runner.run(&request) {
+            Ok(observation) => observation,
+            // The process never started: nothing can have taken effect.
+            Err(crate::br_process::BrRunError::Spawn) => {
+                return Err(WorkError::ProviderUnavailable);
+            }
+            // The write may be in flight: outcome unknown.
+            Err(_) => return Ok(ProviderMutation::Ambiguous),
+        };
+        if observation.exit_code != 0 {
+            return match parse_error_document(&observation.stdout) {
+                // Structured refusals are fixture-verified not-applied.
+                Some(error) => Err(classify_error(&error)),
+                // Unreadable failure AFTER issuing: never claim
+                // definitively-not-applied on faith.
+                None => Ok(ProviderMutation::Ambiguous),
+            };
+        }
+        let confirmed = crate::br_parse::parse_issue_array(&observation.stdout)
+            .ok()
+            .and_then(|issues| match issues.as_slice() {
+                [only] if from_provider(&only.id).as_ref() == Ok(id) => {
+                    Some(format!("{}: {}", only.id, only.status))
+                }
+                _ => None,
+            });
+        let Some(summary) = confirmed else {
+            // Exit 0 with unconfirmable output: the mutation very
+            // likely landed; report unknown and let reconciliation
+            // observe the facts.
+            return Ok(ProviderMutation::Ambiguous);
+        };
+        let Ok(after) = self.current_revision() else {
+            // The mutation landed but its after-revision is unreadable;
+            // Applied without honest before/after would be a lie.
+            return Ok(ProviderMutation::Ambiguous);
+        };
+        Ok(ProviderMutation::Applied {
+            before,
+            after,
+            summary,
+        })
+    }
+}
+
+impl<R, D> crate::adapter::WorkProvider for BrWorkProvider<R, D>
+where
+    R: BrRunner,
+    D: Fn(&str) -> ContentHash,
+{
+    fn ready(&self) -> Result<(WorkRevision, Vec<RawBeadSnapshot>), WorkError> {
+        self.ready_raw()
+    }
+
+    fn inspect(&self, id: &BeadId) -> Result<RawBeadStatusView, WorkError> {
+        self.inspect_raw(id)
+    }
+
+    fn set_status(
+        &self,
+        id: &BeadId,
+        target: TargetStatus,
+        operation: &abacus_core::OperationId,
+    ) -> Result<ProviderMutation, WorkError> {
+        self.set_status_raw(id, target, operation)
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +446,186 @@ mod tests {
         // panic as an unexpected invocation.
         let p = provider(vec![version_step(), sync_step(3)]);
         assert_eq!(p.inspect_raw(&bead("x5")), Err(WorkError::Busy));
+        p.runner.assert_exhausted();
+    }
+
+    fn op_id(raw: &str) -> abacus_core::OperationId {
+        abacus_core::OperationId::new(raw).expect("valid operation id")
+    }
+
+    fn update_request(provider_id: &str, operation: &str) -> BrRequest {
+        BrRequest::new([
+            "update",
+            provider_id,
+            "--status=in_progress",
+            &format!("--actor={operation}"),
+            "--json",
+        ])
+    }
+
+    fn second_sync_step() -> (BrRequest, Result<BrObservation, BrRunError>) {
+        let other = "0d68cacaedf73f96d6eef77c164c0b00d1891e703c1da60591aaee1d6f29249e";
+        let stdout = format!(
+            "{{\"dirty_count\":0,\"jsonl_content_hash\":\"{other}\",\"jsonl_newer\":false,\"db_newer\":false}}"
+        );
+        (BrRequest::new(["sync", "--status", "--json"]), ok(&stdout))
+    }
+
+    #[test]
+    fn applied_mutation_brackets_before_and_after_revisions() {
+        let updated = "[{\"id\":\"abacus-m1\",\"title\":\"T\",\"status\":\"in_progress\",\"priority\":1,\"updated_at\":\"2026-08-05T13:48:35.608039553Z\"}]";
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (update_request("abacus-m1", "op-m1"), ok(updated)),
+            second_sync_step(),
+        ]);
+        let outcome = p
+            .set_status_raw(&bead("m1"), TargetStatus::InProgress, &op_id("op-m1"))
+            .expect("mutation reports");
+        let ProviderMutation::Applied {
+            before,
+            after,
+            summary,
+        } = outcome
+        else {
+            panic!("expected applied, got {outcome:?}");
+        };
+        assert_eq!(before.0.as_str(), HASH);
+        assert_eq!(
+            after.0.as_str(),
+            "0d68cacaedf73f96d6eef77c164c0b00d1891e703c1da60591aaee1d6f29249e"
+        );
+        assert_eq!(summary, "abacus-m1: in_progress");
+        p.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn close_renders_exactly_the_canonical_curated_reason() {
+        let closed = "[{\"id\":\"abacus-m2\",\"status\":\"closed\",\"priority\":1,\"close_reason\":\"abacus:accepted-handoff\"}]";
+        let close_request = BrRequest::new([
+            "close",
+            "abacus-m2",
+            "--reason=abacus:accepted-handoff",
+            "--actor=op-m2",
+            "--json",
+        ]);
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (close_request, ok(closed)),
+            second_sync_step(),
+        ]);
+        let outcome = p
+            .set_status_raw(
+                &bead("m2"),
+                TargetStatus::Closed(abacus_core::ports::CloseReason::AcceptedHandoff),
+                &op_id("op-m2"),
+            )
+            .expect("close reports");
+        assert!(matches!(outcome, ProviderMutation::Applied { .. }));
+        p.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn uncertain_transport_after_issuing_is_ambiguous_never_err() {
+        for error in [
+            BrRunError::DeadlineExceeded,
+            BrRunError::OutputBoundExceeded,
+        ] {
+            let p = provider(vec![
+                version_step(),
+                sync_step(0),
+                (update_request("abacus-m3", "op-m3"), Err(error)),
+            ]);
+            assert_eq!(
+                p.set_status_raw(&bead("m3"), TargetStatus::InProgress, &op_id("op-m3")),
+                Ok(ProviderMutation::Ambiguous),
+                "{error:?} may have landed; Err would invite a double-apply"
+            );
+            p.runner.assert_exhausted();
+        }
+    }
+
+    #[test]
+    fn spawn_failure_is_definitively_not_applied() {
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (update_request("abacus-m4", "op-m4"), Err(BrRunError::Spawn)),
+        ]);
+        assert_eq!(
+            p.set_status_raw(&bead("m4"), TargetStatus::InProgress, &op_id("op-m4")),
+            Err(WorkError::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn structured_refusals_map_and_unreadable_failure_is_ambiguous() {
+        let missing = "{\"error\":{\"code\":\"ISSUE_NOT_FOUND\",\"message\":\"Issue not found: abacus-m5\",\"retryable\":false}}";
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (update_request("abacus-m5", "op-m5"), exit(3, missing)),
+        ]);
+        assert_eq!(
+            p.set_status_raw(&bead("m5"), TargetStatus::InProgress, &op_id("op-m5")),
+            Err(WorkError::NotFound)
+        );
+
+        let garbled = provider(vec![
+            version_step(),
+            sync_step(0),
+            (
+                update_request("abacus-m6", "op-m6"),
+                exit(1, "panic: poisoned lock"),
+            ),
+        ]);
+        assert_eq!(
+            garbled.set_status_raw(&bead("m6"), TargetStatus::InProgress, &op_id("op-m6")),
+            Ok(ProviderMutation::Ambiguous),
+            "an unreadable failure after issuing must never claim not-applied"
+        );
+    }
+
+    #[test]
+    fn unconfirmable_success_output_and_failed_after_read_are_ambiguous() {
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (update_request("abacus-m7", "op-m7"), ok("not json at all")),
+        ]);
+        assert_eq!(
+            p.set_status_raw(&bead("m7"), TargetStatus::InProgress, &op_id("op-m7")),
+            Ok(ProviderMutation::Ambiguous)
+        );
+
+        let updated = "[{\"id\":\"abacus-m8\",\"status\":\"in_progress\",\"priority\":1}]";
+        let after_read_fails = provider(vec![
+            version_step(),
+            sync_step(0),
+            (update_request("abacus-m8", "op-m8"), ok(updated)),
+            (
+                BrRequest::new(["sync", "--status", "--json"]),
+                Err(BrRunError::DeadlineExceeded),
+            ),
+        ]);
+        assert_eq!(
+            after_read_fails.set_status_raw(&bead("m8"), TargetStatus::InProgress, &op_id("op-m8")),
+            Ok(ProviderMutation::Ambiguous),
+            "a landed mutation without an honest after-revision reports unknown"
+        );
+    }
+
+    #[test]
+    fn unbracketable_before_read_refuses_with_no_mutation_issued() {
+        // Script ends after the dirty sync-status: issuing the update
+        // would panic as an unexpected invocation.
+        let p = provider(vec![version_step(), sync_step(4)]);
+        assert_eq!(
+            p.set_status_raw(&bead("m9"), TargetStatus::InProgress, &op_id("op-m9")),
+            Err(WorkError::Busy)
+        );
         p.runner.assert_exhausted();
     }
 
