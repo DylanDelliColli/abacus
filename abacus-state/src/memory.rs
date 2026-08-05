@@ -19,6 +19,7 @@ use abacus_core::{
     attempt_transition, binding_directives, handoff_gate, next_attempt_allowed, retry_within_cap,
     unresolved, worker_append_gate,
 };
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 struct CredentialBinding {
@@ -34,6 +35,7 @@ struct CredentialBinding {
 struct AttemptEntry {
     record: AttemptRecord,
     state: AttemptState,
+    authorizing: OperationId,
 }
 
 #[derive(Clone)]
@@ -46,6 +48,7 @@ struct AssignmentEntry {
 struct State {
     head: u64,
     operations: BTreeMap<String, String>,
+    committed_operations: BTreeSet<String>,
     bootstrap_complete: bool,
     actor_classes: BTreeMap<String, AuthorityClass>,
     active_members: BTreeMap<String, BTreeSet<String>>,
@@ -66,6 +69,8 @@ struct State {
     projections: BTreeMap<String, PendingApplication>,
     application_attempts: BTreeMap<String, Vec<ApplicationAttempt>>,
     receipts: BTreeMap<String, ApplicationReceipt>,
+    audit_events: BTreeMap<u64, AuditEvent>,
+    runtime_observations: BTreeMap<String, RuntimeObservationRecord>,
 }
 
 impl State {
@@ -73,6 +78,7 @@ impl State {
         Self {
             head: 0,
             operations: BTreeMap::new(),
+            committed_operations: BTreeSet::new(),
             bootstrap_complete: false,
             actor_classes: BTreeMap::new(),
             active_members: BTreeMap::new(),
@@ -93,6 +99,8 @@ impl State {
             projections: BTreeMap::new(),
             application_attempts: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            audit_events: BTreeMap::new(),
+            runtime_observations: BTreeMap::new(),
         }
     }
 }
@@ -140,6 +148,9 @@ impl<C> InMemoryState<C> {
         state
             .operations
             .insert(Self::operation_key(verb, operation), request);
+        state
+            .committed_operations
+            .insert(operation.as_str().to_owned());
     }
 
     fn next_seq(state: &mut State) -> Seq {
@@ -341,13 +352,18 @@ impl<C> InMemoryState<C> {
         }
     }
 
-    fn commit_fenced_call(state: &mut State, action: Option<&FencedAction>, substantive: bool) {
+    fn commit_fenced_call(
+        state: &mut State,
+        action: Option<&FencedAction>,
+        substantive: bool,
+    ) -> Seq {
         let seq = Self::next_seq(state);
         if substantive && let Some(action) = action {
             state
                 .response_actions
                 .push(Self::worker_action(action, seq));
         }
+        seq
     }
 
     fn response(state: &State, attempt: &AttemptId, applied: StateApplied) -> FencedResponse {
@@ -414,6 +430,81 @@ impl<C> InMemoryState<C> {
             Err(StateError::ActorMismatch)
         }
     }
+
+    fn worker_initiator(state: &State, call: &FencedCall) -> Result<AuditInitiator, StateError> {
+        let assignment = state
+            .assignments
+            .get(call.assignment.as_str())
+            .ok_or(StateError::IncoherentBundle)?;
+        Ok(AuditInitiator::WorkerBinding {
+            actor: assignment.record.worker.clone(),
+            assignment: call.assignment.clone(),
+            attempt: call.attempt.clone(),
+        })
+    }
+
+    fn append_audit(
+        state: &mut State,
+        seq: Seq,
+        at: Timestamp,
+        initiator: AuditInitiator,
+        operation: AuditOperation,
+        subject: AuditSubject,
+        kind: AuditKind,
+    ) {
+        let prior = state.audit_events.insert(
+            seq.0,
+            AuditEvent {
+                seq,
+                at,
+                initiator,
+                operation,
+                subject,
+                kind,
+            },
+        );
+        assert!(prior.is_none(), "one audit event per Ledger position");
+    }
+
+    fn subject_authorizing_operation(
+        state: &State,
+        subject: &LaunchSubject,
+    ) -> Result<OperationId, StateError> {
+        let operation = match subject {
+            LaunchSubject::WorkerAttempt { attempt, .. } => {
+                let assignment = state
+                    .attempt_owners
+                    .get(attempt.as_str())
+                    .and_then(|assignment| state.assignments.get(assignment))
+                    .ok_or(StateError::Corrupt)?;
+                assignment
+                    .attempts
+                    .iter()
+                    .find(|entry| &entry.record.id == attempt)
+                    .map(|entry| entry.authorizing.clone())
+                    .ok_or(StateError::Corrupt)?
+            }
+            LaunchSubject::ActorActivation { generation, .. } => generation.clone(),
+        };
+        if state.committed_operations.contains(operation.as_str()) {
+            Ok(operation)
+        } else {
+            Err(StateError::Corrupt)
+        }
+    }
+
+    fn system_projection(
+        state: &State,
+        authorizing: &OperationId,
+    ) -> Result<AuditInitiator, StateError> {
+        if state.committed_operations.contains(authorizing.as_str()) {
+            Ok(AuditInitiator::SystemProjection {
+                authorizing: authorizing.clone(),
+            })
+        } else {
+            Err(StateError::Corrupt)
+        }
+    }
 }
 
 /// Cloneable clock control used by hermetic state-contract fixtures.
@@ -462,6 +553,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             return Err(StateError::IncoherentBundle);
         }
 
+        let at = self.clock.now();
         let mut state = self.lock()?;
         let request = format!("{opening:?}");
         if Self::replay(
@@ -523,6 +615,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                 attempts: vec![AttemptEntry {
                     record: opening.first_attempt.clone(),
                     state: AttemptState::Active,
+                    authorizing: opening.authorizing.operation.clone(),
                 }],
             },
         );
@@ -537,6 +630,15 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                 authorized_revision: Some(opening.bead_revision.clone()),
             },
         );
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            AuditInitiator::Authority(opening.authorizing.authority.clone()),
+            AuditOperation::Operation(opening.authorizing.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Assignment(opening.assignment.id.clone())),
+            AuditKind::AssignmentOpened,
+        );
         Self::remember(
             &mut state,
             "open_assignment",
@@ -550,6 +652,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if opening.attempt.assignment != opening.authorizing.assignment {
             return Err(StateError::IncoherentBundle);
         }
+        let at = self.clock.now();
         let mut state = self.lock()?;
         let request = format!("{opening:?}");
         if Self::replay(
@@ -594,7 +697,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let worker = assignment.record.worker.clone();
         let assignment_id = assignment.record.id.clone();
 
-        Self::next_seq(&mut state);
+        let seq = Self::next_seq(&mut state);
         Self::insert_credential(
             &mut state,
             credential_owner,
@@ -619,7 +722,17 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             .push(AttemptEntry {
                 record: opening.attempt.clone(),
                 state: AttemptState::Active,
+                authorizing: opening.authorizing.operation.clone(),
             });
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            AuditInitiator::Authority(opening.authorizing.authority.clone()),
+            AuditOperation::Operation(opening.authorizing.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Attempt(opening.attempt.id.clone())),
+            AuditKind::AttemptOpened,
+        );
         Self::remember(
             &mut state,
             "append_attempt",
@@ -752,6 +865,18 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             }
         };
 
+        let audit_subject = match &effect {
+            Effect::Accept(attempt)
+            | Effect::Reject(attempt)
+            | Effect::Revoke(attempt)
+            | Effect::Reclaim(attempt) => {
+                AuditSubject::Workflow(SubjectRef::Attempt(attempt.clone()))
+            }
+            Effect::Cancel(_) | Effect::Transfer(_) => {
+                AuditSubject::Workflow(SubjectRef::Assignment(record.assignment.clone()))
+            }
+        };
+
         let seq = Self::next_seq(&mut state);
         {
             let assignment = state
@@ -823,6 +948,15 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                 responds_to: record.resolves.clone(),
             },
         });
+        for attempt in &ended {
+            state.response_actions.push(ResponseAction {
+                seq,
+                kind: ResponseKind::TerminalAttemptAction {
+                    attempt: attempt.clone(),
+                    abort_consistent: true,
+                },
+            });
+        }
         if let Some(reason) = record.kind.close_reason() {
             let bead = state
                 .assignments
@@ -846,12 +980,22 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         state
             .decisions
             .insert(record.operation.as_str().to_owned(), record.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            now,
+            AuditInitiator::Authority(record.authority.clone()),
+            AuditOperation::Operation(record.operation.clone()),
+            audit_subject,
+            AuditKind::decision(&record.kind),
+        );
         Self::remember(&mut state, "record_decision", &record.operation, request);
         Ok(StateApplied::Applied)
     }
 
     fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError> {
         let activation = &opening.activation;
+        let at = self.clock.now();
         let mut state = self.lock()?;
         let request = format!("{opening:?}");
         if Self::replay(&state, "activate_profile", &activation.operation, &request)? {
@@ -915,7 +1059,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         );
         Self::credential_available(&state, &opening.credential.id, &owner)?;
 
-        Self::next_seq(&mut state);
+        let seq = Self::next_seq(&mut state);
         state
             .actor_classes
             .insert(activation.actor.as_str().to_owned(), activation.class());
@@ -947,6 +1091,26 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if matches!(opening.case, ActivationCase::OperatorBootstrap) {
             state.bootstrap_complete = true;
         }
+        let initiator = match &opening.case {
+            ActivationCase::ActorAuthorizedRotation { authority } => {
+                AuditInitiator::Authority(authority.clone())
+            }
+            ActivationCase::OperatorBootstrap
+            | ActivationCase::OperatorRecovery
+            | ActivationCase::OperatorOrchestratorEnrolment => AuditInitiator::OperatorChannel,
+        };
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            initiator,
+            AuditOperation::Operation(activation.operation.clone()),
+            AuditSubject::ActorProfile {
+                actor: activation.actor.clone(),
+                profile: activation.profile.clone(),
+            },
+            AuditKind::activation(&opening.case),
+        );
         Self::remember(
             &mut state,
             "activate_profile",
@@ -962,6 +1126,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         actor: &ActorId,
         profile: &ProfileName,
     ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
         let mut state = self.lock()?;
         let request = format!("{}|{}", actor.as_str(), profile.as_str());
         if Self::replay(&state, "deactivate_profile", operation, &request)? {
@@ -974,7 +1139,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if !is_member {
             return Err(StateError::NotTheOccupant);
         }
-        Self::next_seq(&mut state);
+        let seq = Self::next_seq(&mut state);
         state
             .active_members
             .get_mut(profile.as_str())
@@ -985,6 +1150,18 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                 binding.revoked = true;
             }
         }
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            AuditInitiator::OperatorChannel,
+            AuditOperation::Operation(operation.clone()),
+            AuditSubject::ActorProfile {
+                actor: actor.clone(),
+                profile: profile.clone(),
+            },
+            AuditKind::ProfileDeactivated,
+        );
         Self::remember(&mut state, "deactivate_profile", operation, request);
         Ok(StateApplied::Applied)
     }
@@ -996,6 +1173,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if matches!(draft.body, SignalBody::Report { .. }) {
             return Err(StateError::IncoherentBundle);
         }
+        let at = self.clock.now();
         let mut state = self.lock()?;
         if let Some(signal) = Self::signal_replay(&state, draft)? {
             return Ok((signal, StateApplied::AlreadyApplied));
@@ -1012,10 +1190,11 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                     .assignments
                     .get(assignment.as_str())
                     .ok_or(StateError::UnknownRecord)?;
-                if !owner
+                if owner
                     .attempts
                     .iter()
-                    .any(|entry| &entry.record.id == attempt)
+                    .find(|entry| &entry.record.id == attempt)
+                    .is_none_or(|entry| entry.state != AttemptState::Active)
                 {
                     return Err(StateError::IncoherentBundle);
                 }
@@ -1042,6 +1221,15 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             SignalBody::Request { .. } => {}
         }
         let signal = Self::commit_new_signal(&mut state, draft)?;
+        Self::append_audit(
+            &mut state,
+            signal.seq,
+            at,
+            AuditInitiator::Authority(draft.sender.clone()),
+            AuditOperation::Signal(signal.id.clone()),
+            AuditSubject::Workflow(draft.subject.clone()),
+            AuditKind::signal(&signal),
+        );
         Ok((signal, StateApplied::Applied))
     }
 
@@ -1085,23 +1273,36 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if assignment.record.worker != draft.sender.actor {
             return Err(StateError::ActorMismatch);
         }
+        let initiator = Self::worker_initiator(&state, call)?;
         let binding = binding_directives(&call.attempt, &state.signals, &state.response_actions);
-        let outcome = match worker_append_gate(&binding) {
+        let (outcome, seq) = match worker_append_gate(&binding) {
             Ok(()) => {
                 let signal = Self::commit_new_signal(&mut state, draft)?;
-                Self::commit_fenced_call(&mut state, Some(action), true);
-                ReportOutcome::Recorded {
-                    signal: Box::new(signal),
-                }
+                let seq = Self::commit_fenced_call(&mut state, Some(action), true);
+                (
+                    ReportOutcome::Recorded {
+                        signal: Box::new(signal),
+                    },
+                    seq,
+                )
             }
             Err(reason) => {
-                Self::commit_fenced_call(&mut state, Some(action), false);
-                ReportOutcome::Refused { reason }
+                let seq = Self::commit_fenced_call(&mut state, Some(action), false);
+                (ReportOutcome::Refused { reason }, seq)
             }
         };
         state
             .report_outcomes
             .insert(call.operation.as_str().to_owned(), outcome.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            now,
+            initiator,
+            AuditOperation::Operation(call.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+            AuditKind::report(&outcome),
+        );
         Self::remember(&mut state, "fenced_report", &call.operation, request);
         Ok((
             outcome,
@@ -1130,25 +1331,35 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         }
         Self::validate_active_attempt(&state, call, now)?;
         Self::validate_response_target(&state, action)?;
+        let initiator = Self::worker_initiator(&state, call)?;
         let binding = binding_directives(&call.attempt, &state.signals, &state.response_actions);
-        let outcome = match worker_append_gate(&binding) {
+        let (outcome, seq) = match worker_append_gate(&binding) {
             Ok(()) => {
                 state.evidence.push(EvidenceRecord {
                     operation: call.operation.clone(),
                     attempt: call.attempt.clone(),
                     evidence: evidence.clone(),
                 });
-                Self::commit_fenced_call(&mut state, Some(action), true);
-                EvidenceOutcome::Recorded
+                let seq = Self::commit_fenced_call(&mut state, Some(action), true);
+                (EvidenceOutcome::Recorded, seq)
             }
             Err(reason) => {
-                Self::commit_fenced_call(&mut state, Some(action), false);
-                EvidenceOutcome::Refused { reason }
+                let seq = Self::commit_fenced_call(&mut state, Some(action), false);
+                (EvidenceOutcome::Refused { reason }, seq)
             }
         };
         state
             .evidence_outcomes
             .insert(call.operation.as_str().to_owned(), outcome);
+        Self::append_audit(
+            &mut state,
+            seq,
+            now,
+            initiator,
+            AuditOperation::Operation(call.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+            AuditKind::evidence(outcome),
+        );
         Self::remember(&mut state, "fenced_evidence", &call.operation, request);
         Ok((
             outcome,
@@ -1178,6 +1389,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         }
         Self::validate_active_attempt(&state, call, now)?;
         Self::validate_response_target(&state, action)?;
+        let initiator = Self::worker_initiator(&state, call)?;
         if handoff.attempt != call.attempt {
             return Err(StateError::IncoherentBundle);
         }
@@ -1219,16 +1431,71 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                 .expect("fence validated above")
                 .state = AttemptState::Submitted;
         }
-        Self::commit_fenced_call(&mut state, Some(action), substantive);
+        let seq = Self::commit_fenced_call(&mut state, Some(action), substantive);
         state.submissions.insert(
             call.operation.as_str().to_owned(),
             (request.clone(), outcome.clone()),
+        );
+        Self::append_audit(
+            &mut state,
+            seq,
+            now,
+            initiator,
+            AuditOperation::Operation(call.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+            AuditKind::handoff(&outcome),
         );
         Self::remember(&mut state, "fenced_handoff", &call.operation, request);
         Ok((
             outcome,
             Self::response(&state, &call.attempt, StateApplied::Applied),
         ))
+    }
+
+    fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError> {
+        let now = self.clock.now();
+        let mut state = self.lock()?;
+        let request = Self::call_identity(call);
+        if Self::replay(&state, "fenced_abort_attempt", &call.operation, &request)? {
+            return Ok(Self::response(
+                &state,
+                &call.attempt,
+                StateApplied::AlreadyApplied,
+            ));
+        }
+
+        Self::validate_active_attempt(&state, call, now)?;
+        let initiator = Self::worker_initiator(&state, call)?;
+        let binding = binding_directives(&call.attempt, &state.signals, &state.response_actions);
+        if worker_append_gate(&binding) != Err(abacus_core::DirectiveGateRefusal::AbortInForce) {
+            return Err(StateError::AbortNotInForce);
+        }
+
+        let next = attempt_transition(AttemptState::Active, AttemptAction::Abort, false)
+            .map_err(|_| StateError::IncoherentBundle)?;
+        let seq = Self::next_seq(&mut state);
+        Self::attempt_entry_mut(&mut state, &call.assignment, &call.attempt)
+            .expect("active Attempt validated above")
+            .state = next;
+        Self::revoke_attempt_credential(&mut state, &call.attempt);
+        state.response_actions.push(ResponseAction {
+            seq,
+            kind: ResponseKind::TerminalAttemptAction {
+                attempt: call.attempt.clone(),
+                abort_consistent: true,
+            },
+        });
+        Self::append_audit(
+            &mut state,
+            seq,
+            now,
+            initiator,
+            AuditOperation::Operation(call.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+            AuditKind::AttemptAborted,
+        );
+        Self::remember(&mut state, "fenced_abort_attempt", &call.operation, request);
+        Ok(Self::response(&state, &call.attempt, StateApplied::Applied))
     }
 
     fn renew_lease(
@@ -1249,6 +1516,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             ));
         }
         Self::validate_fence(&state, call, now)?;
+        let initiator = Self::worker_initiator(&state, call)?;
         let current = Self::attempt_entry(&state, &call.assignment, &call.attempt)
             .expect("fence validated above")
             .record
@@ -1262,7 +1530,16 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             .record
             .lease
             .expires_at = until;
-        Self::commit_fenced_call(&mut state, None, false);
+        let seq = Self::commit_fenced_call(&mut state, None, false);
+        Self::append_audit(
+            &mut state,
+            seq,
+            now,
+            initiator,
+            AuditOperation::Operation(call.operation.clone()),
+            AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+            AuditKind::LeaseRenewed,
+        );
         Self::remember(&mut state, "renew_lease", &call.operation, request);
         Ok((
             Lease {
@@ -1279,8 +1556,11 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         subject: &LaunchSubject,
         envelope: &EnvelopeSnapshot,
     ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
         let mut state = self.lock()?;
         Self::resolve_subject(&state, subject)?;
+        let authorizing = Self::subject_authorizing_operation(&state, subject)?;
+        let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
         let request = format!("{key}|{envelope:?}");
         if Self::replay(&state, "persist_envelope", operation, &request)? {
@@ -1291,8 +1571,17 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         {
             return Err(StateError::ConflictingOperation);
         }
-        Self::next_seq(&mut state);
+        let seq = Self::next_seq(&mut state);
         state.envelopes.insert(key, envelope.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            initiator,
+            AuditOperation::Operation(operation.clone()),
+            AuditSubject::Launch(subject.clone()),
+            AuditKind::EnvelopePersisted,
+        );
         Self::remember(&mut state, "persist_envelope", operation, request);
         Ok(StateApplied::Applied)
     }
@@ -1313,8 +1602,11 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         subject: &LaunchSubject,
         handle: &RuntimeHandle,
     ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
         let mut state = self.lock()?;
         Self::resolve_subject(&state, subject)?;
+        let authorizing = Self::subject_authorizing_operation(&state, subject)?;
+        let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
         let request = format!("{key}|{}", handle.as_str());
         if Self::replay(&state, "bind_runtime_handle", operation, &request)? {
@@ -1325,8 +1617,17 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         {
             return Err(StateError::ConflictingOperation);
         }
-        Self::next_seq(&mut state);
+        let seq = Self::next_seq(&mut state);
         state.handles.insert(key, handle.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            initiator,
+            AuditOperation::Operation(operation.clone()),
+            AuditSubject::Launch(subject.clone()),
+            AuditKind::RuntimeHandleBound,
+        );
         Self::remember(&mut state, "bind_runtime_handle", operation, request);
         Ok(StateApplied::Applied)
     }
@@ -1336,14 +1637,26 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         operation: &OperationId,
         subject: &LaunchSubject,
     ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
         let mut state = self.lock()?;
         Self::resolve_subject(&state, subject)?;
+        let authorizing = Self::subject_authorizing_operation(&state, subject)?;
+        let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
         if Self::replay(&state, "unbind_runtime_handle", operation, &key)? {
             return Ok(StateApplied::AlreadyApplied);
         }
-        Self::next_seq(&mut state);
+        let seq = Self::next_seq(&mut state);
         state.handles.remove(&key);
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            initiator,
+            AuditOperation::Operation(operation.clone()),
+            AuditSubject::Launch(subject.clone()),
+            AuditKind::RuntimeHandleUnbound,
+        );
         Self::remember(&mut state, "unbind_runtime_handle", operation, key);
         Ok(StateApplied::Applied)
     }
@@ -1354,10 +1667,51 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         Ok(state.handles.get(&Self::association_key(subject)).cloned())
     }
 
+    fn record_runtime_observation(
+        &self,
+        operation: &OperationId,
+        record: &RuntimeObservationRecord,
+    ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
+        let mut state = self.lock()?;
+        Self::resolve_subject(&state, &record.subject)?;
+        let request = format!("{record:?}");
+        if Self::replay(&state, "record_runtime_observation", operation, &request)? {
+            return Ok(StateApplied::AlreadyApplied);
+        }
+        let seq = Self::next_seq(&mut state);
+        state
+            .runtime_observations
+            .insert(operation.as_str().to_owned(), record.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            AuditInitiator::Authority(record.reporter.clone()),
+            AuditOperation::Operation(operation.clone()),
+            AuditSubject::Launch(record.subject.clone()),
+            AuditKind::RuntimeObservationRecorded,
+        );
+        Self::remember(&mut state, "record_runtime_observation", operation, request);
+        Ok(StateApplied::Applied)
+    }
+
+    fn runtime_observation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<RuntimeObservationRecord, StateError> {
+        self.lock()?
+            .runtime_observations
+            .get(operation.as_str())
+            .cloned()
+            .ok_or(StateError::UnknownRecord)
+    }
+
     fn record_application_attempt(
         &self,
         attempt: &ApplicationAttempt,
     ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
         let mut state = self.lock()?;
         let request = format!("{attempt:?}");
         if Self::replay(&state, "record_application_attempt", &attempt.id, &request)? {
@@ -1366,12 +1720,22 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if !state.projections.contains_key(attempt.target.as_str()) {
             return Err(StateError::UnknownRecord);
         }
-        Self::next_seq(&mut state);
+        let initiator = Self::system_projection(&state, &attempt.target)?;
+        let seq = Self::next_seq(&mut state);
         state
             .application_attempts
             .entry(attempt.target.as_str().to_owned())
             .or_default()
             .push(attempt.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            initiator,
+            AuditOperation::Operation(attempt.id.clone()),
+            AuditSubject::Projection(attempt.target.clone()),
+            AuditKind::application(&attempt.outcome),
+        );
         Self::remember(
             &mut state,
             "record_application_attempt",
@@ -1385,6 +1749,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         &self,
         receipt: &ApplicationReceipt,
     ) -> Result<StateApplied, StateError> {
+        let at = self.clock.now();
         let mut state = self.lock()?;
         let request = format!("{receipt:?}");
         if Self::replay(
@@ -1415,10 +1780,20 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if !revision_matches {
             return Err(StateError::IncoherentBundle);
         }
-        Self::next_seq(&mut state);
+        let initiator = Self::system_projection(&state, &receipt.target)?;
+        let seq = Self::next_seq(&mut state);
         state
             .receipts
             .insert(receipt.target.as_str().to_owned(), receipt.clone());
+        Self::append_audit(
+            &mut state,
+            seq,
+            at,
+            initiator,
+            AuditOperation::Operation(receipt.target.clone()),
+            AuditSubject::Projection(receipt.target.clone()),
+            AuditKind::ApplicationReceiptRecorded,
+        );
         Self::remember(
             &mut state,
             "record_application_receipt",
@@ -1483,9 +1858,13 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let binding = Self::resolve_subject(&state, subject)?;
         if binding.revoked {
             Err(StateError::CredentialRevoked)
-        } else if &binding.digest != presented_digest {
-            // Deliberately outcome-level only: the production SQLite/Scribe
-            // implementation owns the vetted constant-time primitive.
+        } else if !bool::from(
+            binding
+                .digest
+                .as_str()
+                .as_bytes()
+                .ct_eq(presented_digest.as_str().as_bytes()),
+        ) {
             Err(StateError::CredentialInvalid)
         } else {
             Ok(())
@@ -1553,6 +1932,24 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
                     .and_then(|assignment| state.assignments.get(assignment))
                     .is_some_and(|assignment| &assignment.record.decision_actor.actor == requested),
                 (SignalBody::Directive { .. }, Some(_)) => false,
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError> {
+        let state = self.lock()?;
+        Ok(state
+            .audit_events
+            .values()
+            .filter(|event| {
+                query
+                    .subject
+                    .as_ref()
+                    .is_none_or(|subject| &event.subject == subject)
+                    && query.class.is_none_or(|class| event.kind.class() == class)
+                    && query.from.is_none_or(|from| event.seq >= from)
+                    && query.through.is_none_or(|through| event.seq <= through)
             })
             .cloned()
             .collect())

@@ -35,10 +35,13 @@ where
     fencing_tracks_clock_expiry_renewal_and_supersession(&build);
     response_links_are_causal_and_idempotent(&build);
     abort_refusals_are_response_bearing_and_trace_free(&build);
+    abort_terminal_is_explicit_idempotent_and_causal(&build);
+    decision_terminals_discharge_abort_and_pause(&build);
     pause_and_amend_still_permit_worker_appends(&build);
     handoff_refusals_and_acceptance_are_transactional(&build);
     unresolved_signals_are_derived_from_responses(&build);
     runtime_associations_use_the_full_launch_subject(&build);
+    audit_lineage_is_transactional_typed_and_filterable(&build);
     projection_receipts_clear_only_proven_success(&build);
 }
 
@@ -1021,7 +1024,10 @@ fn visible_facts(port: &dyn WorkflowStatePort) -> VisibleAttemptFacts {
     }
 }
 
-fn assert_only_call_order_advanced(before: &VisibleAttemptFacts, after: &VisibleAttemptFacts) {
+fn assert_only_call_order_advanced_among_workflow_facts(
+    before: &VisibleAttemptFacts,
+    after: &VisibleAttemptFacts,
+) {
     assert_eq!(after.view.record, before.view.record);
     assert_eq!(after.view.state, before.view.state);
     assert_eq!(after.view.attempts, before.view.attempts);
@@ -1072,7 +1078,10 @@ fn abort_refusals_are_response_bearing_and_trace_free<H: StateContractHarness>(
     assert_eq!(refusal.applied, StateApplied::Applied);
     assert_eq!(refusal.binding_directives, vec![abort.clone()]);
     assert_eq!(refusal.head, Seq(before_validation_refusal.view.head.0 + 1));
-    assert_only_call_order_advanced(&before_validation_refusal, &visible_facts(port));
+    assert_only_call_order_advanced_among_workflow_facts(
+        &before_validation_refusal,
+        &visible_facts(port),
+    );
     assert_eq!(
         port.signals_for(&attempt_id()).expect("query succeeds"),
         vec![abort.clone()],
@@ -1122,7 +1131,10 @@ fn abort_refusals_are_response_bearing_and_trace_free<H: StateContractHarness>(
         Seq(before_evidence_refusal.view.head.0 + 1),
         "ordinary gate refusal owns its operation and call ordering"
     );
-    assert_only_call_order_advanced(&before_evidence_refusal, &visible_facts(port));
+    assert_only_call_order_advanced_among_workflow_facts(
+        &before_evidence_refusal,
+        &visible_facts(port),
+    );
     assert!(
         port.evidence_for(&attempt_id())
             .expect("query succeeds")
@@ -1134,6 +1146,310 @@ fn abort_refusals_are_response_bearing_and_trace_free<H: StateContractHarness>(
         .expect("renewal remains the abort discovery path");
     assert_eq!(lease.expires_at, Timestamp(150));
     assert!(renewal.binding_directives.iter().any(|s| s.id == abort.id));
+
+    let report_events = port
+        .audit_events(&AuditQuery {
+            class: Some(AuditClass::Report),
+            ..AuditQuery::default()
+        })
+        .expect("report audit query succeeds");
+    assert_eq!(report_events.len(), 1);
+    assert_eq!(report_events[0].seq, refusal.head);
+    assert_eq!(
+        report_events[0].kind,
+        AuditKind::ReportRefused {
+            reason: DirectiveGateRefusal::AbortInForce,
+        }
+    );
+    let evidence_events = port
+        .audit_events(&AuditQuery {
+            class: Some(AuditClass::Evidence),
+            ..AuditQuery::default()
+        })
+        .expect("evidence audit query succeeds");
+    assert_eq!(evidence_events.len(), 1);
+    assert_eq!(evidence_events[0].seq, evidence_refusal.head);
+    assert_eq!(
+        evidence_events[0].kind,
+        AuditKind::EvidenceRefused {
+            reason: DirectiveGateRefusal::AbortInForce,
+        }
+    );
+}
+
+fn abort_terminal_is_explicit_idempotent_and_causal<H: StateContractHarness>(
+    build: &impl Fn(Timestamp) -> H,
+) {
+    let harness = build(Timestamp(50));
+    let port = harness.port();
+    open(port);
+
+    let abort_call = call("op-abort-terminal");
+    let before_missing_abort = visible_facts(port);
+    let audit_before_missing_abort = port
+        .audit_events(&AuditQuery::default())
+        .expect("audit query succeeds");
+    assert_eq!(
+        port.fenced_abort_attempt(&abort_call),
+        Err(StateError::AbortNotInForce),
+        "workers cannot invent voluntary terminal actions"
+    );
+    assert_eq!(visible_facts(port), before_missing_abort);
+    assert_eq!(
+        port.audit_events(&AuditQuery::default())
+            .expect("audit query succeeds"),
+        audit_before_missing_abort,
+        "a precondition refusal claims no operation and appends no audit"
+    );
+
+    let (amend, _) = port
+        .append_signal(&amend("sig-terminal-amend"))
+        .expect("amend commits");
+    port.append_signal(&pause("sig-terminal-pause"))
+        .expect("pause commits");
+    port.append_signal(&abort("sig-terminal-abort"))
+        .expect("abort commits");
+
+    let response = port
+        .fenced_abort_attempt(&abort_call)
+        .expect("a live worker may comply with binding Abort");
+    assert_eq!(response.applied, StateApplied::Applied);
+    assert_eq!(
+        response.binding_directives,
+        vec![amend.clone()],
+        "the same-call terminal action discharges Abort and Pause but not Amend"
+    );
+    let view = port
+        .assignment(&assignment_id())
+        .expect("assignment exists");
+    assert_eq!(view.state, AssignmentState::Active);
+    assert_eq!(view.attempts, vec![(attempt_id(), AttemptState::Aborted)]);
+    assert_eq!(
+        port.verify_launch_subject(&worker_subject(), &hash('f')),
+        Err(StateError::CredentialRevoked)
+    );
+
+    let attempt_events = port
+        .audit_events(&AuditQuery {
+            class: Some(AuditClass::Attempt),
+            ..AuditQuery::default()
+        })
+        .expect("attempt audit query succeeds");
+    assert_eq!(attempt_events.len(), 1);
+    assert_eq!(
+        attempt_events[0],
+        AuditEvent {
+            seq: response.head,
+            at: Timestamp(50),
+            initiator: AuditInitiator::WorkerBinding {
+                actor: worker(),
+                assignment: assignment_id(),
+                attempt: attempt_id(),
+            },
+            operation: AuditOperation::Operation(op("op-abort-terminal")),
+            subject: AuditSubject::Workflow(SubjectRef::Attempt(attempt_id())),
+            kind: AuditKind::AttemptAborted,
+        }
+    );
+
+    let audit_after_success = port
+        .audit_events(&AuditQuery::default())
+        .expect("audit query succeeds");
+    let replay = port
+        .fenced_abort_attempt(&abort_call)
+        .expect("terminal replay bypasses ended state and revoked credential");
+    assert_eq!(replay.applied, StateApplied::AlreadyApplied);
+    assert_eq!(replay.head, response.head);
+    assert_eq!(replay.binding_directives, vec![amend]);
+    assert_eq!(
+        port.audit_events(&AuditQuery::default())
+            .expect("audit query succeeds"),
+        audit_after_success,
+        "exact replay allocates neither order nor audit"
+    );
+    let changed_actor = FencedCall {
+        actor: actor("different-worker"),
+        ..abort_call.clone()
+    };
+    assert_eq!(
+        port.fenced_abort_attempt(&changed_actor),
+        Err(StateError::ConflictingOperation),
+        "all fenced identity fields participate before mutable validation"
+    );
+    assert_eq!(
+        port.append_signal(&pause("sig-after-aborted")),
+        Err(StateError::IncoherentBundle),
+        "an ended Attempt cannot receive a Directive it has no worker path to honor"
+    );
+
+    let successor = AttemptOpening {
+        authorizing: RetryDecision {
+            operation: op("op-retry-after-abort"),
+            assignment: assignment_id(),
+            authority: lead_authority("state:retry"),
+            reason: reason("continue after abort compliance"),
+        },
+        attempt: AttemptRecord {
+            id: AttemptId::new("att-contract-after-abort").expect("valid attempt"),
+            assignment: assignment_id(),
+            lease: Lease {
+                token: FencingToken(4),
+                expires_at: Timestamp(200),
+            },
+        },
+        worker_credential: CredentialProvisioning {
+            id: CredentialId::new("cred-contract-after-abort").expect("valid credential"),
+            digest: hash('6'),
+        },
+    };
+    assert_eq!(port.append_attempt(&successor), Ok(StateApplied::Applied));
+    assert_eq!(
+        port.assignment(&assignment_id())
+            .expect("assignment exists")
+            .attempts,
+        vec![
+            (attempt_id(), AttemptState::Aborted),
+            (successor.attempt.id, AttemptState::Active),
+        ],
+        "Aborted is an ended state eligible for explicit retry"
+    );
+
+    let expired_harness = build(Timestamp(50));
+    let expired = expired_harness.port();
+    open(expired);
+    expired
+        .append_signal(&abort("sig-expired-abort"))
+        .expect("abort commits while the lease is live");
+    expired_harness.set_now(Timestamp(101));
+    let audit_before_expired_call = expired
+        .audit_events(&AuditQuery::default())
+        .expect("audit query succeeds");
+    assert_eq!(
+        expired.fenced_abort_attempt(&call("op-expired-abort")),
+        Err(StateError::LeaseExpired),
+        "abort compliance still requires a live lease"
+    );
+    assert_eq!(
+        expired
+            .audit_events(&AuditQuery::default())
+            .expect("audit query succeeds"),
+        audit_before_expired_call
+    );
+}
+
+fn decision_terminals_discharge_abort_and_pause<H: StateContractHarness>(
+    build: &impl Fn(Timestamp) -> H,
+) {
+    assert_decision_terminal_case(
+        build,
+        "revoke",
+        DecisionKind::Revoke {
+            attempt: attempt_id(),
+            reason: reason("decision actor revoked the attempt"),
+        },
+        None,
+        AssignmentState::Active,
+        AttemptState::Revoked,
+        AuditDecisionKind::Revoke,
+        AuditSubject::Workflow(SubjectRef::Attempt(attempt_id())),
+    );
+    assert_decision_terminal_case(
+        build,
+        "reclaim",
+        DecisionKind::Reclaim {
+            attempt: attempt_id(),
+            reason: reason("decision actor reclaimed the expired attempt"),
+        },
+        Some(Timestamp(101)),
+        AssignmentState::Active,
+        AttemptState::Expired,
+        AuditDecisionKind::Reclaim,
+        AuditSubject::Workflow(SubjectRef::Attempt(attempt_id())),
+    );
+    assert_decision_terminal_case(
+        build,
+        "cancel",
+        DecisionKind::Cancel {
+            reason: reason("decision actor cancelled the assignment"),
+        },
+        None,
+        AssignmentState::Cancelled,
+        AttemptState::Revoked,
+        AuditDecisionKind::Cancel,
+        AuditSubject::Workflow(SubjectRef::Assignment(assignment_id())),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_decision_terminal_case<H: StateContractHarness>(
+    build: &impl Fn(Timestamp) -> H,
+    case: &str,
+    kind: DecisionKind,
+    decision_time: Option<Timestamp>,
+    expected_assignment: AssignmentState,
+    expected_attempt: AttemptState,
+    expected_kind: AuditDecisionKind,
+    expected_subject: AuditSubject,
+) {
+    let harness = build(Timestamp(50));
+    let port = harness.port();
+    open(port);
+    let carriage = action(&format!("op-before-terminal-{case}"), None);
+    assert_eq!(
+        port.fenced_evidence(&carriage, &evidence())
+            .expect("pre-terminal response carriage commits")
+            .0,
+        EvidenceOutcome::Recorded
+    );
+    let (amend, _) = port
+        .append_signal(&amend(&format!("sig-{case}-amend")))
+        .expect("amend commits");
+    port.append_signal(&pause(&format!("sig-{case}-pause")))
+        .expect("pause commits");
+    port.append_signal(&abort(&format!("sig-{case}-abort")))
+        .expect("abort commits");
+    if let Some(now) = decision_time {
+        harness.set_now(now);
+    }
+
+    let decision = DecisionRecord {
+        operation: op(&format!("op-decision-terminal-{case}")),
+        assignment: assignment_id(),
+        authority: lead_authority("state:decide"),
+        kind,
+        resolves: None,
+    };
+    assert_eq!(port.record_decision(&decision), Ok(StateApplied::Applied));
+    let replay = port
+        .fenced_evidence(&carriage, &evidence())
+        .expect("earlier response replays after terminal decision")
+        .1;
+    assert_eq!(replay.applied, StateApplied::AlreadyApplied);
+    assert_eq!(
+        replay.binding_directives,
+        vec![amend],
+        "every reachable decision terminal discharges Abort and Pause at its decision Seq"
+    );
+    let view = port
+        .assignment(&assignment_id())
+        .expect("assignment exists");
+    assert_eq!(view.state, expected_assignment);
+    assert_eq!(view.attempts, vec![(attempt_id(), expected_attempt)]);
+    let decision_events = port
+        .audit_events(&AuditQuery {
+            class: Some(AuditClass::Decision),
+            ..AuditQuery::default()
+        })
+        .expect("decision audit query succeeds");
+    assert_eq!(decision_events.len(), 1);
+    assert_eq!(decision_events[0].seq, replay.head);
+    assert_eq!(decision_events[0].subject, expected_subject);
+    assert_eq!(
+        decision_events[0].kind,
+        AuditKind::DecisionRecorded {
+            kind: expected_kind,
+        }
+    );
 }
 
 fn pause_and_amend_still_permit_worker_appends<H: StateContractHarness>(
@@ -1205,7 +1521,7 @@ fn handoff_refusals_and_acceptance_are_transactional<H: StateContractHarness>(
         }
     );
     assert_eq!(refusal.head, Seq(before_missing.view.head.0 + 1));
-    assert_only_call_order_advanced(&before_missing, &visible_facts(port));
+    assert_only_call_order_advanced_among_workflow_facts(&before_missing, &visible_facts(port));
     assert_eq!(port.handoff(&missing.id), Err(StateError::UnknownRecord));
     assert_eq!(
         port.assignment(&assignment_id()).expect("exists").state,
@@ -1249,7 +1565,10 @@ fn handoff_refusals_and_acceptance_are_transactional<H: StateContractHarness>(
         vec![amend.clone()],
         "a refused handoff still returns the directive that explains it"
     );
-    assert_only_call_order_advanced(&before_directive_refusal, &visible_facts(port));
+    assert_only_call_order_advanced_among_workflow_facts(
+        &before_directive_refusal,
+        &visible_facts(port),
+    );
     assert_eq!(port.handoff(&candidate.id), Err(StateError::UnknownRecord));
     assert_eq!(
         port.assignment(&assignment_id()).expect("exists").attempts,
@@ -1279,6 +1598,11 @@ fn handoff_refusals_and_acceptance_are_transactional<H: StateContractHarness>(
         vec![(attempt_id(), AttemptState::Submitted)]
     );
     let submitted_facts = visible_facts(port);
+    assert_eq!(
+        port.append_signal(&pause("sig-directive-after-submission")),
+        Err(StateError::IncoherentBundle),
+        "Directives may target only an Active Attempt"
+    );
     assert_eq!(
         port.fenced_report(
             &action("op-report-after-submission", None),
@@ -1552,6 +1876,310 @@ fn runtime_associations_use_the_full_launch_subject<H: StateContractHarness>(
         Ok(Some(actor_handle)),
         "actor activations and worker attempts share the closed association seam"
     );
+}
+
+fn audit_lineage_is_transactional_typed_and_filterable<H: StateContractHarness>(
+    build: &impl Fn(Timestamp) -> H,
+) {
+    let harness = build(Timestamp(50));
+    let port = harness.port();
+    let opening = opening();
+    assert_eq!(port.open_assignment(&opening), Ok(StateApplied::Applied));
+    let opening_events = port
+        .audit_events(&AuditQuery::default())
+        .expect("audit query succeeds");
+    assert_eq!(opening_events.len(), 1);
+    assert_eq!(
+        opening_events[0],
+        AuditEvent {
+            seq: Seq(1),
+            at: Timestamp(50),
+            initiator: AuditInitiator::Authority(opening.authorizing.authority.clone()),
+            operation: AuditOperation::Operation(opening.authorizing.operation.clone()),
+            subject: AuditSubject::Workflow(SubjectRef::Assignment(assignment_id())),
+            kind: AuditKind::AssignmentOpened,
+        }
+    );
+    assert_eq!(
+        port.open_assignment(&opening),
+        Ok(StateApplied::AlreadyApplied)
+    );
+    assert_eq!(
+        port.audit_events(&AuditQuery::default())
+            .expect("audit query succeeds"),
+        opening_events,
+        "opening replay appends no audit"
+    );
+
+    let audit_before_validation = port
+        .audit_events(&AuditQuery::default())
+        .expect("audit query succeeds");
+    assert_eq!(
+        port.fenced_evidence(
+            &action(
+                "op-audit-invalid-link",
+                Some(SignalId::new("sig-audit-unknown").expect("valid signal"))
+            ),
+            &evidence()
+        ),
+        Err(StateError::UnknownRecord)
+    );
+    assert_eq!(
+        port.audit_events(&AuditQuery::default())
+            .expect("audit query succeeds"),
+        audit_before_validation,
+        "outer validation errors append no audit"
+    );
+
+    let (pause, _) = port
+        .append_signal(&pause("sig-audit-pause"))
+        .expect("directive commits");
+    let report_action = action("op-audit-report", None);
+    let (report_outcome, report_response) = port
+        .fenced_report(&report_action, &report_draft("sig-audit-report"))
+        .expect("report commits under Pause");
+    let ReportOutcome::Recorded { signal: report } = report_outcome else {
+        panic!("report must record without Abort");
+    };
+    assert_eq!(
+        report.seq,
+        Seq(3),
+        "the payload owns the intermediate position"
+    );
+    assert_eq!(
+        report_response.head,
+        Seq(4),
+        "the fenced call owns the transaction's final position"
+    );
+
+    let (lease, renewal_response) = port
+        .renew_lease(&call("op-audit-renew"), Timestamp(150))
+        .expect("renewal commits");
+    assert_eq!(lease.expires_at, Timestamp(150));
+    assert_eq!(renewal_response.head, Seq(5));
+    let refusal = handoff("handoff-audit-refusal", Vec::new());
+    let (refusal_outcome, refusal_response) = port
+        .fenced_submit_handoff(&action("op-audit-handoff-refusal", None), &refusal)
+        .expect("ordinary refusal commits");
+    assert_eq!(
+        refusal_outcome,
+        SubmissionOutcome::Refused {
+            reason: SubmissionRefusalReason::MissingEvidence
+        }
+    );
+    assert_eq!(refusal_response.head, Seq(6));
+
+    let subject = worker_subject();
+    let envelope =
+        EnvelopeSnapshot::new("audit envelope".into(), hash('5')).expect("bounded envelope");
+    assert_eq!(
+        port.persist_envelope(&op("op-audit-envelope"), &subject, &envelope),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.bind_runtime_handle(
+            &op("op-audit-bind"),
+            &subject,
+            &RuntimeHandle::new("runtime-audit")
+        ),
+        Ok(StateApplied::Applied)
+    );
+    let observation = RuntimeObservationRecord {
+        reporter: lead_authority("state:observe"),
+        subject: subject.clone(),
+        observation: LivenessObservation {
+            observed_at: Timestamp(45),
+            kind: LivenessKind::Running,
+        },
+    };
+    assert_eq!(
+        port.record_runtime_observation(&op("op-audit-observation"), &observation),
+        Ok(StateApplied::Applied)
+    );
+    assert_eq!(
+        port.runtime_observation(&op("op-audit-observation")),
+        Ok(observation.clone())
+    );
+
+    let application = ApplicationAttempt {
+        id: op("op-audit-application"),
+        target: op("op-contract-open"),
+        outcome: ApplicationOutcome::Applied {
+            before: revision('e'),
+            after: revision('9'),
+        },
+    };
+    assert_eq!(
+        port.record_application_attempt(&application),
+        Ok(StateApplied::Applied)
+    );
+    let receipt = ApplicationReceipt {
+        target: application.target.clone(),
+        attempt: application.id.clone(),
+        after: revision('9'),
+    };
+    assert_eq!(
+        port.record_application_receipt(&receipt),
+        Ok(StateApplied::Applied)
+    );
+
+    let events = port
+        .audit_events(&AuditQuery::default())
+        .expect("audit query succeeds");
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![
+            Seq(1),
+            Seq(2),
+            Seq(4),
+            Seq(5),
+            Seq(6),
+            Seq(7),
+            Seq(8),
+            Seq(9),
+            Seq(10),
+            Seq(11),
+        ],
+        "each transaction has one final-position event; the Report's intermediate Signal position has none"
+    );
+    assert_eq!(
+        events.iter().filter(|event| event.seq == Seq(4)).count(),
+        1,
+        "no ordering position carries more than one event"
+    );
+
+    let report_events = port
+        .audit_events(&AuditQuery {
+            subject: Some(AuditSubject::Workflow(SubjectRef::Attempt(attempt_id()))),
+            class: Some(AuditClass::Report),
+            from: Some(Seq(3)),
+            through: Some(Seq(4)),
+        })
+        .expect("AND-composed report query succeeds");
+    assert_eq!(report_events.len(), 1);
+    assert_eq!(report_events[0].seq, report_response.head);
+    assert_eq!(
+        report_events[0].kind,
+        AuditKind::ReportRecorded {
+            signal: report.id.clone(),
+        }
+    );
+    assert_eq!(
+        report_events[0].operation,
+        AuditOperation::Operation(report_action.call.operation.clone())
+    );
+    assert_eq!(
+        report_events[0].initiator,
+        AuditInitiator::WorkerBinding {
+            actor: worker(),
+            assignment: assignment_id(),
+            attempt: attempt_id(),
+        }
+    );
+    assert_eq!(
+        port.audit_events(&AuditQuery {
+            subject: Some(AuditSubject::Workflow(SubjectRef::Attempt(attempt_id()))),
+            class: Some(AuditClass::Profile),
+            ..AuditQuery::default()
+        })
+        .expect("AND-composed empty query succeeds"),
+        Vec::<AuditEvent>::new()
+    );
+
+    let signal_event = events
+        .iter()
+        .find(|event| event.seq == pause.seq)
+        .expect("directive audit event exists");
+    assert_eq!(
+        signal_event.operation,
+        AuditOperation::Signal(pause.id.clone())
+    );
+    let renewal_event = events
+        .iter()
+        .find(|event| event.seq == renewal_response.head)
+        .expect("lease-renewal audit event exists");
+    assert_eq!(renewal_event.kind, AuditKind::LeaseRenewed);
+    let envelope_event = events
+        .iter()
+        .find(|event| event.kind == AuditKind::EnvelopePersisted)
+        .expect("envelope audit event exists");
+    assert_eq!(
+        envelope_event.initiator,
+        AuditInitiator::SystemProjection {
+            authorizing: op("op-contract-open")
+        }
+    );
+    let refusal_event = events
+        .iter()
+        .find(|event| event.kind.class() == AuditClass::Handoff)
+        .expect("handoff audit event exists");
+    assert_eq!(
+        refusal_event.kind,
+        AuditKind::HandoffRefused {
+            reason: AuditSubmissionRefusal::MissingEvidence
+        }
+    );
+    let observation_event = events
+        .iter()
+        .find(|event| event.kind == AuditKind::RuntimeObservationRecorded)
+        .expect("observation audit event exists");
+    assert_eq!(observation_event.at, Timestamp(50));
+    assert_eq!(
+        observation_event.initiator,
+        AuditInitiator::Authority(observation.reporter.clone())
+    );
+
+    let before_replays = events;
+    assert_eq!(
+        port.fenced_report(&report_action, &report_draft("sig-audit-report"))
+            .expect("report replays")
+            .1
+            .applied,
+        StateApplied::AlreadyApplied
+    );
+    assert_eq!(
+        port.record_runtime_observation(&op("op-audit-observation"), &observation),
+        Ok(StateApplied::AlreadyApplied)
+    );
+    let mut changed_observation = observation.clone();
+    changed_observation.observation.kind = LivenessKind::Exited;
+    assert_eq!(
+        port.record_runtime_observation(&op("op-audit-observation"), &changed_observation),
+        Err(StateError::ConflictingOperation)
+    );
+    assert_eq!(
+        port.audit_events(&AuditQuery::default())
+            .expect("audit query succeeds"),
+        before_replays,
+        "replay and conflicts append no audit"
+    );
+
+    let profile_harness = build(Timestamp(50));
+    let profiles = profile_harness.port();
+    let boot = activation("op-audit-boot", "lead-audit", "lead");
+    assert_eq!(profiles.activate_profile(&boot), Ok(StateApplied::Applied));
+    assert_eq!(
+        profiles.deactivate_profile(
+            &op("op-audit-deactivate"),
+            &actor("lead-audit"),
+            &ProfileName::new("lead").expect("valid profile")
+        ),
+        Ok(StateApplied::Applied)
+    );
+    let profile_events = profiles
+        .audit_events(&AuditQuery {
+            class: Some(AuditClass::Profile),
+            ..AuditQuery::default()
+        })
+        .expect("profile audit query succeeds");
+    assert_eq!(profile_events.len(), 2);
+    assert!(
+        profile_events
+            .iter()
+            .all(|event| event.initiator == AuditInitiator::OperatorChannel)
+    );
+    assert_eq!(profile_events[0].kind, AuditKind::activation(&boot.case));
+    assert_eq!(profile_events[1].kind, AuditKind::ProfileDeactivated);
 }
 
 fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(

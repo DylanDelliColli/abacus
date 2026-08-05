@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 abacus-core = { path = "../abacus-core" }
 rusqlite = { version = "0.32", features = ["bundled"] }
+subtle = "2.6"
 thiserror = "2"

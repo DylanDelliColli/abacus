@@ -5,7 +5,10 @@ transactional SQLite schema v1/v2 under `src/migrations.rs` with WAL and
 busy-timeout configuration. `ABACUS-9NH.11` adds the public, empty-state
 `InMemoryState` and the portable `run_workflow_state_suite`; both consume an
 injected core `ClockPort`, so lease behavior is hermetic and shared with the
-future SQLite implementation. Scribe itself (process, socket transport,
+future SQLite implementation. `ABACUS-9NH.10` extends that public seam and
+canonical fake with the explicit Abort terminal, decision-terminal discharge,
+typed audit lineage, runtime-observation records, and state-owned constant-time
+credential comparison. Scribe itself (process, socket transport,
 client/server, and SQLite-backed Ledger operations) is not yet implemented;
 everything below describing those remains a design contract.
 
@@ -93,6 +96,7 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 - query immutable Signals by subject, sender, recipient, and causal order;
 - query per-actor and global derived unresolved sets: Signals lacking the typed responding action that resolves or discharges them;
 - return the active Attempt's current binding Directives in every fenced worker response;
+- accept the bare fenced Abort-compliance terminal only for a live, active Attempt with a binding Abort, recording the distinct ended `Aborted` state and revoking its credential;
 - persist/read the canonical Envelope and bind/unbind an opaque runtime handle, both keyed by the closed launch subject (worker Attempt or actor activation) so spawned orchestrator/watchdog profiles are first-class;
 - reconcile an uncertain runtime association.
 
@@ -119,7 +123,9 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 
 ### Observation and watchdog access
 
-- query filtered audit events, including runtime observations explicitly reported by an actor;
+- append exactly one typed audit event at the final `Seq` of every first-time durable mutation, including lease renewal and in-band refusal, while replay and outer refusal append none;
+- query audit events with AND-composed typed subject, event-class, and inclusive sequence filters in Ledger order;
+- record and join immutable actor-reported runtime observations without promoting them to current authority;
 - never grant graph mutation or handoff authority merely because an actor can observe.
 
 A watchdog profile without workflow-mutation authority should require no schema change. New automated recovery behavior adds a focused core use case and a state operation only if existing transitions cannot express it.
@@ -137,7 +143,9 @@ Watchdogs are ordinary Herdr-managed agent profiles, never additional daemon pro
 - The client protocol is causally ordered and idempotent so concurrent or lost-response retries cannot leapfrog a response that first surfaced a binding Directive.
 - Signal appends carry a closed type/kind, validated mandatory subject, full sender identity/profile/capability/scope snapshot, and the typed link required when the record responds to another Signal.
 - No `read_at` columns and no per-Directive acknowledgement state exist in the schema or public interface. Scribe never accepts a client-asserted read marker or Directive head.
-- Handoff is refused with a distinct ordinary Submission-refusal reason while an amend or pause Directive remains undischarged. After abort, Scribe refuses substantive worker appends through response-bearing ordinary outcomes; renewal remains available for discovery, and the abort-consistent terminal operation is the explicit `abacus-9nh.10` lifecycle obligation.
+- Handoff is refused with a distinct ordinary Submission-refusal reason while an amend or pause Directive remains undischarged. After abort, Scribe refuses substantive worker appends through response-bearing ordinary outcomes; renewal remains available for discovery. The sole worker terminal carrier is `fenced_abort_attempt`: a bare call with a live lease and binding Abort, returning the post-commit response after recording `Aborted` and revoking the credential. `AbortNotInForce` claims nothing, and exact replay precedes all validation.
+- Directives may be appended only to an active Attempt. Every decision-driven Attempt terminal records `TerminalAttemptAction { abort_consistent: true }` at the decision's same `Seq`; an unfulfilled Amend remains historically binding but operationally inert after the Attempt ends.
+- Audit kinds contain typed identities and closed outcome/reason classes, never owning record bodies. Direct Signal appends use their Signal ID as the honest audit idempotency identity; other mutations use their operation ID. The initiator is the strongest fact the call proves: full authority, complete recovered worker binding, operator channel, or a projection joined to a committed authorizing operation. V1 profile deactivation is operator-channel-only.
 - Responses are typed success or normalized error; clients do not parse Scribe log text.
 - Unknown fields are handled according to an explicit version policy.
 - Incompatible major versions fail before mutation.
@@ -175,7 +183,7 @@ Canonical `br` fields are not copied into mutable state. An audit record may sto
 
 ## Consistency and recovery
 
-- Mutations and their audit/idempotency records commit in one transaction.
+- Mutations and their audit/idempotency records commit in one transaction. A transaction may allocate several ordering positions (recorded Report: Signal then call), but its sole audit event anchors at the final position; intermediate positions have none and no position has more than one.
 - WAL and busy-timeout behavior are configured centrally.
 - Scribe alone owns writes; clients never compete for SQLite locks.
 - Lease decisions use the Scribe clock.
@@ -209,6 +217,7 @@ empty state plus a suite-controlled clock; assertions use only the public port
 and clock control, never implementation internals or pre-seeded answers. The
 suite covers every port method, including profile lifecycle, clock-driven
 expiry and stale fencing, response linkage, response-bearing abort refusals,
+the explicit and decision-driven terminal-action paths, typed audit lineage,
 derived unresolved/pending queries, runtime associations, and reconciliation
 receipts. The future SQLite fixture must invoke this same suite.
 
@@ -221,6 +230,7 @@ resolve, not an accepted alternate contract.
 Default tests use temporary Git common directories, sockets, and SQLite files. They cover:
 
 - credential authentication: no agent-protocol enrolment request exists; invalid, binding-mismatched, and revoked credentials refuse distinctly; digest-only persistence; worker binding atomic with `AssignmentOpening` and retry `AttemptOpening` (id and digest conflicts both refused); expiry/revocation at attempt end and deactivation;
+- state-owned constant-time credential-digest comparison on both matching and mismatching fixed-length digests;
 
 - initialization and single-Scribe behavior;
 - migrations and rollback/backup paths;
@@ -236,6 +246,7 @@ Default tests use temporary Git common directories, sockets, and SQLite files. T
 - red-green candidate derivation from ordinary Evidence, including matching verification sets, wrong-commit red, passing “red,” green-only submission, `execution-error` rejected as red, overlay-digest mismatch rejected, digest match accepted, and an overlay path outside the policy verification set rejected;
 - Acceptance decision/application-attempt/application-receipt recovery across every interruption point;
 - explicit fenced Attempt retry, optional per-Assignment attempt caps, and audited refusal/attempt churn;
+- typed audit initiators, subjects, and closed event classes; final-position anchoring for multi-position transactions; AND-composed filters; and proof that replay and outer refusal append no event;
 - profile snapshots and decision-authority transfer;
 - watchdog queries and read-only authorization;
 - restart/recovery and corrupt/incompatible state;

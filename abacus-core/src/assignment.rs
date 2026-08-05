@@ -157,6 +157,7 @@ mod tests {
             AttemptState::Rejected,
             AttemptState::Revoked,
             AttemptState::Expired,
+            AttemptState::Aborted,
         ] {
             assert_eq!(
                 next_attempt_allowed(AssignmentState::Active, Some(ended)),

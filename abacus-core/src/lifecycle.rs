@@ -54,11 +54,15 @@ pub enum AttemptState {
     /// Explicit revocation by the Assignment's decision actor.
     Revoked,
     /// Terminal `Expired`: reached by explicit reclamation after
-    /// lease expiry (CONTEXT: a failed, rejected, expired, or revoked
-    /// Attempt ends; nothing expires an Attempt implicitly — Reclaim is
-    /// the fenced decision action, Expired the resulting state).
+    /// lease expiry (CONTEXT: a failed, rejected, expired, revoked, or
+    /// abort-compliant Attempt ends; nothing expires an Attempt implicitly —
+    /// Reclaim is the fenced decision action, Expired the resulting state).
     /// Partial product preserved.
     Expired,
+    /// Terminal worker compliance with a binding Abort Directive. This
+    /// remains distinct from decision-actor revocation so the audit trail
+    /// preserves who ended the Attempt and why.
+    Aborted,
 }
 
 impl AttemptState {
@@ -75,6 +79,8 @@ pub enum AttemptAction {
     Accept,
     Reject,
     Revoke,
+    /// Worker-owned terminal compliance with a binding Abort Directive.
+    Abort,
     /// Valid only from `Active` once the caller-supplied lease-expiry
     /// fact is true.
     Reclaim,
@@ -140,6 +146,10 @@ pub fn attempt_transition(
             AttemptState::Active => Ok(AttemptState::Revoked),
             _ => Err(TransitionError::HandoffPending),
         },
+        AttemptAction::Abort => match state {
+            AttemptState::Active => Ok(AttemptState::Aborted),
+            _ => Err(TransitionError::HandoffPending),
+        },
         AttemptAction::Reclaim => match state {
             AttemptState::Active if lease_expired => Ok(AttemptState::Expired),
             AttemptState::Active => Err(TransitionError::LeaseNotExpired),
@@ -159,19 +169,21 @@ mod tests {
     ];
     const ASSIGNMENT_ACTIONS: [AssignmentAction; 2] =
         [AssignmentAction::Accept, AssignmentAction::Cancel];
-    const ATTEMPT_STATES: [AttemptState; 6] = [
+    const ATTEMPT_STATES: [AttemptState; 7] = [
         AttemptState::Active,
         AttemptState::Submitted,
         AttemptState::Accepted,
         AttemptState::Rejected,
         AttemptState::Revoked,
         AttemptState::Expired,
+        AttemptState::Aborted,
     ];
-    const ATTEMPT_ACTIONS: [AttemptAction; 5] = [
+    const ATTEMPT_ACTIONS: [AttemptAction; 6] = [
         AttemptAction::Submit,
         AttemptAction::Accept,
         AttemptAction::Reject,
         AttemptAction::Revoke,
+        AttemptAction::Abort,
         AttemptAction::Reclaim,
     ];
 
@@ -223,7 +235,9 @@ mod tests {
                             Err(TransitionError::NotSubmitted)
                         }
                         (AttemptState::Active, AttemptAction::Revoke) => Ok(AttemptState::Revoked),
-                        (AttemptState::Submitted, AttemptAction::Revoke) => {
+                        (AttemptState::Active, AttemptAction::Abort) => Ok(AttemptState::Aborted),
+                        (AttemptState::Submitted, AttemptAction::Revoke)
+                        | (AttemptState::Submitted, AttemptAction::Abort) => {
                             Err(TransitionError::HandoffPending)
                         }
                         (AttemptState::Active, AttemptAction::Reclaim) if lease_expired => {
@@ -259,6 +273,7 @@ mod tests {
             AttemptState::Rejected,
             AttemptState::Revoked,
             AttemptState::Expired,
+            AttemptState::Aborted,
         ] {
             assert!(state.is_ended(), "{state:?}");
         }
@@ -268,7 +283,11 @@ mod tests {
     /// reclaims nothing and gates only reclamation.
     #[test]
     fn lease_fact_gates_only_reclamation() {
-        for action in [AttemptAction::Submit, AttemptAction::Revoke] {
+        for action in [
+            AttemptAction::Submit,
+            AttemptAction::Revoke,
+            AttemptAction::Abort,
+        ] {
             assert_eq!(
                 attempt_transition(AttemptState::Active, action, false),
                 attempt_transition(AttemptState::Active, action, true),

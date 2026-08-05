@@ -9,11 +9,8 @@
 //! Transport-level protocol facts (version negotiation, repository
 //! identity, request IDs) belong to the `abacus-state` client/server
 //! implementation, not this in-process seam; the workflow-visible
-//! rules — Scribe-allocated ordering, fenced envelopes, idempotency —
-//! are encoded here in the types. The typed audit-lineage query is
-//! deliberately absent until `abacus-state` defines the audit value
-//! (9NH.7); it arrives as a C1 extension rather than fossilizing a
-//! string placeholder.
+//! rules — Scribe-allocated ordering, fenced envelopes, idempotency,
+//! and the typed audit-lineage index — are encoded here in the types.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +26,9 @@ use crate::lease::{FencingToken, Lease, Timestamp};
 use crate::lifecycle::{AssignmentState, AttemptState};
 use crate::profile::ProfileActivation;
 use crate::scope::ScopeMap;
-use crate::signal::{AuthoritySnapshot, DirectiveGateRefusal, Seq, Signal, SignalDraft};
+use crate::signal::{
+    AuthoritySnapshot, DirectiveGateRefusal, Seq, Signal, SignalBody, SignalDraft, SubjectRef,
+};
 
 // ---------------------------------------------------------------------------
 // Work graph
@@ -668,6 +667,297 @@ pub struct FencedResponse {
     pub head: Seq,
 }
 
+/// The honest idempotency identity attached to an audit event. Most state
+/// mutations are operation-owned; a direct Signal append is intentionally
+/// owned by its globally unique Signal identity and does not invent a second
+/// operation field merely for audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditOperation {
+    Operation(OperationId),
+    Signal(SignalId),
+}
+
+/// The strongest initiator fact a state operation structurally proves.
+///
+/// This is deliberately not a speculative caller-authentication envelope.
+/// A future protocol may strengthen individual calls, but it must do so as an
+/// explicit seam extension rather than reinterpret already-committed events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditInitiator {
+    /// Full acted-under identity, including capability and canonical scope.
+    Authority(AuthoritySnapshot),
+    /// The complete worker binding recovered from durable Assignment state.
+    /// It proves actor, profile snapshot, Assignment, and Attempt; it does not
+    /// fabricate an exercised capability or scope that the current call lacks.
+    WorkerBinding {
+        actor: DecisionActor,
+        assignment: AssignmentId,
+        attempt: AttemptId,
+    },
+    /// A v1 operation accepted only through the pre-listen operator channel.
+    OperatorChannel,
+    /// A projection whose authority joins to an operation already committed
+    /// in the Ledger. Implementations validate that join before mutation.
+    SystemProjection { authorizing: OperationId },
+}
+
+/// Closed typed subject families for audit filtering. Workflow subjects reuse
+/// the normative four-shape [`SubjectRef`] family; launch associations and
+/// operator profile membership are distinct state facts rather than invented
+/// workflow subjects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditSubject {
+    Workflow(SubjectRef),
+    ActorProfile {
+        actor: ActorId,
+        profile: ProfileName,
+    },
+    Launch(LaunchSubject),
+    Projection(OperationId),
+}
+
+/// Stable coarse event classes accepted by [`AuditQuery`]. Exact event kinds
+/// remain closed and typed; the class exists only to avoid a free-text query
+/// language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditClass {
+    Assignment,
+    Attempt,
+    Decision,
+    Profile,
+    Signal,
+    Report,
+    Evidence,
+    Handoff,
+    Lease,
+    Envelope,
+    Runtime,
+    Application,
+}
+
+/// Payload-free classification of one decision kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditDecisionKind {
+    Accept,
+    Reject,
+    Cancel,
+    Revoke,
+    Reclaim,
+    TransferAuthority,
+}
+
+/// Payload-free classification of one activation case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditActivationCase {
+    OperatorBootstrap,
+    ActorAuthorizedRotation,
+    OperatorRecovery,
+    OperatorOrchestratorEnrolment,
+}
+
+/// Audit-safe Handoff refusal category. Detailed paths and evidence records
+/// stay in the operation-owned durable outcome and are joined by operation and
+/// sequence; the audit index never copies record bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditSubmissionRefusal {
+    DirtyWorktree,
+    MissingEvidence,
+    EvidenceWrongCommit,
+    FailingOutcome,
+    EditScopeViolation,
+    Directive(DirectiveGateRefusal),
+    RedGreen,
+}
+
+/// Payload-free classification of an application attempt outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditApplicationOutcome {
+    Applied,
+    EffectAlreadyPresent,
+    Failed,
+    Ambiguous,
+}
+
+/// What class of durable mutation committed. Variants carry only typed
+/// identities and closed-enum reason/outcome classes, never owning record
+/// bodies. Those remain in their canonical Ledger records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditKind {
+    AssignmentOpened,
+    AttemptOpened,
+    DecisionRecorded { kind: AuditDecisionKind },
+    ProfileActivated { case: AuditActivationCase },
+    ProfileDeactivated,
+    DirectiveAppended { signal: SignalId },
+    RequestAppended { signal: SignalId },
+    ReportRecorded { signal: SignalId },
+    ReportRefused { reason: DirectiveGateRefusal },
+    EvidenceRecorded,
+    EvidenceRefused { reason: DirectiveGateRefusal },
+    HandoffRecorded { handoff: HandoffId },
+    HandoffRefused { reason: AuditSubmissionRefusal },
+    LeaseRenewed,
+    AttemptAborted,
+    EnvelopePersisted,
+    RuntimeHandleBound,
+    RuntimeHandleUnbound,
+    RuntimeObservationRecorded,
+    ApplicationAttemptRecorded { outcome: AuditApplicationOutcome },
+    ApplicationReceiptRecorded,
+}
+
+impl AuditKind {
+    pub fn class(&self) -> AuditClass {
+        match self {
+            Self::AssignmentOpened => AuditClass::Assignment,
+            Self::AttemptOpened | Self::AttemptAborted => AuditClass::Attempt,
+            Self::DecisionRecorded { .. } => AuditClass::Decision,
+            Self::ProfileActivated { .. } | Self::ProfileDeactivated => AuditClass::Profile,
+            Self::DirectiveAppended { .. } | Self::RequestAppended { .. } => AuditClass::Signal,
+            Self::ReportRecorded { .. } | Self::ReportRefused { .. } => AuditClass::Report,
+            Self::EvidenceRecorded | Self::EvidenceRefused { .. } => AuditClass::Evidence,
+            Self::HandoffRecorded { .. } | Self::HandoffRefused { .. } => AuditClass::Handoff,
+            Self::LeaseRenewed => AuditClass::Lease,
+            Self::EnvelopePersisted => AuditClass::Envelope,
+            Self::RuntimeHandleBound
+            | Self::RuntimeHandleUnbound
+            | Self::RuntimeObservationRecorded => AuditClass::Runtime,
+            Self::ApplicationAttemptRecorded { .. } | Self::ApplicationReceiptRecorded => {
+                AuditClass::Application
+            }
+        }
+    }
+
+    pub fn decision(kind: &DecisionKind) -> Self {
+        let kind = match kind {
+            DecisionKind::Accept { .. } => AuditDecisionKind::Accept,
+            DecisionKind::Reject { .. } => AuditDecisionKind::Reject,
+            DecisionKind::Cancel { .. } => AuditDecisionKind::Cancel,
+            DecisionKind::Revoke { .. } => AuditDecisionKind::Revoke,
+            DecisionKind::Reclaim { .. } => AuditDecisionKind::Reclaim,
+            DecisionKind::TransferAuthority { .. } => AuditDecisionKind::TransferAuthority,
+        };
+        Self::DecisionRecorded { kind }
+    }
+
+    pub fn activation(case: &ActivationCase) -> Self {
+        let case = match case {
+            ActivationCase::OperatorBootstrap => AuditActivationCase::OperatorBootstrap,
+            ActivationCase::ActorAuthorizedRotation { .. } => {
+                AuditActivationCase::ActorAuthorizedRotation
+            }
+            ActivationCase::OperatorRecovery => AuditActivationCase::OperatorRecovery,
+            ActivationCase::OperatorOrchestratorEnrolment => {
+                AuditActivationCase::OperatorOrchestratorEnrolment
+            }
+        };
+        Self::ProfileActivated { case }
+    }
+
+    pub fn signal(signal: &Signal) -> Self {
+        match &signal.body {
+            SignalBody::Directive { .. } => Self::DirectiveAppended {
+                signal: signal.id.clone(),
+            },
+            SignalBody::Request { .. } => Self::RequestAppended {
+                signal: signal.id.clone(),
+            },
+            SignalBody::Report { .. } => Self::ReportRecorded {
+                signal: signal.id.clone(),
+            },
+        }
+    }
+
+    pub fn report(outcome: &ReportOutcome) -> Self {
+        match outcome {
+            ReportOutcome::Recorded { signal } => Self::ReportRecorded {
+                signal: signal.id.clone(),
+            },
+            ReportOutcome::Refused { reason } => Self::ReportRefused { reason: *reason },
+        }
+    }
+
+    pub fn evidence(outcome: EvidenceOutcome) -> Self {
+        match outcome {
+            EvidenceOutcome::Recorded => Self::EvidenceRecorded,
+            EvidenceOutcome::Refused { reason } => Self::EvidenceRefused { reason },
+        }
+    }
+
+    pub fn handoff(outcome: &SubmissionOutcome) -> Self {
+        match outcome {
+            SubmissionOutcome::Recorded { handoff } => Self::HandoffRecorded {
+                handoff: handoff.clone(),
+            },
+            SubmissionOutcome::Refused { reason } => Self::HandoffRefused {
+                reason: AuditSubmissionRefusal::from(reason),
+            },
+        }
+    }
+
+    pub fn application(outcome: &ApplicationOutcome) -> Self {
+        let outcome = match outcome {
+            ApplicationOutcome::Applied { .. } => AuditApplicationOutcome::Applied,
+            ApplicationOutcome::EffectAlreadyPresent { .. } => {
+                AuditApplicationOutcome::EffectAlreadyPresent
+            }
+            ApplicationOutcome::Failed { .. } => AuditApplicationOutcome::Failed,
+            ApplicationOutcome::Ambiguous => AuditApplicationOutcome::Ambiguous,
+        };
+        Self::ApplicationAttemptRecorded { outcome }
+    }
+}
+
+impl From<&SubmissionRefusalReason> for AuditSubmissionRefusal {
+    fn from(reason: &SubmissionRefusalReason) -> Self {
+        match reason {
+            SubmissionRefusalReason::DirtyWorktree { .. } => Self::DirtyWorktree,
+            SubmissionRefusalReason::MissingEvidence => Self::MissingEvidence,
+            SubmissionRefusalReason::EvidenceWrongCommit => Self::EvidenceWrongCommit,
+            SubmissionRefusalReason::FailingOutcome => Self::FailingOutcome,
+            SubmissionRefusalReason::EditScopeViolation { .. } => Self::EditScopeViolation,
+            SubmissionRefusalReason::Directive(reason) => Self::Directive(*reason),
+            SubmissionRefusalReason::RedGreen(_) => Self::RedGreen,
+        }
+    }
+}
+
+/// One immutable audit index record. `seq` is always the transaction's final
+/// ordering position: a multi-position fenced Report has one event at its
+/// final call position, none at its intermediate Signal position, and no
+/// ordering position can own more than one event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub seq: Seq,
+    pub at: Timestamp,
+    pub initiator: AuditInitiator,
+    pub operation: AuditOperation,
+    pub subject: AuditSubject,
+    pub kind: AuditKind,
+}
+
+/// AND-composed, typed audit filters. Bounds are inclusive and results are
+/// always returned in ascending Ledger order. There is intentionally no
+/// free-text predicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditQuery {
+    pub subject: Option<AuditSubject>,
+    pub class: Option<AuditClass>,
+    pub from: Option<Seq>,
+    pub through: Option<Seq>,
+}
+
+/// One actor-reported, non-authoritative runtime observation. The normalized
+/// observation carries its observation time; the linked [`AuditEvent`] also
+/// records the distinct Ledger commit time. This record is audit-only and can
+/// never establish completion, assignment state, or current liveness alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeObservationRecord {
+    pub reporter: AuthoritySnapshot,
+    pub subject: LaunchSubject,
+    pub observation: LivenessObservation,
+}
+
 /// Outcome of a fenced worker Report append. A binding Abort is an
 /// audited domain refusal, not a protocol failure: the operation owns
 /// the refusal and the caller still receives its [`FencedResponse`].
@@ -809,6 +1099,10 @@ pub enum StateError {
     CredentialBindingMismatch,
     /// The credential was revoked (attempt end / deactivation).
     CredentialRevoked,
+    /// The worker attempted the explicit abort-compliance terminal call
+    /// without a currently binding Abort Directive. The operation is not
+    /// claimed; voluntary worker self-cancellation remains unrepresentable.
+    AbortNotInForce,
     /// Same operation identity, different content: corrupt input.
     ConflictingOperation,
     UnknownRecord,
@@ -937,6 +1231,12 @@ pub trait WorkflowStatePort {
         handoff: &HandoffRecord,
     ) -> Result<(SubmissionOutcome, FencedResponse), StateError>;
 
+    /// Explicit worker compliance with a binding Abort Directive. The bare
+    /// call carries no response link because the terminal action is itself
+    /// the typed response. Exact replay is recognized before all mutable
+    /// validation and returns the causally current response envelope.
+    fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError>;
+
     /// Fenced lease renewal.
     fn renew_lease(
         &self,
@@ -979,6 +1279,20 @@ pub trait WorkflowStatePort {
     ) -> Result<StateApplied, StateError>;
 
     fn runtime_handle(&self, subject: &LaunchSubject) -> Result<Option<RuntimeHandle>, StateError>;
+
+    /// Record one explicitly reported runtime observation as immutable,
+    /// non-authoritative audit data.
+    fn record_runtime_observation(
+        &self,
+        operation: &OperationId,
+        record: &RuntimeObservationRecord,
+    ) -> Result<StateApplied, StateError>;
+
+    /// Read the runtime-observation body joined by its operation identity.
+    fn runtime_observation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<RuntimeObservationRecord, StateError>;
 
     /// Record one immutable application attempt (any outcome).
     fn record_application_attempt(
@@ -1035,6 +1349,10 @@ pub trait WorkflowStatePort {
 
     /// Derived unresolved-Signal set, per recipient or global.
     fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError>;
+
+    /// Complete typed audit lineage under AND-composed filters, in Ledger
+    /// order. Replay and outer validation errors never add events.
+    fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1834,6 +2152,8 @@ mod tests {
         assignment: Option<String>,
         /// Present for actor activation bindings.
         generation: Option<String>,
+        /// Operation that durably created this launch subject.
+        authorizing: OperationId,
         revoked: bool,
     }
 
@@ -1842,6 +2162,7 @@ mod tests {
         committed: RefCell<BTreeMap<String, String>>,
         current_token: RefCell<FencingToken>,
         bound_worker: ActorId,
+        bound_worker_snapshot: DecisionActor,
         /// The Assignment/Attempt this fake's fenced calls belong to —
         /// tokens are not global identities (R5.24).
         bound_assignment: AssignmentId,
@@ -1880,8 +2201,6 @@ mod tests {
         /// Typed Assignment records, so projections derive their bead
         /// from real state rather than parsed Debug output.
         assignments: RefCell<BTreeMap<String, AssignmentRecord>>,
-        /// Monotonic Ledger commit order.
-        next_commit: RefCell<u64>,
         /// Application attempts recorded per target operation.
         application_attempts: RefCell<BTreeMap<String, Vec<(OperationId, ApplicationOutcome)>>>,
         /// Active (profile → actors) membership for EVERY occupancy
@@ -1889,6 +2208,9 @@ mod tests {
         active_members: RefCell<BTreeMap<String, std::collections::BTreeSet<String>>>,
         handoffs: RefCell<Vec<HandoffRecord>>,
         actor_classes: RefCell<BTreeMap<String, AuthorityClass>>,
+        attempt_states: RefCell<BTreeMap<String, AttemptState>>,
+        audit_events: RefCell<BTreeMap<u64, AuditEvent>>,
+        runtime_observations: RefCell<BTreeMap<String, RuntimeObservationRecord>>,
     }
 
     impl FakeState {
@@ -2005,13 +2327,33 @@ mod tests {
             if *self.now.borrow() > *self.lease_expires_at.borrow() {
                 return Err(StateError::LeaseExpired);
             }
+            if self
+                .attempt_states
+                .borrow()
+                .get(call.attempt.as_str())
+                .is_some_and(|state| state.is_ended())
+            {
+                return Err(StateError::IncoherentBundle);
+            }
             Ok(())
         }
 
+        fn active_fence(&self, call: &FencedCall) -> Result<(), StateError> {
+            self.fence(call)?;
+            if self
+                .attempt_states
+                .borrow()
+                .get(call.attempt.as_str())
+                .is_none_or(|state| *state != AttemptState::Active)
+            {
+                Err(StateError::IncoherentBundle)
+            } else {
+                Ok(())
+            }
+        }
+
         fn commit_seq(&self) -> Seq {
-            let mut n = self.next_commit.borrow_mut();
-            *n += 1;
-            Seq(*n)
+            self.next_ledger_seq()
         }
 
         /// Identity check for association operations: the owner must
@@ -2062,6 +2404,60 @@ mod tests {
 
         fn current_head(&self) -> Seq {
             Seq(*self.next_seq.borrow())
+        }
+
+        fn append_audit(
+            &self,
+            seq: Seq,
+            initiator: AuditInitiator,
+            operation: AuditOperation,
+            subject: AuditSubject,
+            kind: AuditKind,
+        ) {
+            let prior = self.audit_events.borrow_mut().insert(
+                seq.0,
+                AuditEvent {
+                    seq,
+                    at: *self.now.borrow(),
+                    initiator,
+                    operation,
+                    subject,
+                    kind,
+                },
+            );
+            assert!(prior.is_none(), "one audit event per Ledger position");
+        }
+
+        fn worker_initiator(&self, call: &FencedCall) -> AuditInitiator {
+            let actor = self
+                .assignments
+                .borrow()
+                .get(call.assignment.as_str())
+                .map(|assignment| assignment.worker.clone())
+                .unwrap_or_else(|| self.bound_worker_snapshot.clone());
+            AuditInitiator::WorkerBinding {
+                actor,
+                assignment: call.assignment.clone(),
+                attempt: call.attempt.clone(),
+            }
+        }
+
+        fn launch_authorizing(&self, subject: &LaunchSubject) -> Result<OperationId, StateError> {
+            let operation = self
+                .launch_credentials
+                .borrow()
+                .get(&Self::owner_locator(subject))
+                .map(|binding| binding.authorizing.clone())
+                .ok_or(StateError::Corrupt)?;
+            let committed = self.committed.borrow();
+            if ["open", "attempt", "act"]
+                .iter()
+                .any(|verb| committed.contains_key(&format!("{verb}:{}", operation.as_str())))
+            {
+                Ok(operation)
+            } else {
+                Err(StateError::Corrupt)
+            }
         }
 
         /// A link is accepted only when its target is already a
@@ -2170,6 +2566,15 @@ mod tests {
                 return Err(StateError::ConflictingOperation);
             }
             let committed = draft.clone().commit(self.next_ledger_seq());
+            if let SignalBody::Directive { attempt, .. } = &committed.body {
+                self.response_actions.borrow_mut().push(ResponseAction {
+                    seq: committed.seq,
+                    kind: ResponseKind::DirectiveCommitted {
+                        attempt: attempt.clone(),
+                        directive: committed.id.clone(),
+                    },
+                });
+            }
             self.stored_signals.borrow_mut().push(committed.clone());
             Ok((committed, StateApplied::Applied))
         }
@@ -2214,6 +2619,7 @@ mod tests {
                     profile: worker.profile.as_str().to_owned(),
                     assignment: Some(opening.assignment.id.as_str().to_owned()),
                     generation: None,
+                    authorizing: opening.authorizing.operation.clone(),
                     revoked: false,
                 },
             );
@@ -2230,6 +2636,10 @@ mod tests {
                 opening.assignment.id.as_str().to_owned(),
                 opening.assignment.clone(),
             );
+            self.attempt_states.borrow_mut().insert(
+                opening.first_attempt.id.as_str().to_owned(),
+                AttemptState::Active,
+            );
             let seq = self.commit_seq();
             self.projections.borrow_mut().insert(
                 opening.authorizing.operation.as_str().to_owned(),
@@ -2241,6 +2651,13 @@ mod tests {
                     committed_at: seq,
                     authorized_revision: Some(opening.bead_revision.clone()),
                 },
+            );
+            self.append_audit(
+                seq,
+                AuditInitiator::Authority(opening.authorizing.authority.clone()),
+                AuditOperation::Operation(opening.authorizing.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Assignment(opening.assignment.id.clone())),
+                AuditKind::AssignmentOpened,
             );
             self.committed.borrow_mut().insert(key, content);
             Ok(StateApplied::Applied)
@@ -2284,8 +2701,20 @@ mod tests {
                     profile: owner_profile,
                     assignment: Some(assignment_id),
                     generation: None,
+                    authorizing: opening.authorizing.operation.clone(),
                     revoked: false,
                 },
+            );
+            self.attempt_states
+                .borrow_mut()
+                .insert(opening.attempt.id.as_str().to_owned(), AttemptState::Active);
+            let seq = self.next_ledger_seq();
+            self.append_audit(
+                seq,
+                AuditInitiator::Authority(opening.authorizing.authority.clone()),
+                AuditOperation::Operation(opening.authorizing.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Attempt(opening.attempt.id.clone())),
+                AuditKind::AttemptOpened,
             );
             self.committed.borrow_mut().insert(key, content);
             Ok(StateApplied::Applied)
@@ -2339,6 +2768,7 @@ mod tests {
                 format!("{record:?}"),
             )?;
             if applied == StateApplied::Applied {
+                let seq = self.next_ledger_seq();
                 // Terminal Attempt decisions end that Attempt's
                 // credential (ADR-0003); refused/conflicting
                 // operations never reach here, so they revoke nothing.
@@ -2365,18 +2795,55 @@ mod tests {
                                 .filter(|(_, b)| {
                                     b.assignment.as_deref() == Some(assignment.as_str())
                                 })
-                                .map(|(k, _)| k.trim_start_matches("attempt:").to_owned()),
+                                .map(|(k, _)| k.trim_start_matches("attempt:").to_owned())
+                                .filter(|attempt| {
+                                    self.attempt_states
+                                        .borrow()
+                                        .get(attempt)
+                                        .is_some_and(|state| !state.is_ended())
+                                }),
                         );
                     }
                     DecisionKind::TransferAuthority { .. } => {}
                 }
                 {
                     let mut creds = self.launch_credentials.borrow_mut();
-                    for attempt in ended {
+                    for attempt in &ended {
                         if let Some(binding) = creds.get_mut(&format!("attempt:{attempt}")) {
                             binding.revoked = true;
                         }
                     }
+                }
+                {
+                    let mut states = self.attempt_states.borrow_mut();
+                    for attempt in &ended {
+                        let state = match &record.kind {
+                            DecisionKind::Accept { .. } => AttemptState::Accepted,
+                            DecisionKind::Reject { .. } => AttemptState::Rejected,
+                            DecisionKind::Reclaim { .. } => AttemptState::Expired,
+                            DecisionKind::Cancel { .. } | DecisionKind::Revoke { .. } => {
+                                AttemptState::Revoked
+                            }
+                            DecisionKind::TransferAuthority { .. } => continue,
+                        };
+                        states.insert(attempt.clone(), state);
+                    }
+                }
+                self.response_actions.borrow_mut().push(ResponseAction {
+                    seq,
+                    kind: ResponseKind::FencedDecision {
+                        responds_to: record.resolves.clone(),
+                    },
+                });
+                for attempt in &ended {
+                    self.response_actions.borrow_mut().push(ResponseAction {
+                        seq,
+                        kind: ResponseKind::TerminalAttemptAction {
+                            attempt: AttemptId::new(attempt)
+                                .expect("stored AttemptId was validated"),
+                            abort_consistent: true,
+                        },
+                    });
                 }
                 // Only Accept and Cancel project a close (R5.25).
                 if let Some(reason) = record.kind.close_reason() {
@@ -2388,7 +2855,6 @@ mod tests {
                         .get(record.assignment.as_str())
                         .map(|a| a.bead.clone())
                         .expect("assignment validated above");
-                    let seq = self.commit_seq();
                     self.projections.borrow_mut().insert(
                         record.operation.as_str().to_owned(),
                         PendingApplication {
@@ -2404,6 +2870,30 @@ mod tests {
                     );
                 }
                 self.decisions.borrow_mut().push(record.clone());
+                let subject = match &record.kind {
+                    DecisionKind::Accept { .. } | DecisionKind::Reject { .. } => {
+                        AuditSubject::Workflow(SubjectRef::Attempt(
+                            AttemptId::new(
+                                ended.first().expect("handoff decision ended its Attempt"),
+                            )
+                            .expect("stored AttemptId was validated"),
+                        ))
+                    }
+                    DecisionKind::Revoke { attempt, .. }
+                    | DecisionKind::Reclaim { attempt, .. } => {
+                        AuditSubject::Workflow(SubjectRef::Attempt(attempt.clone()))
+                    }
+                    DecisionKind::Cancel { .. } | DecisionKind::TransferAuthority { .. } => {
+                        AuditSubject::Workflow(SubjectRef::Assignment(record.assignment.clone()))
+                    }
+                };
+                self.append_audit(
+                    seq,
+                    AuditInitiator::Authority(record.authority.clone()),
+                    AuditOperation::Operation(record.operation.clone()),
+                    subject,
+                    AuditKind::decision(&record.kind),
+                );
             }
             Ok(applied)
         }
@@ -2528,6 +3018,7 @@ mod tests {
                         profile: activation.profile.as_str().to_owned(),
                         assignment: None,
                         generation: Some(activation.operation.as_str().to_owned()),
+                        authorizing: activation.operation.clone(),
                         revoked: false,
                     },
                 );
@@ -2543,6 +3034,25 @@ mod tests {
                     .borrow_mut()
                     .insert("bootstrap:done".into(), "1".into());
             }
+            let seq = self.next_ledger_seq();
+            let initiator = match &opening.case {
+                ActivationCase::ActorAuthorizedRotation { authority } => {
+                    AuditInitiator::Authority(authority.clone())
+                }
+                ActivationCase::OperatorBootstrap
+                | ActivationCase::OperatorRecovery
+                | ActivationCase::OperatorOrchestratorEnrolment => AuditInitiator::OperatorChannel,
+            };
+            self.append_audit(
+                seq,
+                initiator,
+                AuditOperation::Operation(activation.operation.clone()),
+                AuditSubject::ActorProfile {
+                    actor: activation.actor.clone(),
+                    profile: activation.profile.clone(),
+                },
+                AuditKind::activation(&opening.case),
+            );
             self.committed.borrow_mut().insert(key, content);
             Ok(StateApplied::Applied)
         }
@@ -2592,12 +3102,55 @@ mod tests {
                     binding.revoked = true;
                 }
             }
+            let seq = self.next_ledger_seq();
+            self.append_audit(
+                seq,
+                AuditInitiator::OperatorChannel,
+                AuditOperation::Operation(operation.clone()),
+                AuditSubject::ActorProfile {
+                    actor: actor.clone(),
+                    profile: profile.clone(),
+                },
+                AuditKind::ProfileDeactivated,
+            );
             self.committed.borrow_mut().insert(key, content);
             Ok(StateApplied::Applied)
         }
 
         fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError> {
-            self.commit_signal(draft)
+            if matches!(draft.body, SignalBody::Report { .. }) {
+                return Err(StateError::IncoherentBundle);
+            }
+            if self
+                .stored_signals
+                .borrow()
+                .iter()
+                .any(|signal| signal.id == draft.id)
+            {
+                return self.commit_signal(draft);
+            }
+            crate::signal::validate_subject(&draft.body, &draft.subject)
+                .map_err(|_| StateError::IncoherentBundle)?;
+            if let SignalBody::Directive { attempt, .. } = &draft.body
+                && self
+                    .attempt_states
+                    .borrow()
+                    .get(attempt.as_str())
+                    .is_none_or(|state| *state != AttemptState::Active)
+            {
+                return Err(StateError::IncoherentBundle);
+            }
+            let (signal, applied) = self.commit_signal(draft)?;
+            if applied == StateApplied::Applied {
+                self.append_audit(
+                    signal.seq,
+                    AuditInitiator::Authority(draft.sender.clone()),
+                    AuditOperation::Signal(signal.id.clone()),
+                    AuditSubject::Workflow(draft.subject.clone()),
+                    AuditKind::signal(&signal),
+                );
+            }
+            Ok((signal, applied))
         }
 
         fn fenced_report(
@@ -2621,8 +3174,6 @@ mod tests {
                     .ok_or(StateError::Corrupt)?;
                 return Ok((outcome, response));
             }
-            self.fence(call)?;
-            self.validate_response_target(action)?;
             // A durable record id belongs to exactly one operation.
             if let Some(owner) = self
                 .record_owners
@@ -2632,6 +3183,8 @@ mod tests {
             {
                 return Err(StateError::ConflictingOperation);
             }
+            self.active_fence(call)?;
+            self.validate_response_target(action)?;
             // The draft must describe THIS call: same Attempt subject,
             // same sending actor (R5.24).
             let subject_ok = matches!(
@@ -2661,6 +3214,13 @@ mod tests {
                     StateApplied::Applied,
                 );
                 let head = self.commit_fenced_call(Some(action), false);
+                self.append_audit(
+                    head,
+                    self.worker_initiator(call),
+                    AuditOperation::Operation(call.operation.clone()),
+                    AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+                    AuditKind::report(&outcome),
+                );
                 return Ok((
                     outcome,
                     self.respond(&call.attempt, StateApplied::Applied, head),
@@ -2680,6 +3240,13 @@ mod tests {
                 .insert(call.operation.as_str().to_owned(), outcome.clone());
             let head = self.commit_fenced_call(Some(action), true);
             self.remember("fenced_report", &call.operation, &request, applied);
+            self.append_audit(
+                head,
+                self.worker_initiator(call),
+                AuditOperation::Operation(call.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+                AuditKind::report(&outcome),
+            );
             Ok((outcome, self.respond(&call.attempt, applied, head)))
         }
 
@@ -2704,7 +3271,7 @@ mod tests {
                     .ok_or(StateError::Corrupt)?;
                 return Ok((outcome, response));
             }
-            self.fence(call)?;
+            self.active_fence(call)?;
             self.validate_response_target(action)?;
 
             let outcome = {
@@ -2734,6 +3301,13 @@ mod tests {
                 &request,
                 StateApplied::Applied,
             );
+            self.append_audit(
+                head,
+                self.worker_initiator(call),
+                AuditOperation::Operation(call.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+                AuditKind::evidence(outcome),
+            );
             Ok((
                 outcome,
                 self.respond(&call.attempt, StateApplied::Applied, head),
@@ -2761,8 +3335,6 @@ mod tests {
                     .ok_or(StateError::Corrupt)?;
                 return Ok((stored, response));
             }
-            self.fence(call)?;
-            self.validate_response_target(action)?;
             if let Some(owner) = self
                 .record_owners
                 .borrow()
@@ -2771,6 +3343,8 @@ mod tests {
             {
                 return Err(StateError::ConflictingOperation);
             }
+            self.active_fence(call)?;
+            self.validate_response_target(action)?;
             if handoff.attempt != call.attempt {
                 return Err(StateError::IncoherentBundle);
             }
@@ -2817,6 +3391,9 @@ mod tests {
                     format!("handoff:{}", handoff.id.as_str()),
                     call.operation.as_str().to_owned(),
                 );
+                self.attempt_states
+                    .borrow_mut()
+                    .insert(call.attempt.as_str().to_owned(), AttemptState::Submitted);
             }
             self.submissions
                 .borrow_mut()
@@ -2828,10 +3405,78 @@ mod tests {
                 StateApplied::Applied,
             );
             let head = self.commit_fenced_call(Some(action), substantive);
+            self.append_audit(
+                head,
+                self.worker_initiator(call),
+                AuditOperation::Operation(call.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+                AuditKind::handoff(&outcome),
+            );
             Ok((
                 outcome,
                 self.respond(&call.attempt, StateApplied::Applied, head),
             ))
+        }
+
+        fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError> {
+            let request = Self::call_identity(call);
+            if let Some(response) = self.replay_fenced_response(
+                "fenced_abort_attempt",
+                &call.operation,
+                &request,
+                &call.attempt,
+            )? {
+                return Ok(response);
+            }
+            self.active_fence(call)?;
+            let binding_has_abort = {
+                let signals = self.stored_signals.borrow();
+                let actions = self.response_actions.borrow();
+                let binding = binding_directives(&call.attempt, &signals, &actions);
+                worker_append_gate(&binding) == Err(DirectiveGateRefusal::AbortInForce)
+            };
+            if !binding_has_abort {
+                return Err(StateError::AbortNotInForce);
+            }
+
+            let head = self.next_ledger_seq();
+            let next = crate::lifecycle::attempt_transition(
+                AttemptState::Active,
+                crate::lifecycle::AttemptAction::Abort,
+                false,
+            )
+            .expect("active Abort transition is a core invariant");
+            self.attempt_states
+                .borrow_mut()
+                .insert(call.attempt.as_str().to_owned(), next);
+            if let Some(binding) = self
+                .launch_credentials
+                .borrow_mut()
+                .get_mut(&format!("attempt:{}", call.attempt.as_str()))
+            {
+                binding.revoked = true;
+            }
+            self.response_actions.borrow_mut().push(ResponseAction {
+                seq: head,
+                kind: ResponseKind::TerminalAttemptAction {
+                    attempt: call.attempt.clone(),
+                    abort_consistent: true,
+                },
+            });
+            self.append_audit(
+                head,
+                self.worker_initiator(call),
+                AuditOperation::Operation(call.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+                AuditKind::AttemptAborted,
+            );
+            self.remember(
+                "fenced_abort_attempt",
+                &call.operation,
+                &request,
+                StateApplied::Applied,
+            );
+            Ok(self.respond(&call.attempt, StateApplied::Applied, head))
         }
 
         fn renew_lease(
@@ -2870,6 +3515,13 @@ mod tests {
                 StateApplied::Applied,
             );
             let head = self.commit_fenced_call(None, false);
+            self.append_audit(
+                head,
+                self.worker_initiator(call),
+                AuditOperation::Operation(call.operation.clone()),
+                AuditSubject::Workflow(SubjectRef::Attempt(call.attempt.clone())),
+                AuditKind::LeaseRenewed,
+            );
             Ok((
                 Lease {
                     token: call.token,
@@ -2896,12 +3548,21 @@ mod tests {
             {
                 return Err(StateError::ConflictingOperation);
             }
+            let authorizing = self.launch_authorizing(subject)?;
             self.envelopes.borrow_mut().insert(key, envelope.clone());
             self.remember(
                 "persist_envelope",
                 operation,
                 &request,
                 StateApplied::Applied,
+            );
+            let seq = self.next_ledger_seq();
+            self.append_audit(
+                seq,
+                AuditInitiator::SystemProjection { authorizing },
+                AuditOperation::Operation(operation.clone()),
+                AuditSubject::Launch(subject.clone()),
+                AuditKind::EnvelopePersisted,
             );
             Ok(StateApplied::Applied)
         }
@@ -2934,8 +3595,17 @@ mod tests {
             {
                 return Err(StateError::ConflictingOperation);
             }
+            let authorizing = self.launch_authorizing(subject)?;
             self.handles.borrow_mut().insert(key, handle.clone());
             self.remember("bind", operation, &request, StateApplied::Applied);
+            let seq = self.next_ledger_seq();
+            self.append_audit(
+                seq,
+                AuditInitiator::SystemProjection { authorizing },
+                AuditOperation::Operation(operation.clone()),
+                AuditSubject::Launch(subject.clone()),
+                AuditKind::RuntimeHandleBound,
+            );
             Ok(StateApplied::Applied)
         }
 
@@ -2950,8 +3620,17 @@ mod tests {
             if let Some(stored) = self.replay("unbind", operation, &request)? {
                 return Ok(stored);
             }
+            let authorizing = self.launch_authorizing(subject)?;
             self.handles.borrow_mut().remove(&key);
             self.remember("unbind", operation, &request, StateApplied::Applied);
+            let seq = self.next_ledger_seq();
+            self.append_audit(
+                seq,
+                AuditInitiator::SystemProjection { authorizing },
+                AuditOperation::Operation(operation.clone()),
+                AuditSubject::Launch(subject.clone()),
+                AuditKind::RuntimeHandleUnbound,
+            );
             Ok(StateApplied::Applied)
         }
 
@@ -2965,6 +3644,47 @@ mod tests {
                 .borrow()
                 .get(&Self::association_key(subject))
                 .cloned())
+        }
+
+        fn record_runtime_observation(
+            &self,
+            operation: &OperationId,
+            record: &RuntimeObservationRecord,
+        ) -> Result<StateApplied, StateError> {
+            self.resolve_subject(&record.subject)?;
+            let request = format!("{record:?}");
+            if let Some(stored) = self.replay("runtime_observation", operation, &request)? {
+                return Ok(stored);
+            }
+            let seq = self.next_ledger_seq();
+            self.runtime_observations
+                .borrow_mut()
+                .insert(operation.as_str().to_owned(), record.clone());
+            self.append_audit(
+                seq,
+                AuditInitiator::Authority(record.reporter.clone()),
+                AuditOperation::Operation(operation.clone()),
+                AuditSubject::Launch(record.subject.clone()),
+                AuditKind::RuntimeObservationRecorded,
+            );
+            self.remember(
+                "runtime_observation",
+                operation,
+                &request,
+                StateApplied::Applied,
+            );
+            Ok(StateApplied::Applied)
+        }
+
+        fn runtime_observation(
+            &self,
+            operation: &OperationId,
+        ) -> Result<RuntimeObservationRecord, StateError> {
+            self.runtime_observations
+                .borrow()
+                .get(operation.as_str())
+                .cloned()
+                .ok_or(StateError::UnknownRecord)
         }
 
         fn record_application_attempt(
@@ -2989,6 +3709,16 @@ mod tests {
                     .entry(attempt.target.as_str().to_owned())
                     .or_default()
                     .push((attempt.id.clone(), attempt.outcome.clone()));
+                let seq = self.next_ledger_seq();
+                self.append_audit(
+                    seq,
+                    AuditInitiator::SystemProjection {
+                        authorizing: attempt.target.clone(),
+                    },
+                    AuditOperation::Operation(attempt.id.clone()),
+                    AuditSubject::Projection(attempt.target.clone()),
+                    AuditKind::application(&attempt.outcome),
+                );
             }
             Ok(applied)
         }
@@ -3033,6 +3763,16 @@ mod tests {
                 self.receipts
                     .borrow_mut()
                     .push(receipt.target.as_str().to_owned());
+                let seq = self.next_ledger_seq();
+                self.append_audit(
+                    seq,
+                    AuditInitiator::SystemProjection {
+                        authorizing: receipt.target.clone(),
+                    },
+                    AuditOperation::Operation(receipt.target.clone()),
+                    AuditSubject::Projection(receipt.target.clone()),
+                    AuditKind::ApplicationReceiptRecorded,
+                );
             }
             Ok(applied)
         }
@@ -3138,6 +3878,24 @@ mod tests {
         ) -> Result<Vec<Signal>, StateError> {
             Ok(Vec::new())
         }
+
+        fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError> {
+            Ok(self
+                .audit_events
+                .borrow()
+                .values()
+                .filter(|event| {
+                    query
+                        .subject
+                        .as_ref()
+                        .is_none_or(|subject| &event.subject == subject)
+                        && query.class.is_none_or(|class| event.kind.class() == class)
+                        && query.from.is_none_or(|from| event.seq >= from)
+                        && query.through.is_none_or(|through| event.seq <= through)
+                })
+                .cloned()
+                .collect())
+        }
     }
 
     fn fake_state() -> FakeState {
@@ -3145,6 +3903,7 @@ mod tests {
             committed: RefCell::new(BTreeMap::new()),
             current_token: RefCell::new(FencingToken(3)),
             bound_worker: ActorId::new("worker-1").unwrap(),
+            bound_worker_snapshot: worker_snapshot(),
             bound_assignment: AssignmentId::new("asg-1").unwrap(),
             bound_attempt: AttemptId::new("att-1").unwrap(),
             lease_expires_at: RefCell::new(Timestamp(100)),
@@ -3165,11 +3924,16 @@ mod tests {
             record_owners: RefCell::new(BTreeMap::new()),
             projections: RefCell::new(BTreeMap::new()),
             assignments: RefCell::new(BTreeMap::new()),
-            next_commit: RefCell::new(0),
             application_attempts: RefCell::new(BTreeMap::new()),
             active_members: RefCell::new(BTreeMap::new()),
             handoffs: RefCell::new(Vec::new()),
             actor_classes: RefCell::new(BTreeMap::new()),
+            attempt_states: RefCell::new(BTreeMap::from([(
+                "att-1".to_owned(),
+                AttemptState::Active,
+            )])),
+            audit_events: RefCell::new(BTreeMap::new()),
+            runtime_observations: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -3188,6 +3952,15 @@ mod tests {
             call: good_call(operation),
             responds_to: None,
         }
+    }
+
+    fn worker_action_count(state: &FakeState) -> usize {
+        state
+            .response_actions
+            .borrow()
+            .iter()
+            .filter(|action| matches!(&action.kind, ResponseKind::WorkerAction { .. }))
+            .count()
     }
 
     fn worker_authority(capability: &str) -> AuthoritySnapshot {
@@ -3344,7 +4117,13 @@ mod tests {
     fn scribe_allocates_signal_order_and_absorbs_retries() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
-        let draft = report_draft("sig-1");
+        let draft = directive_draft(
+            "sig-1",
+            "att-1",
+            DirectiveKind::Amend {
+                instruction: BoundedText::new("update the implementation").unwrap(),
+            },
+        );
         let (first, applied) = port.append_signal(&draft).unwrap();
         assert_eq!(applied, StateApplied::Applied);
         assert_eq!(first.seq, Seq(1));
@@ -3352,9 +4131,10 @@ mod tests {
         assert_eq!(retry, StateApplied::AlreadyApplied);
         assert_eq!(again, first);
         let mut altered = draft.clone();
-        altered.body = SignalBody::Report {
+        altered.body = SignalBody::Directive {
+            assignment: AssignmentId::new("asg-1").unwrap(),
             attempt: AttemptId::new("att-1").unwrap(),
-            kind: ReportKind::BlockedWithReason {
+            kind: DirectiveKind::Pause {
                 reason: BoundedText::new("blocked on dependency").unwrap(),
             },
         };
@@ -4579,6 +5359,34 @@ mod tests {
             resolves: None,
         };
         assert_eq!(port.record_decision(&revoke), Ok(StateApplied::Applied));
+        let decision_events = port
+            .audit_events(&AuditQuery {
+                class: Some(AuditClass::Decision),
+                ..AuditQuery::default()
+            })
+            .unwrap();
+        assert_eq!(decision_events.len(), 1);
+        assert_eq!(
+            decision_events[0].subject,
+            AuditSubject::Workflow(SubjectRef::Attempt(AttemptId::new("att-1").unwrap()))
+        );
+        assert_eq!(
+            *state.response_actions.borrow(),
+            vec![
+                ResponseAction {
+                    seq: decision_events[0].seq,
+                    kind: ResponseKind::FencedDecision { responds_to: None },
+                },
+                ResponseAction {
+                    seq: decision_events[0].seq,
+                    kind: ResponseKind::TerminalAttemptAction {
+                        attempt: AttemptId::new("att-1").unwrap(),
+                        abort_consistent: true,
+                    },
+                },
+            ],
+            "a decision terminal and its audit share one causal position"
+        );
         assert_eq!(
             port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
             Err(StateError::CredentialRevoked)
@@ -5279,7 +6087,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dir-current-1"]
         );
-        let action_count = state.response_actions.borrow().len();
+        let action_count = worker_action_count(&state);
 
         // Replaying after another Directive commits allocates no new
         // action position, but still returns the current causal view.
@@ -5294,7 +6102,7 @@ mod tests {
         let (replay_outcome, replay) = port.fenced_evidence(&evidence_action, &evidence).unwrap();
         assert_eq!(replay_outcome, EvidenceOutcome::Recorded);
         assert_eq!(replay.applied, StateApplied::AlreadyApplied);
-        assert_eq!(state.response_actions.borrow().len(), action_count);
+        assert_eq!(worker_action_count(&state), action_count);
         assert_eq!(replay.head, state.current_head());
         assert_eq!(
             replay
@@ -5361,7 +6169,7 @@ mod tests {
                 .iter()
                 .all(|signal| signal.id != report.id)
         );
-        assert!(state.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&state), 0);
 
         let evidence_action = good_action("op-abort-evidence");
         let evidence = passing_evidence();
@@ -5377,7 +6185,7 @@ mod tests {
         assert_eq!(evidence_response.head, Seq(3));
         assert_eq!(evidence_response.binding_directives[0].id, abort_id);
         assert!(state.evidence_records.borrow().is_empty());
-        assert!(state.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&state), 0);
 
         // A newer Directive makes the causal envelope newer without
         // changing either stored refusal or allocating a replay call.
@@ -5422,7 +6230,7 @@ mod tests {
         assert_eq!(state.current_head(), head);
         assert_eq!(state.stored_signals.borrow().len(), signal_count);
         assert!(state.evidence_records.borrow().is_empty());
-        assert!(state.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&state), 0);
 
         // The response link participates in identity even when the
         // operation owns a refusal rather than a recorded payload.
@@ -5435,6 +6243,72 @@ mod tests {
             Err(StateError::ConflictingOperation)
         );
         assert_eq!(state.current_head(), head);
+    }
+
+    #[test]
+    fn explicit_abort_terminal_is_causal_idempotent_and_audited() {
+        let state = fake_state();
+        let port: &dyn WorkflowStatePort = &state;
+        let call = good_call("op-explicit-abort");
+        assert_eq!(
+            port.fenced_abort_attempt(&call),
+            Err(StateError::AbortNotInForce)
+        );
+        assert!(
+            port.audit_events(&AuditQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        port.append_signal(&directive_draft(
+            "dir-explicit-abort",
+            "att-1",
+            DirectiveKind::Abort {
+                reason: BoundedText::new("stop this attempt").unwrap(),
+            },
+        ))
+        .unwrap();
+        let response = port.fenced_abort_attempt(&call).unwrap();
+        assert_eq!(response.applied, StateApplied::Applied);
+        assert!(response.binding_directives.is_empty());
+        assert_eq!(
+            state.attempt_states.borrow().get("att-1"),
+            Some(&AttemptState::Aborted)
+        );
+        let events = port
+            .audit_events(&AuditQuery {
+                class: Some(AuditClass::Attempt),
+                ..AuditQuery::default()
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, response.head);
+        assert_eq!(events[0].kind, AuditKind::AttemptAborted);
+        assert_eq!(
+            events[0].initiator,
+            AuditInitiator::WorkerBinding {
+                actor: worker_snapshot(),
+                assignment: AssignmentId::new("asg-1").unwrap(),
+                attempt: AttemptId::new("att-1").unwrap(),
+            }
+        );
+
+        let all_events = port.audit_events(&AuditQuery::default()).unwrap();
+        let replay = port.fenced_abort_attempt(&call).unwrap();
+        assert_eq!(replay.applied, StateApplied::AlreadyApplied);
+        assert_eq!(replay.head, response.head);
+        assert_eq!(
+            port.audit_events(&AuditQuery::default()).unwrap(),
+            all_events
+        );
+        let changed = FencedCall {
+            token: FencingToken(99),
+            ..call
+        };
+        assert_eq!(
+            port.fenced_abort_attempt(&changed),
+            Err(StateError::ConflictingOperation)
+        );
     }
 
     #[test]
@@ -5456,7 +6330,7 @@ mod tests {
         assert_eq!(lease.expires_at, Timestamp(150));
         assert_eq!(renewal.applied, StateApplied::Applied);
         assert_eq!(renewal.binding_directives[0].id.as_str(), "dir-renew-abort");
-        assert!(aborted.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&aborted), 0);
 
         let active = fake_state();
         let active_port: &dyn WorkflowStatePort = &active;
@@ -5494,7 +6368,7 @@ mod tests {
         assert_eq!(evidence_outcome, EvidenceOutcome::Recorded);
         assert_eq!(evidence_response.binding_directives.len(), 2);
         assert_eq!(active.evidence_records.borrow().len(), 1);
-        assert_eq!(active.response_actions.borrow().len(), 2);
+        assert_eq!(worker_action_count(&active), 2);
     }
 
     #[test]
@@ -5547,7 +6421,7 @@ mod tests {
             }
         );
         assert_eq!(response.head, Seq(head_before.0 + 1));
-        assert!(state.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&state), 0);
     }
 
     #[test]
@@ -5687,6 +6561,10 @@ mod tests {
         );
 
         let foreign_state = fake_state();
+        foreign_state
+            .attempt_states
+            .borrow_mut()
+            .insert("att-other".to_owned(), AttemptState::Active);
         let foreign_port: &dyn WorkflowStatePort = &foreign_state;
         foreign_port
             .append_signal(&directive_draft(
@@ -5706,7 +6584,7 @@ mod tests {
             Err(StateError::IncoherentBundle)
         );
         assert_eq!(foreign_state.current_head(), Seq(1));
-        assert!(foreign_state.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&foreign_state), 0);
     }
 
     #[test]
@@ -5772,7 +6650,7 @@ mod tests {
             refused_response.binding_directives[0].id.as_str(),
             "dir-handoff"
         );
-        assert!(state.response_actions.borrow().is_empty());
+        assert_eq!(worker_action_count(&state), 0);
 
         let linked = FencedAction {
             call: good_call("op-handoff-linked"),
@@ -5786,7 +6664,7 @@ mod tests {
             }
         );
         assert!(response.binding_directives.is_empty());
-        assert_eq!(state.response_actions.borrow().len(), 1);
+        assert_eq!(worker_action_count(&state), 1);
     }
 
     /// R5.28: the idempotency record binds FULL call identity, durable

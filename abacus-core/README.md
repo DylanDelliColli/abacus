@@ -1,6 +1,7 @@
 # `abacus-core` module contract
 
-Status: design contract; no Rust implementation yet
+Status: Rust domain rules and provider-neutral ports implemented; persistence and
+transport implementations continue by migration phase.
 
 ## Purpose
 
@@ -61,6 +62,7 @@ Capabilities use validated namespaced IDs. Each owning module declares descripto
 - Submit an immutable Request to another in-scope actor and resolve it only with the linked fenced decision.
 - Validate every Signal's typed subject and derive its resolution from immutable responding actions.
 - Evaluate the current binding Directive set on every fenced worker interaction.
+- End the current Attempt through the explicit fenced worker Abort-compliance action when a binding Abort exists.
 - Submit a handoff from the current attempt.
 - Accept or reject a handoff through the explicitly authorized decision actor.
 
@@ -98,7 +100,13 @@ Core refuses consequential actions that conflict with the effective Directive se
 
 For Report and Evidence, a binding Abort produces a concrete in-band `Refused { AbortInForce }` outcome paired with the normal `FencedResponse`; it is not an outer `StateError`. The audited refusal owns its operation and advances call ordering, but records no Report/Evidence and no responding `WorkerAction`, so malformed or refused work cannot discharge a Directive. Exact replay returns the refusal without duplication and with the causally current response envelope. Validation/authority failures remain outer errors, claim no operation, and take precedence over the Abort gate.
 
-Pause and Amend do not block honest Report or Evidence appends; only Abort does. Lease renewal also remains allowed after Abort because it is lease machinery and its response is a mechanical Directive-discovery path, not a substantive response. Handoff retains the stricter all-kinds gate. The explicit abort-consistent terminal worker operation is deferred to `abacus-9nh.10`; none of the existing four fenced methods is silently classified as that terminal action.
+Pause and Amend do not block honest Report or Evidence appends; only Abort does. Lease renewal also remains allowed after Abort because it is lease machinery and its response is a mechanical Directive-discovery path, not a substantive response. Handoff retains the stricter all-kinds gate. `fenced_abort_attempt` is the sole worker Abort-compliance carrier: a bare `FencedCall` under a live lease moves the active Attempt to the distinct ended `Aborted` state, revokes its credential, records an abort-consistent terminal action, and returns post-commit Directives. With no binding Abort it returns `AbortNotInForce` and claims nothing; exact replay precedes all validation. Directives may target only an active Attempt. Decision-driven Attempt terminals record the same abort-consistent terminal-action fact at the decision's `Seq`, so historical Abort and Pause discharge stays coherent regardless of who ended the Attempt; Amend remains historically undischargeable but operationally inert after the Attempt ends.
+
+### Audit lineage
+
+The state port exposes a typed audit index, not an event-sourced alternate state model. Every first-time durable mutation has exactly one `AuditEvent` at the transaction's final `Seq`; a recorded fenced Report may first allocate its Signal position, but only the final call position owns the event. Replay adds none, and an outer validation/authority refusal commits nothing. Events carry only a closed kind, typed subject, honest idempotency identity, commit time, and the strongest structurally proven initiator: full authority, recovered worker binding, operator channel, or a system projection joined to a committed authorizing operation. Owning record bodies remain separately joinable.
+
+Audit queries AND-compose typed subject, event class, and inclusive sequence bounds in Ledger order, with no free-text predicate. Actor-reported `RuntimeObservationRecord` values are immutable audit-only facts; their normalized liveness observation never becomes current authority or a completion signal.
 
 No `read_at` columns, per-Directive acknowledgement rows/state, client-asserted “seen head,” mutable inbox, delivery retry, or escalation-on-silence exists. Per-recipient and global unresolved sets are derived from immutable Signals lacking their typed linked responding actions. Lost-response and concurrent-call behavior uses normal idempotency, fencing, and causal protocol ordering; a call cannot leapfrog the response that surfaced a binding Directive.
 
@@ -170,6 +178,8 @@ These are not a generic plugin framework. A port exists only for behavior a core
 17. Acceptance fails if the authoritative bead content no longer matches the Assignment's bound hash, the commit diff escapes edit scope, or verification changed the workspace without an allowed and accounted-for result.
 18. Signal exposure and discharge are derived from immutable call ordering and linked responding actions, never from delivery metadata, opening, acknowledgement, or a timer. Only substantive fenced worker actions can carry a Directive response link; lease renewal cannot.
 19. A required red-green pair is selected by the bead-content-hash-bound Assignment and derives from ordinary, honestly recorded Evidence: assertion-level red against the declared-base implementation using digest-bound verification overlays, and green at the Handoff commit; workers cannot opt into or out of it.
+20. A Directive may target only an active Attempt; `Aborted` is a distinct ended state eligible only for explicit decision-authorized retry.
+21. Every first-time durable mutation owns exactly one typed audit event at its transaction's final Ledger position; replay and outer refusal own none.
 
 ## Dependency rule
 
@@ -200,6 +210,7 @@ All default tests are pure and deterministic:
 - submission-refusal versus Handoff-Rejection lifecycle tests;
 - Signal subject/sender fencing, closed-kind validation, per-recipient/global linked-resolution queries, and proof that no read/ack state exists;
 - Directive binding-from-commit, authorization, mechanical response surfacing, causal-call ordering, lost-response/idempotency, pause/amend/abort transition gates, and responding-action discharge tests;
+- explicit `Aborted` lifecycle, decision-driven terminal-action causality, and seam-local typed audit-identity tests;
 - Acceptance decision/application-attempt/application-receipt ordering and crash-window tests;
 - bead-hash, edit-scope, before/after-workspace-digest, and evidence-policy tests with fake commit verification;
 - red-green pairing tests for matching command sets, missing red, wrong-commit red, passing “red,” green-only submission, `execution-error` rejected as red, overlay-digest mismatch rejected as `red-stale`, matching overlay digests accepted, paths outside the policy verification set rejected, and honest outcome interpretation;

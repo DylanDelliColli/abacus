@@ -349,10 +349,12 @@ Required behavior:
 - append actor-to-actor Requests and validate their responding fenced-decision links;
 - query per-actor and global unresolved sets derived from immutable Signals lacking their typed responding actions;
 - preserve immutable per-Attempt fenced call/response ordering from which Directive exposure and discharge are derived;
+- terminate an active Attempt through the bare fenced Abort-compliance call only when a binding Abort exists, producing the distinct `Aborted` state and a post-commit Directive envelope;
 - append and inspect ordinary Evidence records and query them by Assignment/Attempt, normalized verification set, commit binding, closed normalized outcome, and optional overlay path/digest metadata;
 - submit and decide handoffs;
 - record immutable work-status application attempts/receipts and derive decisions lacking a successful receipt;
-- append/query audit events;
+- append one typed audit event at every first-time transaction's final ordering position and query it by typed subject, class, and sequence range;
+- record immutable actor-reported runtime observations as audit-only facts;
 - process idempotent requests.
 
 ### Runtime interface
@@ -427,7 +429,7 @@ The worker does not receive direct database credentials or raw provider mutation
 6. A Report is resolved only by a linked responding Directive or fenced decision. A Request is resolved only by its linked responding fenced decision. Directive discharge follows its closed kind and a later substantive responding workflow action. Report, Evidence, and Handoff calls may name the committed same-Attempt Directive they substantively answer; lease renewal cannot carry that link. Opening, prompting, renewal, or an acknowledgement-only record resolves nothing. `abacus signal unresolved` derives the remaining per-actor/global set.
 7. Only after Scribe commits a Signal does the facade ask Herdr to carry a best-effort, content-free doorbell such as “workflow signal available; query unresolved.” A Signal body never rides the prompt. Doorbell failure never rolls back the Signal and creates no retry queue.
 8. A Directive binds from commit. Exposure and discharge are derived from immutable call ordering and responding actions: a Directive committed before the worker's latest fenced call was, by construction of step 2, surfaced in that call's response. No `read_at` columns, per-Directive acknowledgement state, or client-asserted seen-head exists.
-9. Scribe/core refuses consequential actions that conflict with the current binding set. Handoff under an undischarged pause or amend Directive receives a distinct ordinary Submission refusal, records no Handoff, and leaves the Attempt active. After abort, Report and Evidence appends return audited in-band refusals with the current Directive envelope and record no payload or responding action. Renewal remains allowed as lease/discovery machinery. The abort-consistent terminal worker operation is named and implemented in the transactional-lifecycle slice (`abacus-9nh.10`), never inferred from one of these existing calls.
+9. Scribe/core refuses consequential actions that conflict with the current binding set. Handoff under an undischarged pause or amend Directive receives a distinct ordinary Submission refusal, records no Handoff, and leaves the Attempt active. After abort, Report and Evidence appends return audited in-band refusals with the current Directive envelope and record no payload or responding action. Renewal remains allowed as lease/discovery machinery. The worker complies through `fenced_abort_attempt`, a bare live-lease call that requires the binding Abort, records the distinct terminal `Aborted` state plus an abort-consistent terminal action, revokes the credential, and returns post-commit Directives. With no Abort it claims nothing; it is never inferred from Report, Evidence, Handoff, or renewal.
 10. The state client is idempotent and causally ordered so lost responses or concurrent calls cannot leapfrog the response that first surfaced a Directive. Role-card synchronization guidance affects only latency; no hook, prompt, or prose instruction is load-bearing.
 11. Herdr remains available for transient agent-to-agent conversation, but transient chat is not evidence or authority. Actual Directive compliance and Request/Report resolution are evaluated from linked durable state.
 12. Lease renewal includes the current fencing token. A stale token is rejected even if the old runtime is still alive.
@@ -665,7 +667,7 @@ Avoid giant golden snapshots. Fixtures represent upstream contracts and should b
 
 ## Observability
 
-Structured audit events answer who requested what, against which bead/assignment/attempt, with which idempotency key and fencing token, and what durable result occurred.
+Structured audit events are the typed who/when/what-class index over durable state, not another source of truth. Each first-time mutation contributes one event at its transaction's final Ledger position; event identities join to the owning record for payloads such as the fenced call and token. Replay contributes none. The closed initiator records only what the call proves—full authority, recovered worker binding, operator channel, or validated system projection—and filtered queries AND-compose typed subject, class, and sequence range without free text.
 
 Logs are diagnostic and may be rotated. Logs are never the only record of a state transition. Provider stdout/stderr is bounded, redacted where necessary, and linked to—not substituted for—normalized results.
 
