@@ -17,6 +17,7 @@ pub mod evidence;
 pub mod id;
 pub mod lease;
 pub mod lifecycle;
+pub mod ports;
 pub mod signal;
 
 pub use assignment::{
