@@ -12,7 +12,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
 use abacus_core::ports::{
-    AdviceDegradation, BeadSnapshot, BeadStatusView, Priority, WorkError, WorkRevision, WorkStatus,
+    AdviceDegradation, BeadSnapshot, BeadStatusView, Eligibility, Priority, WorkError,
+    WorkRevision, WorkStatus,
 };
 use abacus_core::{BeadId, ContentHash, OperationId, ScopeMap};
 
@@ -124,6 +125,7 @@ impl FakeWorkProvider {
             BeadStatusView {
                 snapshot: snapshot(id, tick, 2),
                 status,
+                eligibility: Eligibility::Eligible,
                 revision: rev(tick),
             },
         );
@@ -156,7 +158,10 @@ impl FakeWorkProvider {
     /// adapter provides its own equivalent over checked-in fixtures, and
     /// both then satisfy the same suite.
     pub fn from_scenario(scenario: &Scenario) -> Self {
-        let provider = Self::with_bead(&scenario.bead, scenario.status, scenario.tick);
+        let mut provider = Self::with_bead(&scenario.bead, scenario.status, scenario.tick);
+        if matches!(scenario.eligibility, Eligibility::Parked) {
+            provider = provider.parked(&scenario.bead);
+        }
         match &scenario.behavior {
             Behavior::Normal => provider,
             Behavior::AmbiguousApplied => provider.scripted(Script::new().ambiguous_applied()),
@@ -172,6 +177,15 @@ impl FakeWorkProvider {
 
     pub fn failing_ready(self, error: WorkError) -> Self {
         self.inner.borrow_mut().ready_error = Some(error);
+        self
+    }
+
+    /// Park the bead: still open work, deliberately excluded from
+    /// dispatch. Lets a test drive the implicit-undefer refusal.
+    pub fn parked(self, id: &BeadId) -> Self {
+        if let Some(view) = self.inner.borrow_mut().beads.get_mut(id.as_str()) {
+            view.eligibility = Eligibility::Parked;
+        }
         self
     }
 
@@ -277,6 +291,7 @@ impl WorkProvider for FakeWorkProvider {
                 priority: view.snapshot.priority.value(),
             },
             status: view.status,
+            eligibility: view.eligibility,
             revision: view.revision,
         })
     }

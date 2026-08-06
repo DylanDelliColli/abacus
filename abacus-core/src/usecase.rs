@@ -1760,6 +1760,7 @@ mod tests {
         .with_view(Ok(BeadStatusView {
             snapshot: snapshot("ABACUS-usecase.1", 1),
             status: WorkStatus::InProgress,
+            eligibility: crate::ports::Eligibility::Eligible,
             revision: rev('5'),
         }));
 

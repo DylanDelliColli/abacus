@@ -11,7 +11,7 @@
 //! facade) instead of being re-derived by every provider adapter. An
 //! adapter reports what it observed; it does not decide what that means.
 
-use abacus_core::ports::{CloseReason, WorkError, WorkRevision, WorkStatus};
+use abacus_core::ports::{CloseReason, Eligibility, WorkError, WorkRevision, WorkStatus};
 use abacus_core::{BeadId, ContentHash, OperationId};
 
 /// Provider facts before ABACUS applies scope-label normalization.
@@ -30,6 +30,11 @@ pub struct RawBeadSnapshot {
 pub struct RawBeadStatusView {
     pub snapshot: RawBeadSnapshot,
     pub status: WorkStatus,
+    /// The provider's scheduling fact, preserved as its own axis. An
+    /// adapter that collapsed a parked bead into `Open` would erase a
+    /// deliberate operator decision and let a later projection undefer
+    /// it implicitly.
+    pub eligibility: Eligibility,
     pub revision: WorkRevision,
 }
 

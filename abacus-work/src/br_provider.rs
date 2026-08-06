@@ -18,6 +18,7 @@
 use std::cell::Cell;
 
 use abacus_core::ContentHash;
+use abacus_core::ports::Eligibility;
 use abacus_core::ports::WorkError;
 use abacus_core::ports::WorkStatus;
 use serde_json::Value;
@@ -142,20 +143,28 @@ where
         let revision = self.current_revision()?;
         let provider_id = to_provider(id);
         let (snapshot, provider_status) = self.show_facts(provider_id.as_str(), id)?;
-        let status = match provider_status {
+        // Deferral is provider SCHEDULING, not a lifecycle state, so it
+        // is preserved on its own axis rather than collapsed into
+        // `Open`. The earlier mapping erased it: `compare_observation`
+        // would then report a parked bead as Clean, and a later
+        // projection could drive it to in-progress — an implicit
+        // undefer nobody authorized (ABACUS-wsj).
+        let (status, eligibility) = match provider_status {
             // A deleted bead no longer exists as work; the typed
             // `Missing` anomaly is derived from this by the port.
             BrIssueStatus::Tombstone => return Err(WorkError::NotFound),
-            // Deferral is provider scheduling, not a distinct work
-            // status: a deferred bead is open work that `ready`
-            // excludes. Flagged for cross-review at the omw.2 gate.
-            BrIssueStatus::Deferred | BrIssueStatus::Open => WorkStatus::Open,
-            BrIssueStatus::InProgress => WorkStatus::InProgress,
-            BrIssueStatus::Closed(observed_reason) => WorkStatus::Closed { observed_reason },
+            BrIssueStatus::Deferred => (WorkStatus::Open, Eligibility::Parked),
+            BrIssueStatus::Open => (WorkStatus::Open, Eligibility::Eligible),
+            BrIssueStatus::InProgress => (WorkStatus::InProgress, Eligibility::Eligible),
+            BrIssueStatus::Closed(observed_reason) => (
+                WorkStatus::Closed { observed_reason },
+                Eligibility::Eligible,
+            ),
         };
         Ok(RawBeadStatusView {
             snapshot,
             status,
+            eligibility,
             revision,
         })
     }
@@ -181,13 +190,23 @@ where
         let mut snapshots = Vec::with_capacity(listed.len());
         for issue in &listed {
             let expected = from_provider(&issue.id).map_err(|_| WorkError::MalformedOutput)?;
-            let (snapshot, _) = match self.show_facts(&issue.id, &expected) {
+            let (snapshot, re_shown) = match self.show_facts(&issue.id, &expected) {
                 // Listed as ready moments ago, unknown now: the graph
                 // moved under the batch. Report the conflict; the
                 // caller re-reads a coherent generation.
                 Err(WorkError::NotFound) => return Err(WorkError::RevisionConflict),
                 other => other?,
             };
+            // The re-show's FRESH status must still be eligible-open.
+            // Discarding it would let provider drift or a race admit a
+            // deferred (or already in-progress, or closed) bead into a
+            // bracket the caller will treat as dispatchable — the
+            // closing-hash check alone does not catch a bead whose
+            // status changed without moving the graph hash. Fail
+            // closed; the caller re-reads a coherent generation.
+            if !matches!(re_shown, BrIssueStatus::Open) {
+                return Err(WorkError::RevisionConflict);
+            }
             snapshots.push(snapshot);
         }
         let closing = self.current_revision()?;
@@ -428,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_bead_reads_as_open_work() {
+    fn a_deferred_bead_reads_as_open_work_that_is_parked() {
         let deferred =
             "[{\"id\":\"abacus-x4\",\"status\":\"deferred\",\"priority\":3,\"labels\":[]}]";
         let p = provider(vec![
@@ -437,7 +456,60 @@ mod tests {
             (show_request("abacus-x4"), ok(deferred)),
         ]);
         let view = p.inspect_raw(&bead("x4")).expect("deferred bead inspects");
-        assert_eq!(view.status, WorkStatus::Open);
+        assert_eq!(
+            view.status,
+            WorkStatus::Open,
+            "deferral is not a lifecycle state: the bead is still open work"
+        );
+        assert_eq!(
+            view.eligibility,
+            Eligibility::Parked,
+            "and the scheduling fact SURVIVES - collapsing it into Open is \
+             what let a projection undefer it implicitly (ABACUS-wsj)"
+        );
+    }
+
+    #[test]
+    fn a_re_shown_bead_that_is_no_longer_eligible_fails_the_bracket_closed() {
+        // `ready` listed it moments ago; the re-show says deferred. The
+        // graph moved under the batch, and the closing-hash check does
+        // NOT catch it. Admitting the bead would put a parked item into
+        // a bracket the caller treats as dispatchable.
+        let listing = "[{\"id\":\"abacus-x9\",\"title\":\"t\",\"status\":\"open\",\"priority\":1}]";
+        let deferred =
+            "[{\"id\":\"abacus-x9\",\"status\":\"deferred\",\"priority\":1,\"labels\":[]}]";
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (ready_request(), ok(listing)),
+            (show_request("abacus-x9"), ok(deferred)),
+        ]);
+
+        assert_eq!(
+            p.ready_raw().map(|(_, snapshots)| snapshots.len()),
+            Err(WorkError::RevisionConflict),
+            "a re-shown item whose FRESH status is not eligible-open fails \
+             closed; the caller re-reads a coherent generation"
+        );
+    }
+
+    #[test]
+    fn a_re_shown_bead_that_is_already_in_progress_also_fails_closed() {
+        let listing = "[{\"id\":\"abacus-xa\",\"title\":\"t\",\"status\":\"open\",\"priority\":1}]";
+        let taken =
+            "[{\"id\":\"abacus-xa\",\"status\":\"in_progress\",\"priority\":1,\"labels\":[]}]";
+        let p = provider(vec![
+            version_step(),
+            sync_step(0),
+            (ready_request(), ok(listing)),
+            (show_request("abacus-xa"), ok(taken)),
+        ]);
+
+        assert_eq!(
+            p.ready_raw().map(|(_, snapshots)| snapshots.len()),
+            Err(WorkError::RevisionConflict),
+            "the same check covers a bead another actor claimed mid-batch"
+        );
     }
 
     #[test]

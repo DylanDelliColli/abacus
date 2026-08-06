@@ -90,12 +90,32 @@ pub enum WorkStatus {
     },
 }
 
+/// Whether a bead is currently offered for execution, as an axis
+/// ORTHOGONAL to the open/in-progress/closed lifecycle.
+///
+/// Deferral is a scheduling fact, not a lifecycle state: a parked bead
+/// is still open work. Collapsing it into `Open` would erase an
+/// operator's deliberate decision to park it, and a later projection
+/// could then flip it to in-progress — an implicit undefer nobody
+/// authorized (ADR-0002 §1 snapshot semantics; ABACUS-wsj).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Eligibility {
+    /// Offered for dispatch.
+    Eligible,
+    /// Deliberately parked: excluded from ready, and never driven into
+    /// execution by a projection.
+    Parked,
+}
+
 /// Read-before-write inspection view: normalized status/revision facts
 /// for ambiguity reconciliation and out-of-band correlation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeadStatusView {
     pub snapshot: BeadSnapshot,
     pub status: WorkStatus,
+    /// Preserved rather than collapsed into `status`: see
+    /// [`Eligibility`].
+    pub eligibility: Eligibility,
     pub revision: WorkRevision,
 }
 
@@ -182,6 +202,10 @@ pub enum WorkError {
     NotFound,
     /// The graph moved between bracketed reads; re-read.
     RevisionConflict,
+    /// The bead is parked and may not be driven into execution. Only an
+    /// explicit authoring un-defer makes it eligible again — a
+    /// projection must never do it implicitly (ABACUS-wsj).
+    BeadParked,
     /// Mutation outcome unknown: inspect before any retry.
     AmbiguousOutcome,
     /// Scope-label normalization refusals (ADR-0002 §1).
@@ -2054,6 +2078,7 @@ mod tests {
             Ok(BeadStatusView {
                 snapshot,
                 status,
+                eligibility: Eligibility::Eligible,
                 revision: self.revision.clone(),
             })
         }

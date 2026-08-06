@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use abacus_core::ContentHash;
-use abacus_core::ports::{ObservedCloseReason, WorkError, WorkStatus};
+use abacus_core::ports::{Eligibility, ObservedCloseReason, WorkError, WorkStatus};
 use abacus_work::br_process::{BrObservation, BrRequest, BrRunError, BrRunner};
 use abacus_work::br_provider::BrWorkProvider;
 use abacus_work::contract::{Behavior, Scenario, run_work_graph_suite};
@@ -68,6 +68,14 @@ fn structured_error(
 impl BrSimulator {
     fn from_scenario(scenario: &Scenario) -> Self {
         let (status, close_reason) = match scenario.status {
+            // A parked scenario materializes the way `br` actually
+            // expresses it: the issue is DEFERRED. The suite then
+            // asserts identical facade behavior for the fake's flag and
+            // the provider's real status, which is what makes the
+            // parked expectations portable rather than fake-shaped.
+            WorkStatus::Open if matches!(scenario.eligibility, Eligibility::Parked) => {
+                ("deferred".to_owned(), None)
+            }
             WorkStatus::Open => ("open".to_owned(), None),
             WorkStatus::InProgress => ("in_progress".to_owned(), None),
             WorkStatus::Closed { observed_reason } => (

@@ -13,8 +13,8 @@
 //! actually exists.
 
 use abacus_core::ports::{
-    CloseReason, ExpectedWorkObservation, MutationOutcome, ObservedCloseReason, WorkError,
-    WorkGraphPort, WorkObservation, WorkRevision, WorkStatus,
+    CloseReason, Eligibility, ExpectedWorkObservation, MutationOutcome, ObservedCloseReason,
+    WorkError, WorkGraphPort, WorkObservation, WorkRevision, WorkStatus,
 };
 use abacus_core::{BeadId, ContentHash, OperationId};
 
@@ -44,6 +44,11 @@ pub struct Scenario {
     pub bead: BeadId,
     /// Its status before the facade is exercised.
     pub status: WorkStatus,
+    /// Whether the bead is offered for dispatch. An implementation
+    /// materializes a parked scenario however its substrate expresses
+    /// deferral - `br` defers the issue, the fake sets the flag - and
+    /// the suite then asserts the same facade behavior for both.
+    pub eligibility: Eligibility,
     /// Seed for its starting revision; the suite reads the revision back
     /// rather than assuming a representation.
     pub tick: u32,
@@ -51,10 +56,17 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// A parked variant of this scenario.
+    pub fn parked(mut self) -> Self {
+        self.eligibility = Eligibility::Parked;
+        self
+    }
+
     pub fn new(bead: BeadId, status: WorkStatus, tick: u32, behavior: Behavior) -> Self {
         Self {
             bead,
             status,
+            eligibility: Eligibility::Eligible,
             tick,
             behavior,
         }
@@ -114,6 +126,86 @@ where
     bounds_the_audit_summary(&build, &bead);
     treats_a_closed_bead_as_terminal(&build, &bead);
     never_reopens_a_closed_bead(&build, &bead);
+    preserves_the_parked_fact(&build, &bead);
+    never_implicitly_undefers_a_parked_bead(&build, &bead);
+    closes_a_parked_bead_without_refusal(&build, &bead);
+}
+
+/// A parked bead's scheduling fact must SURVIVE normalization. Erasing
+/// it into `Open` is what let a projection silently undefer it, and it
+/// also made `compare_observation` report a parked bead as Clean
+/// (ABACUS-wsj).
+fn preserves_the_parked_fact<P: WorkProvider>(build: &impl Fn(&Scenario) -> P, bead: &BeadId) {
+    let facade = WorkFacade::new(build(
+        &Scenario::new(bead.clone(), WorkStatus::Open, 11, Behavior::Normal).parked(),
+    ));
+
+    let view = facade.inspect(bead).expect("a parked bead still inspects");
+    assert_eq!(
+        view.eligibility,
+        Eligibility::Parked,
+        "deferral is preserved as its own axis, never collapsed into status"
+    );
+    assert_eq!(
+        view.status,
+        WorkStatus::Open,
+        "a parked bead is still OPEN work - eligibility is orthogonal to \
+         the lifecycle, not a fourth lifecycle state"
+    );
+}
+
+/// The defect this bead exists to close: an execution projection must
+/// never drive a parked bead into progress. Only an explicit authoring
+/// un-defer may make it eligible again.
+fn never_implicitly_undefers_a_parked_bead<P: WorkProvider>(
+    build: &impl Fn(&Scenario) -> P,
+    bead: &BeadId,
+) {
+    let facade = WorkFacade::new(build(
+        &Scenario::new(bead.clone(), WorkStatus::Open, 12, Behavior::Normal).parked(),
+    ));
+    let expected = current_revision(&facade, bead);
+
+    assert_eq!(
+        facade.mark_in_progress(bead, &operation(), &expected),
+        Err(WorkError::BeadParked),
+        "a projection is not an authoring decision: it may not undefer"
+    );
+    let after = facade.inspect(bead).expect("the bead is untouched");
+    assert_eq!(
+        after.status,
+        WorkStatus::Open,
+        "the refusal must mutate nothing"
+    );
+    assert_eq!(
+        after.eligibility,
+        Eligibility::Parked,
+        "the park survives the refused projection"
+    );
+}
+
+/// Closing a parked bead stays PERMITTED. Completed work is done
+/// whatever its scheduling flag says, and refusing the close would
+/// strand its projection pending with no resolution path.
+fn closes_a_parked_bead_without_refusal<P: WorkProvider>(
+    build: &impl Fn(&Scenario) -> P,
+    bead: &BeadId,
+) {
+    let facade = WorkFacade::new(build(
+        &Scenario::new(bead.clone(), WorkStatus::Open, 13, Behavior::Normal).parked(),
+    ));
+    let expected = current_revision(&facade, bead);
+
+    match facade.close(bead, CloseReason::AcceptedHandoff, &operation(), &expected) {
+        Ok(MutationOutcome::Applied { .. }) => {}
+        other => panic!("a parked bead may still be closed, got {other:?}"),
+    }
+    assert_eq!(
+        facade.inspect(bead).expect("bead is present").status,
+        WorkStatus::Closed {
+            observed_reason: ObservedCloseReason::AcceptedHandoff
+        },
+    );
 }
 
 fn reports_a_matching_observation_as_clean<P: WorkProvider>(

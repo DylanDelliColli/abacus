@@ -588,6 +588,7 @@ enum StoredWorkError {
     NotFound,
     RevisionConflict,
     AmbiguousOutcome,
+    BeadParked,
     ScopeLabelMalformed { label: String },
     ScopeLabelConflict { key: String },
 }
@@ -2057,6 +2058,7 @@ impl From<&WorkError> for StoredWorkError {
             WorkError::MalformedOutput => Self::MalformedOutput,
             WorkError::NotFound => Self::NotFound,
             WorkError::RevisionConflict => Self::RevisionConflict,
+            WorkError::BeadParked => Self::BeadParked,
             WorkError::AmbiguousOutcome => Self::AmbiguousOutcome,
             WorkError::ScopeLabelMalformed { label } => Self::ScopeLabelMalformed {
                 label: label.clone(),
@@ -2076,6 +2078,7 @@ impl From<StoredWorkError> for WorkError {
             StoredWorkError::MalformedOutput => Self::MalformedOutput,
             StoredWorkError::NotFound => Self::NotFound,
             StoredWorkError::RevisionConflict => Self::RevisionConflict,
+            StoredWorkError::BeadParked => Self::BeadParked,
             StoredWorkError::AmbiguousOutcome => Self::AmbiguousOutcome,
             StoredWorkError::ScopeLabelMalformed { label } => Self::ScopeLabelMalformed { label },
             StoredWorkError::ScopeLabelConflict { key } => Self::ScopeLabelConflict { key },

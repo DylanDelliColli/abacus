@@ -12,8 +12,9 @@
 use std::collections::BTreeSet;
 
 use abacus_core::ports::{
-    AdviceDegradation, AdviceOutcome, BeadSnapshot, BeadStatusView, CloseReason, MutationOutcome,
-    ObservedCloseReason, WorkAdvicePort, WorkError, WorkGraphPort, WorkRevision, WorkStatus,
+    AdviceDegradation, AdviceOutcome, BeadSnapshot, BeadStatusView, CloseReason, Eligibility,
+    MutationOutcome, ObservedCloseReason, WorkAdvicePort, WorkError, WorkGraphPort, WorkRevision,
+    WorkStatus,
 };
 use abacus_core::{BeadId, OperationId, ScopeKey};
 
@@ -77,11 +78,13 @@ impl<P: WorkProvider> WorkFacade<P> {
         let RawBeadStatusView {
             snapshot,
             status,
+            eligibility,
             revision,
         } = self.provider.inspect(id)?;
         Ok(BeadStatusView {
             snapshot: self.normalize(snapshot)?,
             status,
+            eligibility,
             revision,
         })
     }
@@ -126,6 +129,20 @@ impl<P: WorkProvider> WorkFacade<P> {
                 status: view.status,
                 revision: view.revision,
             });
+        }
+
+        // A parked bead may not be driven INTO execution. Doing so
+        // would silently undefer it: an operator deliberately excluded
+        // it from dispatch, and a projection is not an authoring
+        // decision (ABACUS-wsj). Closing a parked bead stays permitted -
+        // completed work is done whatever its scheduling flag says, and
+        // refusing it would strand the projection with no resolution
+        // path. Checked AFTER idempotency so an already-satisfied
+        // effect still reports observed facts rather than a refusal.
+        if matches!(target, TargetStatus::InProgress)
+            && matches!(view.eligibility, Eligibility::Parked)
+        {
+            return Err(WorkError::BeadParked);
         }
 
         if view.revision != *expected {
