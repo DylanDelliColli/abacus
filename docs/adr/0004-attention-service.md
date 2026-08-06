@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 4 — Codex cross-review returned six material findings on revision 3; all six accepted and resolved here. Awaiting re-review, then operator sign-off as named decider.
+- **Status:** Proposed, revision 5 — second cross-review returned four findings on revision 4; three resolved here, the fourth escalated to the operator as a scope decision that blocks acceptance (see "Open question"). Awaiting that decision, then re-review and sign-off.
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
@@ -74,11 +74,23 @@ class as a document asserting provenance the code cannot supply.
 
 `AttentionFacts` fixes it by construction. It is an immutable plain value —
 the unresolved Reports and Requests, the pending Handoffs, the reclaimable
-leases, and the timestamps belonging to each — gathered by the caller and
-handed in. The derivation holds no port at all, so it cannot read, cannot
-write, and cannot reach a mutation verb even by accident. Gathering is
-ordinary I/O and lives in the ring pass (§6), where it is honest about being
-I/O.
+leases, the timestamps belonging to each, and the **already-resolved audience
+facts** each one implies. The derivation holds no port at all, so it cannot
+read, cannot write, and cannot reach a mutation verb even by accident.
+
+Facts are pre-joined deliberately. If `AttentionFacts` carried raw Reports and
+Handoffs, the derivation would have to look up owning Assignments to learn who
+should act — which means holding a port again, and the purity would be back to
+being a promise. Whatever the derivation needs to name an audience is resolved
+before it is called.
+
+**Gathering happens outside `abacus-attention` entirely.** Revision 4 put it in
+the module's ring pass, which left the module holding
+`DecisionWorkflowStatePort` — an interface carrying every decision mutation.
+The function was pure while the module was still handed the verbs §2 says it
+cannot use, so the integration assertion proved current behavior rather than
+unrepresentability. The composition root gathers the facts and passes them in;
+`abacus-attention` never names a state port at all.
 
 The `work` parameter is deleted outright. It was left over from a draft that
 included ready-work-without-a-worker, which §5 excludes; nothing in the
@@ -182,7 +194,7 @@ never an LLM watchdog deciding when to look, because an agent watchdog can
 itself idle and would reintroduce the failure it exists to detect. An agent
 may sit *above* this floor and add judgment; it may not *be* the floor.
 
-### 5. Three obligation classes, each declaring its own audience
+### 5. Four obligation classes, each declaring its own audience
 
 Operator decision, 2026-08-06. Each class names who should act, so routing
 is data on the obligation rather than branching in the ringer.
@@ -237,12 +249,26 @@ admitted.** `runtime_handle` takes a `LaunchSubject`, and the actor form
 requires actor, profile, *and* activation generation. A Report or Handoff
 yields a `DecisionActor` (actor and profile) but no generation; a Request
 yields only an `ActorId`. Revision 3's claim that "a handle resolves from an
-Attempt as readily as from an actor" was false. A third read-only query is
-therefore required: **current activation generation for an actor**, from which
-the `LaunchSubject` and then the handle follow. It must state its
-missing-and-ambiguous behavior explicitly and must assume no singleton
-orchestrator (I16). An obligation whose audience has no resolvable live
-activation is surfaced to the operator rather than dropped.
+Attempt as readily as from an actor" was false.
+
+A third read-only query resolves an actor to its **current activations**,
+returning profile *and* generation together — a generation alone is still
+insufficient for a Request, which supplies no profile. One actor may occupy
+several profiles, so the result is a typed zero / one / many shape rather than
+an optional: none means no live activation, many means the audience is
+ambiguous. Neither is an error and neither is silently collapsed to a guess.
+An obligation whose audience resolves to none or to many is reported without a
+ring.
+
+**Operator-class obligations are report-only in v1.** Revisions 1–4 said they
+"reach a live operator session," and nothing in the system makes that
+implementable: no config field, policy, state fact, or topology rule names
+which operator activation to ring, and I16 forbids assuming a single one.
+Rather than invent an operator-target configuration to satisfy a sentence, the
+sentence goes. Operator obligations appear in the run's report, and the
+operator reads it — which is what §7 already admitted when it ruled out every
+external channel. Only obligations with a named, resolvable actor audience
+ring anything.
 
 Three new **read-only** state queries are therefore required, not two. They
 are a C1 seam extension in `abacus-core`'s state port plus `abacus-state`
@@ -256,10 +282,17 @@ an observer into a decider.
 
 ### 6. Delivery outcomes are returned, never persisted
 
-The ring pass gathers `AttentionFacts`, resolves handles, calls the existing
-content-free `doorbell()`, and returns each normalized outcome — submitted,
-not delivered, or ambiguous — **in the run's report**. Nothing about delivery
-is written anywhere.
+The ring pass takes the gathered `AttentionFacts`, calls a content-free
+doorbell for each worker-audience obligation, and returns every normalized
+outcome — submitted, not delivered, or ambiguous — **in the run's report**.
+Nothing about delivery is written anywhere.
+
+The ring pass holds exactly one narrow port: a **doorbell seam** with a single
+method, ringing a resolved handle and returning the typed outcome. It does not
+receive `RuntimePort`, which also carries launch and stop — a module that
+cannot mutate workflow state but can start and kill sessions has not honoured
+§2 in any meaningful sense. One method in, one outcome out; the module cannot
+express any other effect.
 
 Revisions 1–3 said these outcomes ride "the existing audit trail," and that
 was not implementable as described. ADR-0001 defines audit as a transaction
@@ -286,10 +319,10 @@ the module never consults a prior outcome to decide anything.
 
 ### 7. Accepted v1 non-goals
 
-- No external notification channel. Escalation reaches a terminal and a live
-  operator session; it does not send email, SMS, or push. If the operator is
-  away from every session, nothing reaches them, and that is a known limit of
-  v1 rather than an oversight.
+- No external notification channel, and no operator ringing at all (§5).
+  Operator-class obligations appear in the run's report and nowhere else. If
+  the operator is not reading runs, nothing reaches them; that is a known
+  limit of v1 rather than an oversight.
 - No auto-launch, auto-reclaim, or any other automated recovery (§2).
 - No worker-side acknowledgement of any kind (I19).
 - No scheduling or work distribution (§5).
@@ -302,8 +335,9 @@ this shape:
 
 | Required proof | How it holds |
 |---|---|
-| Crash after Signal commit, before ring, recovers on restart | No ring state exists to lose; the next run recomputes from the Ledger |
-| Duplicate and ambiguous deliveries are harmless and retried | The derivation is idempotent and the nudge is content-free. A duplicate nudge is **not** literally a no-op — it can prompt an agent to act again, and that action can produce a distinct Report. The honest claim is narrower: the nudge carries no authority, and any action it provokes still passes the ordinary fencing and idempotency gates that guard every worker write |
+| Crash after **Report or Request** commit, before ring, recovers on restart | No ring state exists to lose; the next run recomputes from the Ledger |
+| Crash after **Directive** commit, before ring — **OPEN, operator decision required** | **This proof does not hold under §5.** With no standing Directive obligation, the next run derives nothing. Recovery comes on the worker's next fenced call, or — if it makes none — only when its lease expires, which is slower and surfaces to the *operator* rather than to the worker. `ABACUS-IKQ` names the crash-window proof and a reliable doorbell as non-negotiable v1 scope, so narrowing it is a scope change requiring explicit ratification, not an authorial judgment call. See §5 and the open question below |
+| Duplicate and ambiguous deliveries are harmless, and a later tick reconciles afresh | The derivation is idempotent and the nudge is content-free. A duplicate nudge is **not** literally a no-op — it can prompt an agent to act again, and that action can produce a distinct Report. The honest claim is narrower: the nudge carries no authority, and any action it provokes still passes the ordinary fencing and idempotency gates that guard every worker write |
 | Stale generations never target the wrong Attempt | The runtime seam is generation-fenced and already returns `HandleStale` |
 | Herdr or service outage catches up | The next run recomputes; nothing was queued to be lost |
 | Unresolved state keeps re-ringing despite `Submitted` | `Submitted` is never read by the derivation (§6) |
@@ -334,7 +368,7 @@ Costs, stated honestly:
   by-construction table depends on them: a cancelled Handoff produces no
   obligation, a reclaimed or revoked Attempt produces no lease obligation, and
   a lease exactly at `expires_at` produces none either (expiry is strict).
-- A run against a stale handle records `HandleStale` and completes the
+- A run against a stale handle reports `HandleStale` and completes the
   remaining obligations rather than aborting.
 - Running the derivation twice over unchanged state produces an identical
   report, and the second run's doorbells change no workflow state.
@@ -347,6 +381,32 @@ Costs, stated honestly:
 - Actor-to-handle resolution (§5) is tested for its missing and ambiguous
   cases, not only the happy one: an obligation whose audience has no
   resolvable live activation is surfaced to the operator, never dropped.
+
+## Open question for the operator (blocks acceptance)
+
+§5 removes the Directive obligation class on the grounds that existing
+mechanisms cover it. Cross-review accepts that the lease-expiry path is an
+honest liveness bound but rejects it as a silent substitute for the
+crash-window proof `ABACUS-IKQ` calls non-negotiable, and that objection is
+correct. The two are not equivalent: a lost Directive ring is recovered on the
+worker's next fenced call — which never comes if the worker is idle — and
+otherwise only at lease expiry, targeting the operator instead of the worker.
+
+The operator chooses one:
+
+1. **Ratify the narrower scope.** Directives get the commit-time doorbell and
+   lease expiry, and the crash-window proof is explicitly narrowed to Reports
+   and Requests. Cheapest, ships nothing new, and accepts that a lost Directive
+   ring costs up to one lease period of idle worker time.
+2. **Add a binding-Directive attention read.** A fourth read-only query
+   surfaces Active Attempts carrying undischarged binding Directives, and the
+   proof holds for all three Signal types. This is not free: "binding" includes
+   Pause, and a legitimately paused worker must not ring every tick forever, so
+   the query needs a defensible rule for which binding Directives constitute an
+   unmet obligation versus a steady state. That rule is the real cost.
+
+This ADR cannot be accepted until one is chosen, because option 1 changes what
+the epic promised and option 2 changes what this document specifies.
 
 ## Normative amendments this ADR requires on acceptance
 
@@ -365,10 +425,23 @@ exists, and both must be amended **in the accepting commit**, not afterwards:
   inactive gets "no escalation machinery." Age promotion to operator-class is
   escalation, deliberately bounded and stateless. The row must say so.
 
+A third gap is **pre-existing** and this ADR merely surfaces it, but it must be
+closed in the same commit because §5 now depends on it. CONTEXT line 37 and
+ADR-0001 §8 both define an unresolved Signal unconditionally as "a Signal
+lacking its linked responding action." The implemented derivation covers only
+Reports and Requests and excludes Directives by design, so both sentences are
+already stronger than the query — before this ADR existed. `docs/architecture.md`
+§4.6 and the `abacus-cli` unresolved-Signal contract inherit the same
+imprecision. All four must distinguish **binding Directives**, which are in
+force from commit and discharged by worker action, from **unresolved Reports
+and Requests**, which are the derived set.
+
 The standard here is the one this lineage applied to ADR-0003's provenance
 weakening: a document that claims something stronger than the code delivers is
-a defect, whichever direction the gap runs. An ADR that ships escalation while
-CONTEXT denies escalation exists is that defect.
+a defect, whichever direction the gap runs, and whether or not the current
+change introduced it. An ADR that ships escalation while CONTEXT denies
+escalation exists is that defect; so is a CONTEXT that promises a derived set
+broader than the code computes.
 
 ## Alternatives considered
 
