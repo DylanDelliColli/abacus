@@ -151,12 +151,6 @@ opaque_id! {
     /// Immutable Handoff identity: what Accept/Reject decisions bind to.
     HandoffId
 }
-opaque_id! {
-    /// Credential identity: names a bearer credential whose plaintext
-    /// never crosses this seam — only its digest does (ADR-0003).
-    CredentialId
-}
-
 /// Namespaced capability identifier, `module:verb` (core contract:
 /// capabilities use validated namespaced IDs; descriptors are declared
 /// by owning modules and supplied via the composition-root registry).

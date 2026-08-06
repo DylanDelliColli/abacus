@@ -113,19 +113,19 @@ impl<C: ClockPort> SqliteState<C> {
 
 impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
     fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.open_assignment(opening))
+        self.mutate(|state| WorkflowStatePort::open_assignment(state, opening))
     }
 
     fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.append_attempt(opening))
+        self.mutate(|state| WorkflowStatePort::append_attempt(state, opening))
     }
 
     fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.record_decision(record))
+        self.mutate(|state| WorkflowStatePort::record_decision(state, record))
     }
 
     fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.activate_profile(opening))
+        self.mutate(|state| WorkflowStatePort::activate_profile(state, opening))
     }
 
     fn deactivate_profile(
@@ -134,19 +134,19 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         actor: &ActorId,
         profile: &ProfileName,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.deactivate_profile(operation, actor, profile))
+        self.mutate(|state| WorkflowStatePort::deactivate_profile(state, operation, actor, profile))
     }
 
     fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError> {
-        self.mutate(|state| state.append_signal(draft))
+        self.mutate(|state| WorkflowStatePort::append_signal(state, draft))
     }
 
     fn fenced_report(
         &self,
         action: &FencedAction,
-        draft: &SignalDraft,
+        draft: &ReportDraft,
     ) -> Result<(ReportOutcome, FencedResponse), StateError> {
-        self.mutate(|state| state.fenced_report(action, draft))
+        self.mutate(|state| WorkflowStatePort::fenced_report(state, action, draft))
     }
 
     fn fenced_evidence(
@@ -154,7 +154,7 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         action: &FencedAction,
         evidence: &Evidence,
     ) -> Result<(EvidenceOutcome, FencedResponse), StateError> {
-        self.mutate(|state| state.fenced_evidence(action, evidence))
+        self.mutate(|state| WorkflowStatePort::fenced_evidence(state, action, evidence))
     }
 
     fn fenced_submit_handoff(
@@ -162,11 +162,11 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         action: &FencedAction,
         handoff: &HandoffRecord,
     ) -> Result<(SubmissionOutcome, FencedResponse), StateError> {
-        self.mutate(|state| state.fenced_submit_handoff(action, handoff))
+        self.mutate(|state| WorkflowStatePort::fenced_submit_handoff(state, action, handoff))
     }
 
     fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError> {
-        self.mutate(|state| state.fenced_abort_attempt(call))
+        self.mutate(|state| WorkflowStatePort::fenced_abort_attempt(state, call))
     }
 
     fn renew_lease(
@@ -174,7 +174,7 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         call: &FencedCall,
         until: Timestamp,
     ) -> Result<(Lease, FencedResponse), StateError> {
-        self.mutate(|state| state.renew_lease(call, until))
+        self.mutate(|state| WorkflowStatePort::renew_lease(state, call, until))
     }
 
     fn persist_envelope(
@@ -183,11 +183,13 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         subject: &LaunchSubject,
         envelope: &EnvelopeSnapshot,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.persist_envelope(operation, subject, envelope))
+        self.mutate(|state| {
+            WorkflowStatePort::persist_envelope(state, operation, subject, envelope)
+        })
     }
 
     fn envelope(&self, subject: &LaunchSubject) -> Result<EnvelopeSnapshot, StateError> {
-        self.read(|state| state.envelope(subject))
+        self.read(|state| WorkflowStatePort::envelope(state, subject))
     }
 
     fn bind_runtime_handle(
@@ -196,7 +198,9 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         subject: &LaunchSubject,
         handle: &RuntimeHandle,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.bind_runtime_handle(operation, subject, handle))
+        self.mutate(|state| {
+            WorkflowStatePort::bind_runtime_handle(state, operation, subject, handle)
+        })
     }
 
     fn unbind_runtime_handle(
@@ -204,11 +208,11 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         operation: &OperationId,
         subject: &LaunchSubject,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.unbind_runtime_handle(operation, subject))
+        self.mutate(|state| WorkflowStatePort::unbind_runtime_handle(state, operation, subject))
     }
 
     fn runtime_handle(&self, subject: &LaunchSubject) -> Result<Option<RuntimeHandle>, StateError> {
-        self.read(|state| state.runtime_handle(subject))
+        self.read(|state| WorkflowStatePort::runtime_handle(state, subject))
     }
 
     fn record_runtime_observation(
@@ -216,60 +220,52 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
         operation: &OperationId,
         record: &RuntimeObservationRecord,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.record_runtime_observation(operation, record))
+        self.mutate(|state| WorkflowStatePort::record_runtime_observation(state, operation, record))
     }
 
     fn runtime_observation(
         &self,
         operation: &OperationId,
     ) -> Result<RuntimeObservationRecord, StateError> {
-        self.read(|state| state.runtime_observation(operation))
+        self.read(|state| WorkflowStatePort::runtime_observation(state, operation))
     }
 
     fn record_application_attempt(
         &self,
         attempt: &ApplicationAttempt,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.record_application_attempt(attempt))
+        self.mutate(|state| WorkflowStatePort::record_application_attempt(state, attempt))
     }
 
     fn record_application_receipt(
         &self,
         receipt: &ApplicationReceipt,
     ) -> Result<StateApplied, StateError> {
-        self.mutate(|state| state.record_application_receipt(receipt))
+        self.mutate(|state| WorkflowStatePort::record_application_receipt(state, receipt))
     }
 
     fn assignment(&self, id: &AssignmentId) -> Result<AssignmentView, StateError> {
-        self.read(|state| state.assignment(id))
+        self.read(|state| WorkflowStatePort::assignment(state, id))
     }
 
     fn evidence_for(&self, attempt: &AttemptId) -> Result<Vec<EvidenceRecord>, StateError> {
-        self.read(|state| state.evidence_for(attempt))
+        self.read(|state| WorkflowStatePort::evidence_for(state, attempt))
     }
 
     fn signals_for(&self, attempt: &AttemptId) -> Result<Vec<Signal>, StateError> {
-        self.read(|state| state.signals_for(attempt))
-    }
-
-    fn verify_launch_subject(
-        &self,
-        subject: &LaunchSubject,
-        presented_digest: &ContentHash,
-    ) -> Result<(), StateError> {
-        self.read(|state| state.verify_launch_subject(subject, presented_digest))
+        self.read(|state| WorkflowStatePort::signals_for(state, attempt))
     }
 
     fn handoff(&self, id: &HandoffId) -> Result<HandoffRecord, StateError> {
-        self.read(|state| state.handoff(id))
+        self.read(|state| WorkflowStatePort::handoff(state, id))
     }
 
     fn decision(&self, operation: &OperationId) -> Result<DecisionRecord, StateError> {
-        self.read(|state| state.decision(operation))
+        self.read(|state| WorkflowStatePort::decision(state, operation))
     }
 
     fn active_occupants(&self, profile: &ProfileName) -> Result<Vec<ActorId>, StateError> {
-        self.read(|state| state.active_occupants(profile))
+        self.read(|state| WorkflowStatePort::active_occupants(state, profile))
     }
 
     fn pending_applications(&self) -> Result<Vec<PendingApplication>, StateError> {
@@ -281,10 +277,10 @@ impl<C: ClockPort> WorkflowStatePort for SqliteState<C> {
     }
 
     fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError> {
-        self.read(|state| state.unresolved_signals(recipient))
+        self.read(|state| WorkflowStatePort::unresolved_signals(state, recipient))
     }
 
     fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError> {
-        self.read(|state| state.audit_events(query))
+        self.read(|state| WorkflowStatePort::audit_events(state, query))
     }
 }

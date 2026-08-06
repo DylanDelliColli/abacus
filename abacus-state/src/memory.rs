@@ -13,23 +13,12 @@ use abacus_core::ports::*;
 use abacus_core::signal::validate_subject;
 use abacus_core::{
     ActorId, AssignmentAction, AssignmentId, AssignmentState, AttemptAction, AttemptId,
-    AttemptState, AuthorityClass, ContentHash, CredentialId, DecisionActor, DirectiveKind,
-    HandoffId, Lease, OccupancyClass, OperationId, ProfileName, ResponseAction, ResponseKind, Seq,
-    Signal, SignalBody, SignalDraft, SignalId, SubjectRef, Timestamp, assignment_transition,
+    AttemptState, AuthorityClass, DecisionActor, DirectiveKind, HandoffId, Lease, OccupancyClass,
+    OperationId, ProfileName, ReportDraft, ResponseAction, ResponseKind, Seq, Signal, SignalBody,
+    SignalDraft, SignalId, SignalSender, SubjectRef, Timestamp, assignment_transition,
     attempt_transition, binding_directives, handoff_gate, next_attempt_allowed, retry_within_cap,
     unresolved, worker_append_gate,
 };
-use subtle::ConstantTimeEq;
-
-#[derive(Clone)]
-pub(crate) struct CredentialBinding {
-    pub(crate) credential: CredentialId,
-    pub(crate) digest: ContentHash,
-    pub(crate) actor: ActorId,
-    pub(crate) profile: ProfileName,
-    pub(crate) assignment: Option<AssignmentId>,
-    pub(crate) revoked: bool,
-}
 
 #[derive(Clone)]
 pub(crate) struct AttemptEntry {
@@ -53,8 +42,10 @@ pub(crate) struct State {
     pub(crate) bootstrap_complete: bool,
     pub(crate) actor_classes: BTreeMap<String, AuthorityClass>,
     pub(crate) active_members: BTreeMap<String, BTreeSet<String>>,
-    pub(crate) credentials: BTreeMap<String, CredentialBinding>,
-    pub(crate) credential_owners: BTreeMap<String, String>,
+    /// Current activation generation by `actor:profile`. Legacy credential
+    /// rows are dormant; this is the semantic generation binding
+    /// `LaunchSubject` needs.
+    pub(crate) active_activations: BTreeMap<(String, String), OperationId>,
     pub(crate) assignments: BTreeMap<String, AssignmentEntry>,
     pub(crate) attempt_owners: BTreeMap<String, String>,
     pub(crate) signals: Vec<Signal>,
@@ -83,8 +74,7 @@ impl State {
             bootstrap_complete: false,
             actor_classes: BTreeMap::new(),
             active_members: BTreeMap::new(),
-            credentials: BTreeMap::new(),
-            credential_owners: BTreeMap::new(),
+            active_activations: BTreeMap::new(),
             assignments: BTreeMap::new(),
             attempt_owners: BTreeMap::new(),
             signals: Vec::new(),
@@ -162,7 +152,9 @@ impl<C> InMemoryState<C> {
     ) -> Result<bool, StateError> {
         match state.operations.get(&Self::operation_key(verb, operation)) {
             None => Ok(false),
-            Some(stored) if stored == request => Ok(true),
+            Some(stored) if crate::stored::request_identities_match(verb, stored, request) => {
+                Ok(true)
+            }
             Some(_) => Err(StateError::ConflictingOperation),
         }
     }
@@ -202,6 +194,10 @@ impl<C> InMemoryState<C> {
         )
     }
 
+    fn activation_membership_key(actor: &ActorId, profile: &ProfileName) -> (String, String) {
+        (actor.as_str().to_owned(), profile.as_str().to_owned())
+    }
+
     fn owner_locator(subject: &LaunchSubject) -> String {
         match subject {
             LaunchSubject::WorkerAttempt { attempt, .. } => Self::worker_locator(attempt),
@@ -215,44 +211,54 @@ impl<C> InMemoryState<C> {
     }
 
     fn association_key(subject: &LaunchSubject) -> String {
-        format!(
-            "{}:credential:{}",
-            Self::owner_locator(subject),
-            subject.credential().as_str()
-        )
+        Self::owner_locator(subject)
     }
 
-    fn resolve_subject<'a>(
+    fn validate_launch_subject(state: &State, subject: &LaunchSubject) -> Result<(), StateError> {
+        match subject {
+            LaunchSubject::WorkerAttempt { attempt } => {
+                let assignment_id = state
+                    .attempt_owners
+                    .get(attempt.as_str())
+                    .ok_or(StateError::UnknownRecord)?;
+                let assignment = state
+                    .assignments
+                    .get(assignment_id)
+                    .ok_or(StateError::IncoherentBundle)?;
+                if assignment
+                    .attempts
+                    .iter()
+                    .any(|entry| entry.record.id == *attempt)
+                {
+                    Ok(())
+                } else {
+                    Err(StateError::IncoherentBundle)
+                }
+            }
+            LaunchSubject::ActorActivation {
+                actor,
+                profile,
+                generation,
+            } => match state
+                .active_activations
+                .get(&Self::activation_membership_key(actor, profile))
+            {
+                Some(active) if active == generation => Ok(()),
+                Some(_) => Err(StateError::StaleFencing),
+                None => Err(StateError::UnknownRecord),
+            },
+        }
+    }
+
+    fn assignment_id_for_attempt<'a>(
         state: &'a State,
-        subject: &LaunchSubject,
-    ) -> Result<&'a CredentialBinding, StateError> {
-        let binding = state
-            .credentials
-            .get(&Self::owner_locator(subject))
-            .ok_or(StateError::UnknownRecord)?;
-        if &binding.credential != subject.credential() {
-            return Err(StateError::CredentialBindingMismatch);
-        }
-        Ok(binding)
-    }
-
-    fn credential_available(
-        state: &State,
-        credential: &CredentialId,
-        owner: &str,
-    ) -> Result<(), StateError> {
-        match state.credential_owners.get(credential.as_str()) {
-            None => Ok(()),
-            Some(existing) if existing == owner => Ok(()),
-            Some(_) => Err(StateError::ConflictingOperation),
-        }
-    }
-
-    fn insert_credential(state: &mut State, owner: String, binding: CredentialBinding) {
+        attempt: &AttemptId,
+    ) -> Result<&'a str, StateError> {
         state
-            .credential_owners
-            .insert(binding.credential.as_str().to_owned(), owner.clone());
-        state.credentials.insert(owner, binding);
+            .attempt_owners
+            .get(attempt.as_str())
+            .map(String::as_str)
+            .ok_or(StateError::UnknownRecord)
     }
 
     fn attempt_entry<'a>(
@@ -282,26 +288,24 @@ impl<C> InMemoryState<C> {
     }
 
     fn validate_fence(state: &State, call: &FencedCall, now: Timestamp) -> Result<(), StateError> {
+        let assignment_id = Self::assignment_id_for_attempt(state, &call.attempt)?;
         let assignment = state
             .assignments
-            .get(call.assignment.as_str())
+            .get(assignment_id)
             .ok_or(StateError::IncoherentBundle)?;
         let attempt = assignment
             .attempts
             .iter()
             .find(|entry| entry.record.id == call.attempt)
             .ok_or(StateError::IncoherentBundle)?;
-        if assignment.record.worker.actor != call.actor {
-            return Err(StateError::ActorMismatch);
-        }
         if attempt.record.lease.token != call.token {
+            return Err(StateError::StaleFencing);
+        }
+        if assignment.state.is_terminal() || attempt.state.is_ended() {
             return Err(StateError::StaleFencing);
         }
         if now > attempt.record.lease.expires_at {
             return Err(StateError::LeaseExpired);
-        }
-        if assignment.state.is_terminal() || attempt.state.is_ended() {
-            return Err(StateError::IncoherentBundle);
         }
         Ok(())
     }
@@ -312,7 +316,9 @@ impl<C> InMemoryState<C> {
         now: Timestamp,
     ) -> Result<(), StateError> {
         Self::validate_fence(state, call, now)?;
-        if Self::attempt_entry(state, &call.assignment, &call.attempt)
+        let assignment = AssignmentId::new(Self::assignment_id_for_attempt(state, &call.attempt)?)
+            .map_err(|_| StateError::Corrupt)?;
+        if Self::attempt_entry(state, &assignment, &call.attempt)
             .is_none_or(|entry| entry.state != AttemptState::Active)
         {
             return Err(StateError::IncoherentBundle);
@@ -321,13 +327,7 @@ impl<C> InMemoryState<C> {
     }
 
     fn call_identity(call: &FencedCall) -> String {
-        format!(
-            "asg={}|att={}|actor={}|tok={}",
-            call.assignment.as_str(),
-            call.attempt.as_str(),
-            call.actor.as_str(),
-            call.token.0
-        )
+        format!("att={}|tok={}", call.attempt.as_str(), call.token.0)
     }
 
     fn action_identity(action: &FencedAction) -> String {
@@ -355,7 +355,10 @@ impl<C> InMemoryState<C> {
                     attempt,
                     ..
                 },
-            ) if assignment == &action.call.assignment
+            ) if state
+                .attempt_owners
+                .get(action.call.attempt.as_str())
+                .is_some_and(|owner| owner == assignment.as_str())
                 && subject == &action.call.attempt
                 && attempt == &action.call.attempt =>
             {
@@ -408,9 +411,12 @@ impl<C> InMemoryState<C> {
         let Some(existing) = state.signals.iter().find(|signal| signal.id == draft.id) else {
             return Ok(None);
         };
+        let SignalSender::Authority(sender) = &existing.sender else {
+            return Err(StateError::IncoherentBundle);
+        };
         let redraft = SignalDraft {
             id: existing.id.clone(),
-            sender: existing.sender.clone(),
+            sender: sender.clone(),
             subject: existing.subject.clone(),
             body: existing.body.clone(),
         };
@@ -437,10 +443,35 @@ impl<C> InMemoryState<C> {
         Ok(signal)
     }
 
-    fn revoke_attempt_credential(state: &mut State, attempt: &AttemptId) {
-        if let Some(binding) = state.credentials.get_mut(&Self::worker_locator(attempt)) {
-            binding.revoked = true;
-        }
+    fn commit_new_report(
+        state: &mut State,
+        call: &FencedCall,
+        draft: &ReportDraft,
+    ) -> Result<Signal, StateError> {
+        let assignment_id = Self::assignment_id_for_attempt(state, &call.attempt)?;
+        let assignment = state
+            .assignments
+            .get(assignment_id)
+            .ok_or(StateError::IncoherentBundle)?;
+        let actor = assignment.record.worker.clone();
+        let assignment = assignment.record.id.clone();
+        let seq = Self::next_seq(state);
+        let signal = Signal {
+            id: draft.id.clone(),
+            seq,
+            sender: SignalSender::WorkerBinding {
+                actor,
+                assignment,
+                attempt: call.attempt.clone(),
+            },
+            subject: SubjectRef::Attempt(call.attempt.clone()),
+            body: SignalBody::Report {
+                attempt: call.attempt.clone(),
+                kind: draft.kind.clone(),
+            },
+        };
+        state.signals.push(signal.clone());
+        Ok(signal)
     }
 
     fn validate_decision_authority(
@@ -455,13 +486,14 @@ impl<C> InMemoryState<C> {
     }
 
     fn worker_initiator(state: &State, call: &FencedCall) -> Result<AuditInitiator, StateError> {
+        let assignment_id = Self::assignment_id_for_attempt(state, &call.attempt)?;
         let assignment = state
             .assignments
-            .get(call.assignment.as_str())
+            .get(assignment_id)
             .ok_or(StateError::IncoherentBundle)?;
         Ok(AuditInitiator::WorkerBinding {
             actor: assignment.record.worker.clone(),
-            assignment: call.assignment.clone(),
+            assignment: assignment.record.id.clone(),
             attempt: call.attempt.clone(),
         })
     }
@@ -646,9 +678,6 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         {
             return Err(StateError::ActorClassMismatch);
         }
-        let credential_owner = Self::worker_locator(&opening.first_attempt.id);
-        Self::credential_available(&state, &opening.worker_credential.id, &credential_owner)?;
-
         let seq = Self::next_seq(&mut state);
         state
             .actor_classes
@@ -658,18 +687,6 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             .entry(worker.profile.as_str().to_owned())
             .or_default()
             .insert(worker.actor.as_str().to_owned());
-        Self::insert_credential(
-            &mut state,
-            credential_owner,
-            CredentialBinding {
-                credential: opening.worker_credential.id.clone(),
-                digest: opening.worker_credential.digest.clone(),
-                actor: worker.actor.clone(),
-                profile: worker.profile.clone(),
-                assignment: Some(opening.assignment.id.clone()),
-                revoked: false,
-            },
-        );
         state.attempt_owners.insert(
             opening.first_attempt.id.as_str().to_owned(),
             opening.assignment.id.as_str().to_owned(),
@@ -737,9 +754,6 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         {
             return Err(StateError::ConflictingOperation);
         }
-        let credential_owner = Self::worker_locator(&opening.attempt.id);
-        Self::credential_available(&state, &opening.worker_credential.id, &credential_owner)?;
-
         let assignment = state
             .assignments
             .get(opening.attempt.assignment.as_str())
@@ -762,22 +776,9 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         {
             return Err(StateError::IncoherentBundle);
         }
-        let worker = assignment.record.worker.clone();
         let assignment_id = assignment.record.id.clone();
 
         let seq = Self::next_seq(&mut state);
-        Self::insert_credential(
-            &mut state,
-            credential_owner,
-            CredentialBinding {
-                credential: opening.worker_credential.id.clone(),
-                digest: opening.worker_credential.digest.clone(),
-                actor: worker.actor,
-                profile: worker.profile,
-                assignment: Some(assignment_id.clone()),
-                revoked: false,
-            },
-        );
         state.attempt_owners.insert(
             opening.attempt.id.as_str().to_owned(),
             assignment_id.as_str().to_owned(),
@@ -1007,9 +1008,6 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             Effect::Cancel(attempts) => attempts.clone(),
             Effect::Transfer(_) => Vec::new(),
         };
-        for attempt in &ended {
-            Self::revoke_attempt_credential(&mut state, attempt);
-        }
         state.response_actions.push(ResponseAction {
             seq,
             kind: ResponseKind::FencedDecision {
@@ -1121,36 +1119,13 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         {
             return Err(StateError::ProfileOccupied);
         }
-        let owner = Self::activation_locator(
-            &activation.actor,
-            &activation.profile,
-            &activation.operation,
-        );
-        Self::credential_available(&state, &opening.credential.id, &owner)?;
-
         let seq = Self::next_seq(&mut state);
         state
             .actor_classes
             .insert(activation.actor.as_str().to_owned(), activation.class());
-        for binding in state.credentials.values_mut() {
-            if binding.assignment.is_none()
-                && binding.actor == activation.actor
-                && binding.profile == activation.profile
-            {
-                binding.revoked = true;
-            }
-        }
-        Self::insert_credential(
-            &mut state,
-            owner,
-            CredentialBinding {
-                credential: opening.credential.id.clone(),
-                digest: opening.credential.digest.clone(),
-                actor: activation.actor.clone(),
-                profile: activation.profile.clone(),
-                assignment: None,
-                revoked: false,
-            },
+        state.active_activations.insert(
+            Self::activation_membership_key(&activation.actor, &activation.profile),
+            activation.operation.clone(),
         );
         state
             .active_members
@@ -1214,11 +1189,9 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             .get_mut(profile.as_str())
             .expect("membership validated above")
             .remove(actor.as_str());
-        for binding in state.credentials.values_mut() {
-            if binding.actor == *actor && binding.profile == *profile {
-                binding.revoked = true;
-            }
-        }
+        state
+            .active_activations
+            .remove(&Self::activation_membership_key(actor, profile));
         Self::append_audit(
             &mut state,
             seq,
@@ -1305,7 +1278,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     fn fenced_report(
         &self,
         action: &FencedAction,
-        draft: &SignalDraft,
+        draft: &ReportDraft,
     ) -> Result<(ReportOutcome, FencedResponse), StateError> {
         let call = &action.call;
         let now = self.clock.now();
@@ -1330,26 +1303,11 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if state.signals.iter().any(|signal| signal.id == draft.id) {
             return Err(StateError::ConflictingOperation);
         }
-        let valid_report_shape = matches!(
-            (&draft.subject, &draft.body),
-            (SubjectRef::Attempt(subject), SignalBody::Report { attempt, .. })
-                if subject == &call.attempt && attempt == &call.attempt
-        );
-        if !valid_report_shape {
-            return Err(StateError::IncoherentBundle);
-        }
-        let assignment = state
-            .assignments
-            .get(call.assignment.as_str())
-            .expect("fence validated the assignment above");
-        if assignment.record.worker != draft.sender.actor {
-            return Err(StateError::ActorMismatch);
-        }
         let initiator = Self::worker_initiator(&state, call)?;
         let binding = binding_directives(&call.attempt, &state.signals, &state.response_actions);
         let (outcome, seq) = match worker_append_gate(&binding) {
             Ok(()) => {
-                let signal = Self::commit_new_signal(&mut state, draft)?;
+                let signal = Self::commit_new_report(&mut state, call, draft)?;
                 let seq = Self::commit_fenced_call(&mut state, Some(action), true);
                 (
                     ReportOutcome::Recorded {
@@ -1502,10 +1460,13 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         };
         let substantive = matches!(outcome, SubmissionOutcome::Recorded { .. });
         if substantive {
+            let assignment =
+                AssignmentId::new(Self::assignment_id_for_attempt(&state, &call.attempt)?)
+                    .map_err(|_| StateError::Corrupt)?;
             state
                 .handoffs
                 .insert(handoff.id.as_str().to_owned(), handoff.clone());
-            Self::attempt_entry_mut(&mut state, &call.assignment, &call.attempt)
+            Self::attempt_entry_mut(&mut state, &assignment, &call.attempt)
                 .expect("fence validated above")
                 .state = AttemptState::Submitted;
         }
@@ -1552,10 +1513,11 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         let next = attempt_transition(AttemptState::Active, AttemptAction::Abort, false)
             .map_err(|_| StateError::IncoherentBundle)?;
         let seq = Self::next_seq(&mut state);
-        Self::attempt_entry_mut(&mut state, &call.assignment, &call.attempt)
+        let assignment = AssignmentId::new(Self::assignment_id_for_attempt(&state, &call.attempt)?)
+            .map_err(|_| StateError::Corrupt)?;
+        Self::attempt_entry_mut(&mut state, &assignment, &call.attempt)
             .expect("active Attempt validated above")
             .state = next;
-        Self::revoke_attempt_credential(&mut state, &call.attempt);
         state.response_actions.push(ResponseAction {
             seq,
             kind: ResponseKind::TerminalAttemptAction {
@@ -1598,7 +1560,9 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         }
         Self::validate_fence(&state, call, now)?;
         let initiator = Self::worker_initiator(&state, call)?;
-        let current = Self::attempt_entry(&state, &call.assignment, &call.attempt)
+        let assignment = AssignmentId::new(Self::assignment_id_for_attempt(&state, &call.attempt)?)
+            .map_err(|_| StateError::Corrupt)?;
+        let current = Self::attempt_entry(&state, &assignment, &call.attempt)
             .expect("fence validated above")
             .record
             .lease
@@ -1606,7 +1570,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
         if until <= current {
             return Err(StateError::NonExtendingLease);
         }
-        Self::attempt_entry_mut(&mut state, &call.assignment, &call.attempt)
+        Self::attempt_entry_mut(&mut state, &assignment, &call.attempt)
             .expect("fence validated above")
             .record
             .lease
@@ -1639,7 +1603,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<StateApplied, StateError> {
         let at = self.clock.now();
         let mut state = self.lock()?;
-        Self::resolve_subject(&state, subject)?;
+        Self::validate_launch_subject(&state, subject)?;
         let authorizing = Self::subject_authorizing_operation(&state, subject)?;
         let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
@@ -1669,7 +1633,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
 
     fn envelope(&self, subject: &LaunchSubject) -> Result<EnvelopeSnapshot, StateError> {
         let state = self.lock()?;
-        Self::resolve_subject(&state, subject)?;
+        Self::validate_launch_subject(&state, subject)?;
         state
             .envelopes
             .get(&Self::association_key(subject))
@@ -1685,7 +1649,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<StateApplied, StateError> {
         let at = self.clock.now();
         let mut state = self.lock()?;
-        Self::resolve_subject(&state, subject)?;
+        Self::validate_launch_subject(&state, subject)?;
         let authorizing = Self::subject_authorizing_operation(&state, subject)?;
         let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
@@ -1720,7 +1684,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<StateApplied, StateError> {
         let at = self.clock.now();
         let mut state = self.lock()?;
-        Self::resolve_subject(&state, subject)?;
+        Self::validate_launch_subject(&state, subject)?;
         let authorizing = Self::subject_authorizing_operation(&state, subject)?;
         let initiator = Self::system_projection(&state, &authorizing)?;
         let key = Self::association_key(subject);
@@ -1744,7 +1708,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
 
     fn runtime_handle(&self, subject: &LaunchSubject) -> Result<Option<RuntimeHandle>, StateError> {
         let state = self.lock()?;
-        Self::resolve_subject(&state, subject)?;
+        Self::validate_launch_subject(&state, subject)?;
         Ok(state.handles.get(&Self::association_key(subject)).cloned())
     }
 
@@ -1755,7 +1719,7 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
     ) -> Result<StateApplied, StateError> {
         let at = self.clock.now();
         let mut state = self.lock()?;
-        Self::resolve_subject(&state, &record.subject)?;
+        Self::validate_launch_subject(&state, &record.subject)?;
         let request = Self::stored_identity(crate::stored::runtime_observation_identity(record))?;
         if Self::replay(&state, "record_runtime_observation", operation, &request)? {
             return Ok(StateApplied::AlreadyApplied);
@@ -1939,28 +1903,6 @@ impl<C: ClockPort> WorkflowStatePort for InMemoryState<C> {
             })
             .cloned()
             .collect())
-    }
-
-    fn verify_launch_subject(
-        &self,
-        subject: &LaunchSubject,
-        presented_digest: &ContentHash,
-    ) -> Result<(), StateError> {
-        let state = self.lock()?;
-        let binding = Self::resolve_subject(&state, subject)?;
-        if binding.revoked {
-            Err(StateError::CredentialRevoked)
-        } else if !bool::from(
-            binding
-                .digest
-                .as_str()
-                .as_bytes()
-                .ct_eq(presented_digest.as_str().as_bytes()),
-        ) {
-            Err(StateError::CredentialInvalid)
-        } else {
-            Ok(())
-        }
     }
 
     fn handoff(&self, id: &HandoffId) -> Result<HandoffRecord, StateError> {

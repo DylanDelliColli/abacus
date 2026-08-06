@@ -47,7 +47,7 @@ impl RuntimeContractHarness for FakeHarness {
         self.peer.prompts(correlation)
     }
 
-    fn startup_deliveries(&self, correlation: &str) -> Vec<(String, String)> {
+    fn startup_deliveries(&self, correlation: &str) -> Vec<String> {
         self.peer.startup_deliveries(correlation)
     }
 

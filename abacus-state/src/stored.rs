@@ -14,10 +14,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::{AssignmentEntry, AttemptEntry, CredentialBinding, State};
+use crate::memory::{AssignmentEntry, AttemptEntry, State};
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
-const IDENTITY_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
+const MIN_READABLE_RECORD_VERSION: u32 = 3;
+const IDENTITY_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoredError {
@@ -51,10 +52,128 @@ fn encode_identity<T: Serialize>(value: &T) -> Result<String, StoredError> {
     })?)
 }
 
+fn strip_credential_suffix(raw: &str) -> String {
+    let Some(start) = raw.find(":credential:") else {
+        return raw.to_owned();
+    };
+    let tail = raw[start + ":credential:".len()..]
+        .find('|')
+        .map(|offset| start + ":credential:".len() + offset);
+    match tail {
+        Some(tail) => format!("{}{}", &raw[..start], &raw[tail..]),
+        None => raw[..start].to_owned(),
+    }
+}
+
+fn normalize_fenced_identity(raw: &str) -> String {
+    let retained: Vec<&str> = raw
+        .split('|')
+        .filter(|part| {
+            part.starts_with("att=") || part.starts_with("tok=") || part.starts_with("responds_to=")
+        })
+        .collect();
+    if retained.iter().any(|part| part.starts_with("att="))
+        && retained.iter().any(|part| part.starts_with("tok="))
+    {
+        retained.join("|")
+    } else {
+        raw.to_owned()
+    }
+}
+
+fn normalize_identity_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_identity_value(value);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            fields.remove("credential");
+            fields.remove("worker_credential");
+            if let Some(version) = fields.get_mut("schema_version") {
+                *version = serde_json::Value::from(IDENTITY_VERSION);
+            }
+            for (key, value) in fields.iter_mut() {
+                if let Some(raw) = value.as_str() {
+                    if key == "association_key" {
+                        *value = serde_json::Value::String(strip_credential_suffix(raw));
+                    } else if key == "fenced_identity" {
+                        *value = serde_json::Value::String(normalize_fenced_identity(raw));
+                    }
+                }
+                normalize_identity_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_report_payload(value: &mut serde_json::Value) {
+    let Some(payload) = value
+        .get_mut("value")
+        .and_then(|value| value.get_mut("payload"))
+    else {
+        return;
+    };
+    let Some(fields) = payload.as_object_mut() else {
+        return;
+    };
+    if fields.contains_key("report") {
+        return;
+    }
+    let Some(id) = fields.get("id").cloned() else {
+        return;
+    };
+    let Some(report) = fields
+        .get("body")
+        .and_then(|body| body.get("report"))
+        .cloned()
+    else {
+        return;
+    };
+    fields.clear();
+    fields.insert("id".to_owned(), id);
+    fields.insert("report".to_owned(), report);
+}
+
+/// Compatibility comparator for durable idempotency identities across the
+/// revision-6 removal of credential and caller-authority fields. It removes
+/// only fields whose semantics no longer exist; every remaining payload fact
+/// must still match exactly.
+pub(crate) fn request_identities_match(verb: &str, stored: &str, request: &str) -> bool {
+    if stored == request {
+        return true;
+    }
+    let mut stored_json = serde_json::from_str::<serde_json::Value>(stored).ok();
+    let mut request_json = serde_json::from_str::<serde_json::Value>(request).ok();
+    match (&mut stored_json, &mut request_json) {
+        (Some(stored), Some(request)) => {
+            normalize_identity_value(stored);
+            normalize_identity_value(request);
+            if verb == "fenced_report" {
+                normalize_report_payload(stored);
+                normalize_report_payload(request);
+            }
+            stored == request
+        }
+        _ if matches!(
+            verb,
+            "fenced_abort_attempt" | "bind_runtime_handle" | "unbind_runtime_handle"
+        ) =>
+        {
+            let stored = normalize_fenced_identity(&strip_credential_suffix(stored));
+            let request = normalize_fenced_identity(&strip_credential_suffix(request));
+            stored == request
+        }
+        _ => false,
+    }
+}
+
 fn decode_row<T: DeserializeOwned>(column_version: i64, json: &str) -> Result<T, StoredError> {
     let found = u32::try_from(column_version)
         .map_err(|_| invalid("stored schema version", column_version))?;
-    if found != SCHEMA_VERSION {
+    if !(MIN_READABLE_RECORD_VERSION..=SCHEMA_VERSION).contains(&found) {
         return Err(StoredError::UnsupportedVersion {
             found,
             supported: SCHEMA_VERSION,
@@ -77,22 +196,6 @@ enum StoredAuthorityClass {
     Worker,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredCredentialBinding {
-    credential: String,
-    digest: String,
-    actor: String,
-    profile: String,
-    assignment: Option<String>,
-    revoked: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct StoredCredentialProvisioning {
-    id: String,
-    digest: String,
-}
-
 #[derive(Debug, Serialize)]
 struct StoredAssignDecision {
     operation: String,
@@ -107,7 +210,6 @@ struct StoredAssignmentOpening {
     first_attempt: StoredAttemptRecord,
     authorizing: StoredAssignDecision,
     bead_revision: String,
-    worker_credential: StoredCredentialProvisioning,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,7 +224,6 @@ struct StoredRetryDecision {
 struct StoredAttemptOpening {
     authorizing: StoredRetryDecision,
     attempt: StoredAttemptRecord,
-    worker_credential: StoredCredentialProvisioning,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,15 +263,12 @@ enum StoredActivationCase {
 struct StoredActivationOpening {
     activation: StoredProfileActivation,
     case: StoredActivationCase,
-    credential: StoredCredentialProvisioning,
 }
 
 #[derive(Debug, Serialize)]
-struct StoredSignalDraft {
+struct StoredReportDraft {
     id: String,
-    sender: StoredAuthoritySnapshot,
-    subject: StoredSubjectRef,
-    body: StoredSignalBody,
+    report: StoredReportKind,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,9 +355,26 @@ struct StoredVerificationSet {
 struct StoredSignal {
     id: String,
     seq: u64,
-    sender: StoredAuthoritySnapshot,
+    sender: StoredSignalSender,
     subject: StoredSubjectRef,
     body: StoredSignalBody,
+}
+
+/// Untagged for v3 compatibility: legacy/full-authority senders retain their
+/// original object shape, while revision-6 worker provenance has a distinct
+/// wrapper key that cannot alias an authority snapshot.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredSignalSender {
+    WorkerBinding { worker_binding: StoredWorkerBinding },
+    Authority(StoredAuthoritySnapshot),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredWorkerBinding {
+    actor: StoredDecisionActor,
+    assignment: String,
+    attempt: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -745,13 +860,11 @@ struct StoredRuntimeObservation {
 enum StoredLaunchSubject {
     WorkerAttempt {
         attempt: String,
-        credential: String,
     },
     ActorActivation {
         actor: String,
         profile: String,
         generation: String,
-        credential: String,
     },
 }
 
@@ -822,37 +935,6 @@ impl From<StoredAuthorityClass> for AuthorityClass {
             StoredAuthorityClass::Orchestrator => Self::Orchestrator,
             StoredAuthorityClass::Worker => Self::Worker,
         }
-    }
-}
-
-impl From<&CredentialBinding> for StoredCredentialBinding {
-    fn from(value: &CredentialBinding) -> Self {
-        Self {
-            credential: value.credential.as_str().to_owned(),
-            digest: value.digest.as_str().to_owned(),
-            actor: value.actor.as_str().to_owned(),
-            profile: value.profile.as_str().to_owned(),
-            assignment: value.assignment.as_ref().map(|id| id.as_str().to_owned()),
-            revoked: value.revoked,
-        }
-    }
-}
-
-impl TryFrom<StoredCredentialBinding> for CredentialBinding {
-    type Error = StoredError;
-
-    fn try_from(value: StoredCredentialBinding) -> Result<Self, Self::Error> {
-        Ok(Self {
-            credential: parse_id!(CredentialId, value.credential, "credential id")?,
-            digest: content_hash(value.digest)?,
-            actor: parse_id!(ActorId, value.actor, "actor id")?,
-            profile: parse_id!(ProfileName, value.profile, "profile name")?,
-            assignment: value
-                .assignment
-                .map(|id| parse_id!(AssignmentId, id, "assignment id"))
-                .transpose()?,
-            revoked: value.revoked,
-        })
     }
 }
 
@@ -1329,6 +1411,40 @@ impl From<&Signal> for StoredSignal {
             subject: (&value.subject).into(),
             body: (&value.body).into(),
         }
+    }
+}
+
+impl From<&SignalSender> for StoredSignalSender {
+    fn from(value: &SignalSender) -> Self {
+        match value {
+            SignalSender::Authority(authority) => Self::Authority(authority.into()),
+            SignalSender::WorkerBinding {
+                actor,
+                assignment,
+                attempt,
+            } => Self::WorkerBinding {
+                worker_binding: StoredWorkerBinding {
+                    actor: actor.into(),
+                    assignment: assignment.as_str().to_owned(),
+                    attempt: attempt.as_str().to_owned(),
+                },
+            },
+        }
+    }
+}
+
+impl TryFrom<StoredSignalSender> for SignalSender {
+    type Error = StoredError;
+
+    fn try_from(value: StoredSignalSender) -> Result<Self, Self::Error> {
+        Ok(match value {
+            StoredSignalSender::Authority(authority) => Self::Authority(authority.try_into()?),
+            StoredSignalSender::WorkerBinding { worker_binding } => Self::WorkerBinding {
+                actor: worker_binding.actor.try_into()?,
+                assignment: parse_id!(AssignmentId, worker_binding.assignment, "assignment id")?,
+                attempt: parse_id!(AttemptId, worker_binding.attempt, "attempt id")?,
+            },
+        })
     }
 }
 
@@ -2185,23 +2301,17 @@ impl TryFrom<StoredApplicationReceipt> for ApplicationReceipt {
 impl From<&LaunchSubject> for StoredLaunchSubject {
     fn from(value: &LaunchSubject) -> Self {
         match value {
-            LaunchSubject::WorkerAttempt {
-                attempt,
-                credential,
-            } => Self::WorkerAttempt {
+            LaunchSubject::WorkerAttempt { attempt } => Self::WorkerAttempt {
                 attempt: attempt.as_str().to_owned(),
-                credential: credential.as_str().to_owned(),
             },
             LaunchSubject::ActorActivation {
                 actor,
                 profile,
                 generation,
-                credential,
             } => Self::ActorActivation {
                 actor: actor.as_str().to_owned(),
                 profile: profile.as_str().to_owned(),
                 generation: generation.as_str().to_owned(),
-                credential: credential.as_str().to_owned(),
             },
         }
     }
@@ -2212,23 +2322,17 @@ impl TryFrom<StoredLaunchSubject> for LaunchSubject {
 
     fn try_from(value: StoredLaunchSubject) -> Result<Self, Self::Error> {
         Ok(match value {
-            StoredLaunchSubject::WorkerAttempt {
-                attempt,
-                credential,
-            } => Self::WorkerAttempt {
+            StoredLaunchSubject::WorkerAttempt { attempt } => Self::WorkerAttempt {
                 attempt: parse_id!(AttemptId, attempt, "attempt id")?,
-                credential: parse_id!(CredentialId, credential, "credential id")?,
             },
             StoredLaunchSubject::ActorActivation {
                 actor,
                 profile,
                 generation,
-                credential,
             } => Self::ActorActivation {
                 actor: parse_id!(ActorId, actor, "actor id")?,
                 profile: parse_id!(ProfileName, profile, "profile name")?,
                 generation: parse_id!(OperationId, generation, "operation id")?,
-                credential: parse_id!(CredentialId, credential, "credential id")?,
             },
         })
     }
@@ -2638,13 +2742,6 @@ impl TryFrom<StoredAuditEvent> for AuditEvent {
     }
 }
 
-fn stored_credential(value: &CredentialProvisioning) -> StoredCredentialProvisioning {
-    StoredCredentialProvisioning {
-        id: value.id.as_str().to_owned(),
-        digest: value.digest.as_str().to_owned(),
-    }
-}
-
 pub(crate) fn assignment_opening_identity(
     value: &AssignmentOpening,
 ) -> Result<String, StoredError> {
@@ -2658,7 +2755,6 @@ pub(crate) fn assignment_opening_identity(
             authority: (&value.authorizing.authority).into(),
         },
         bead_revision: value.bead_revision.0.as_str().to_owned(),
-        worker_credential: stored_credential(&value.worker_credential),
     })
 }
 
@@ -2671,7 +2767,6 @@ pub(crate) fn attempt_opening_identity(value: &AttemptOpening) -> Result<String,
             reason: value.authorizing.reason.as_str().to_owned(),
         },
         attempt: (&value.attempt).into(),
-        worker_credential: stored_credential(&value.worker_credential),
     })
 }
 
@@ -2714,21 +2809,18 @@ pub(crate) fn activation_identity(value: &ActivationOpening) -> Result<String, S
                 .collect(),
         },
         case,
-        credential: stored_credential(&value.credential),
     })
 }
 
 pub(crate) fn report_identity(
     fenced_identity: &str,
-    draft: &SignalDraft,
+    draft: &ReportDraft,
 ) -> Result<String, StoredError> {
     encode_identity(&StoredFencedPayload {
         fenced_identity: fenced_identity.to_owned(),
-        payload: StoredSignalDraft {
+        payload: StoredReportDraft {
             id: draft.id.as_str().to_owned(),
-            sender: (&draft.sender).into(),
-            subject: (&draft.subject).into(),
-            body: (&draft.body).into(),
+            report: (&draft.kind).into(),
         },
     })
 }
@@ -2804,9 +2896,12 @@ fn validate_state(state: &State) -> Result<(), StoredError> {
             }
         }
     }
-    for (owner, binding) in &state.credentials {
-        if state.credential_owners.get(binding.credential.as_str()) != Some(owner) {
-            return Err(invalid("credential ownership", binding.credential.as_str()));
+    for ((actor, profile), generation) in &state.active_activations {
+        if !state.committed_operations.contains(generation.as_str()) {
+            return Err(invalid(
+                "activation generation",
+                format_args!("{actor}:{profile}"),
+            ));
         }
     }
     for signal in &state.signals {
@@ -3018,22 +3113,30 @@ pub(crate) fn load_state(connection: &Connection) -> Result<State, StoredError> 
     }
     {
         let mut statement = connection.prepare(
-            "SELECT owner_key, credential_id, record_version, record_json
-             FROM credential_bindings ORDER BY owner_key",
+            "SELECT profile_name, actor_id, generation_operation
+             FROM active_profile_activations ORDER BY profile_name, actor_id",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let owner: String = row.get(0)?;
-            let credential: String = row.get(1)?;
-            let version: i64 = row.get(2)?;
-            let json: String = row.get(3)?;
-            let stored: StoredCredentialBinding = decode_row(version, &json)?;
-            let binding: CredentialBinding = stored.try_into()?;
-            if binding.credential.as_str() != credential {
-                return Err(invalid("credential row identity", credential));
+            let profile: String = row.get(0)?;
+            let actor: String = row.get(1)?;
+            let generation: String = row.get(2)?;
+            parse_id!(ProfileName, profile.clone(), "profile name")?;
+            parse_id!(ActorId, actor.clone(), "actor id")?;
+            let generation = parse_id!(OperationId, generation, "operation id")?;
+            if !state
+                .active_members
+                .get(&profile)
+                .is_some_and(|members| members.contains(&actor))
+            {
+                return Err(invalid(
+                    "activation membership",
+                    format_args!("{actor}:{profile}"),
+                ));
             }
-            state.credential_owners.insert(credential, owner.clone());
-            state.credentials.insert(owner, binding);
+            state
+                .active_activations
+                .insert((actor, profile), generation);
         }
     }
     {
@@ -3486,53 +3589,41 @@ fn persist_meta_and_current(
         }
     }
 
-    for (owner, binding) in &after.credentials {
-        let stored = StoredCredentialBinding::from(binding);
-        let json = encode_row(&stored)?;
-        match before.credentials.get(owner) {
+    for (actor, profile) in before.active_activations.keys() {
+        if !after
+            .active_activations
+            .contains_key(&(actor.clone(), profile.clone()))
+        {
+            transaction.execute(
+                "DELETE FROM active_profile_activations
+                 WHERE profile_name = ?1 AND actor_id = ?2",
+                params![profile, actor],
+            )?;
+        }
+    }
+    for ((actor, profile), generation) in &after.active_activations {
+        match before
+            .active_activations
+            .get(&(actor.clone(), profile.clone()))
+        {
             None => {
                 transaction.execute(
-                    "INSERT INTO credential_bindings(
-                         owner_key, credential_id, revoked, record_version, record_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        owner,
-                        binding.credential.as_str(),
-                        i64::from(binding.revoked),
-                        i64::from(SCHEMA_VERSION),
-                        json
-                    ],
+                    "INSERT INTO active_profile_activations(
+                         profile_name, actor_id, generation_operation
+                     ) VALUES (?1, ?2, ?3)",
+                    params![profile, actor, generation.as_str()],
                 )?;
             }
-            Some(previous) => {
-                if previous.credential != binding.credential
-                    || previous.digest != binding.digest
-                    || previous.actor != binding.actor
-                    || previous.profile != binding.profile
-                    || previous.assignment != binding.assignment
-                {
-                    return Err(invalid("credential binding rewrite", owner));
-                }
+            Some(previous) if previous == generation => {}
+            Some(_) => {
                 transaction.execute(
-                    "UPDATE credential_bindings
-                     SET revoked = ?2, record_version = ?3, record_json = ?4
-                     WHERE owner_key = ?1",
-                    params![
-                        owner,
-                        i64::from(binding.revoked),
-                        i64::from(SCHEMA_VERSION),
-                        json
-                    ],
+                    "UPDATE active_profile_activations
+                     SET generation_operation = ?3
+                     WHERE profile_name = ?1 AND actor_id = ?2",
+                    params![profile, actor, generation.as_str()],
                 )?;
             }
         }
-    }
-    if before
-        .credentials
-        .keys()
-        .any(|owner| !after.credentials.contains_key(owner))
-    {
-        return Err(invalid("credential deletion", "not permitted"));
     }
 
     for (key, assignment) in &after.assignments {
@@ -4044,6 +4135,130 @@ fn persist_immutable_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revision_three_report_identity_replays_only_after_honest_narrowing() {
+        let report = ReportDraft {
+            id: SignalId::new("signal-compat").expect("valid signal id"),
+            kind: ReportKind::Progress {
+                phase: SemanticPhase::Verifying,
+                summary: None,
+            },
+        };
+        let current = report_identity("att=attempt-1|tok=7|responds_to=-", &report)
+            .expect("encode current report identity");
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "value": {
+                "fenced_identity":
+                    "asg=assignment-1|att=attempt-1|actor=worker-1|tok=7|responds_to=-",
+                "payload": {
+                    "id": "signal-compat",
+                    "sender": { "legacy_authority": true },
+                    "subject": { "kind": "attempt", "id": "attempt-1" },
+                    "body": {
+                        "kind": "report",
+                        "attempt": "attempt-1",
+                        "report": {
+                            "kind": "progress",
+                            "phase": "verifying",
+                            "summary": null
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        assert!(request_identities_match("fenced_report", &legacy, &current));
+
+        let changed = report_identity(
+            "att=attempt-1|tok=7|responds_to=-",
+            &ReportDraft {
+                id: report.id,
+                kind: ReportKind::BlockedWithReason {
+                    reason: BoundedText::new("different payload").expect("bounded reason"),
+                },
+            },
+        )
+        .expect("encode changed report identity");
+        assert!(
+            !request_identities_match("fenced_report", &legacy, &changed),
+            "compatibility drops only removed authority facts, never the Report payload"
+        );
+    }
+
+    #[test]
+    fn revision_three_removed_fields_do_not_weaken_remaining_identity() {
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "value": {
+                "assignment": "assignment-1",
+                "worker_credential": {
+                    "id": "credential-old",
+                    "digest": "digest-old"
+                }
+            }
+        })
+        .to_string();
+        let current = serde_json::json!({
+            "schema_version": 2,
+            "value": { "assignment": "assignment-1" }
+        })
+        .to_string();
+        let changed = serde_json::json!({
+            "schema_version": 2,
+            "value": { "assignment": "assignment-2" }
+        })
+        .to_string();
+
+        assert!(request_identities_match(
+            "open_assignment",
+            &legacy,
+            &current
+        ));
+        assert!(!request_identities_match(
+            "open_assignment",
+            &legacy,
+            &changed
+        ));
+    }
+
+    #[test]
+    fn revision_three_association_and_bare_fence_keys_normalize_narrowly() {
+        let legacy_association = serde_json::json!({
+            "schema_version": 1,
+            "value": {
+                "association_key": "attempt:attempt-1:credential:credential-old",
+                "payload": { "content": "same" }
+            }
+        })
+        .to_string();
+        let current_association = serde_json::json!({
+            "schema_version": 2,
+            "value": {
+                "association_key": "attempt:attempt-1",
+                "payload": { "content": "same" }
+            }
+        })
+        .to_string();
+        assert!(request_identities_match(
+            "persist_envelope",
+            &legacy_association,
+            &current_association
+        ));
+
+        assert!(request_identities_match(
+            "fenced_abort_attempt",
+            "asg=assignment-1|att=attempt-1|actor=worker-1|tok=7",
+            "att=attempt-1|tok=7"
+        ));
+        assert!(!request_identities_match(
+            "fenced_abort_attempt",
+            "asg=assignment-1|att=attempt-1|actor=worker-1|tok=7",
+            "att=attempt-2|tok=7"
+        ));
+    }
 
     #[test]
     fn unknown_representation_version_is_loud() {

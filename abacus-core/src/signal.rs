@@ -1,7 +1,7 @@
 //! Typed coordination Signals: Directive, Report, Request.
 //!
 //! One closed family (ADR-0001 §8, CONTEXT I19): immutable, idempotently
-//! appended, sender-fenced with the full authority snapshot, and bound
+//! appended, sender-fenced with the strongest provenance the call proves, and bound
 //! to exactly one validated workflow subject. Payloads are bounded
 //! typed values — never generic mail bodies — and a Request stores its
 //! concrete recipient (ADR-0002 §5: addressing, not subject). No
@@ -15,6 +15,7 @@
 //! and core only derives meaning from it (I13).
 
 pub use crate::assignment::AuthoritySnapshot;
+use crate::assignment::DecisionActor;
 use crate::id::{ActorId, AssignmentId, AttemptId, BeadId, SignalId};
 use crate::scope::ScopeExpr;
 
@@ -142,9 +143,31 @@ pub enum SignalBody {
 pub struct Signal {
     pub id: SignalId,
     pub seq: Seq,
-    pub sender: AuthoritySnapshot,
+    pub sender: SignalSender,
     pub subject: SubjectRef,
     pub body: SignalBody,
+}
+
+/// Strongest structurally proven Signal provenance. Decision-side Signals
+/// retain their exercised authority snapshot. Worker Reports retain the
+/// durable binding Scribe derives without fabricating a capability or scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalSender {
+    Authority(AuthoritySnapshot),
+    WorkerBinding {
+        actor: DecisionActor,
+        assignment: AssignmentId,
+        attempt: AttemptId,
+    },
+}
+
+impl SignalSender {
+    pub fn actor(&self) -> &DecisionActor {
+        match self {
+            Self::Authority(authority) => &authority.actor,
+            Self::WorkerBinding { actor, .. } => actor,
+        }
+    }
 }
 
 /// Caller-side Signal input: everything but the commit order. Commit
@@ -159,13 +182,22 @@ pub struct SignalDraft {
     pub body: SignalBody,
 }
 
+/// Worker-supplied Report payload. The caller selects no sender, subject, or
+/// Attempt identity here: Scribe resolves those facts from the fenced call's
+/// Attempt locator and the durable Assignment binding (ADR-0003 revision 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportDraft {
+    pub id: SignalId,
+    pub kind: ReportKind,
+}
+
 impl SignalDraft {
     /// Commit this draft at the Scribe-allocated order.
     pub fn commit(self, seq: Seq) -> Signal {
         Signal {
             id: self.id,
             seq,
-            sender: self.sender,
+            sender: SignalSender::Authority(self.sender),
             subject: self.subject,
             body: self.body,
         }
@@ -470,11 +502,20 @@ mod tests {
         AttemptId::new("att-1").unwrap()
     }
 
+    fn worker() -> DecisionActor {
+        DecisionActor {
+            actor: ActorId::new("worker-1").unwrap(),
+            class: AuthorityClass::Worker,
+            profile: ProfileName::new("worker").unwrap(),
+            profile_hash: ContentHash::new(&"b".repeat(64)).unwrap(),
+        }
+    }
+
     fn directive(id: &str, seq: u64, kind: DirectiveKind) -> Signal {
         Signal {
             id: SignalId::new(id).unwrap(),
             seq: Seq(seq),
-            sender: fence(),
+            sender: SignalSender::Authority(fence()),
             subject: SubjectRef::Attempt(attempt()),
             body: SignalBody::Directive {
                 assignment: AssignmentId::new("asg-1").unwrap(),
@@ -506,7 +547,11 @@ mod tests {
         Signal {
             id: SignalId::new(id).unwrap(),
             seq: Seq(seq),
-            sender: fence(),
+            sender: SignalSender::WorkerBinding {
+                actor: worker(),
+                assignment: AssignmentId::new("asg-1").unwrap(),
+                attempt: attempt(),
+            },
             subject: SubjectRef::Attempt(attempt()),
             body: SignalBody::Report {
                 attempt: attempt(),
@@ -521,7 +566,7 @@ mod tests {
         Signal {
             id: SignalId::new(id).unwrap(),
             seq: Seq(seq),
-            sender: fence(),
+            sender: SignalSender::Authority(fence()),
             subject: SubjectRef::Bead(BeadId::new("ABACUS-9nh").unwrap()),
             body: SignalBody::Request {
                 recipient: ActorId::new(recipient).unwrap(),

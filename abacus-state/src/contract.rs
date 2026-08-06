@@ -263,10 +263,6 @@ where
         vec![(attempt_id(), AttemptState::Expired)]
     );
     assert_eq!(port.decision(&reclaim.operation), Ok(reclaim));
-    assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
-        Err(StateError::CredentialRevoked)
-    );
     assert!(
         !port
             .unresolved_signals(None)
@@ -353,7 +349,6 @@ fn restart_preserves_application_derivations<H: RestartStateContractHarness>(
         let mut superseded_opening = opening_for(
             "asg-restart-superseded",
             "attempt-restart-superseded",
-            "cred-restart-superseded",
             superseded_target.as_str(),
         );
         superseded_opening.assignment.bead = opening().assignment.bead;
@@ -542,10 +537,6 @@ fn lead_authority(capability: &str) -> AuthoritySnapshot {
     authority_for(lead(), capability)
 }
 
-fn worker_authority(capability: &str) -> AuthoritySnapshot {
-    authority_for(worker(), capability)
-}
-
 fn reason(raw: &str) -> DecisionReason {
     DecisionReason::new(raw).expect("contract reason is valid")
 }
@@ -596,19 +587,10 @@ fn opening() -> AssignmentOpening {
             authority: lead_authority("state:assign"),
         },
         bead_revision: revision('e'),
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-contract-1").expect("valid credential id"),
-            digest: hash('f'),
-        },
     }
 }
 
-fn opening_for(
-    assignment: &str,
-    attempt: &str,
-    credential: &str,
-    operation: &str,
-) -> AssignmentOpening {
+fn opening_for(assignment: &str, attempt: &str, operation: &str) -> AssignmentOpening {
     let mut opening = opening();
     let assignment = AssignmentId::new(assignment).expect("valid assignment id");
     let attempt = AttemptId::new(attempt).expect("valid attempt id");
@@ -620,22 +602,18 @@ fn opening_for(
     opening.authorizing.operation = op(operation);
     opening.authorizing.assignment = assignment;
     opening.authorizing.first_attempt = attempt;
-    opening.worker_credential.id = CredentialId::new(credential).expect("valid credential id");
     opening
 }
 
 fn worker_subject() -> LaunchSubject {
     LaunchSubject::WorkerAttempt {
         attempt: attempt_id(),
-        credential: CredentialId::new("cred-contract-1").expect("valid credential id"),
     }
 }
 
 fn call(operation: &str) -> FencedCall {
     FencedCall {
-        assignment: assignment_id(),
         attempt: attempt_id(),
-        actor: worker().actor,
         token: FencingToken(3),
         operation: op(operation),
     }
@@ -665,17 +643,12 @@ fn evidence() -> Evidence {
     .expect("contract evidence is coherent")
 }
 
-fn report_draft(id: &str) -> SignalDraft {
-    SignalDraft {
+fn report_draft(id: &str) -> ReportDraft {
+    ReportDraft {
         id: SignalId::new(id).expect("valid signal id"),
-        sender: worker_authority("state:report"),
-        subject: SubjectRef::Attempt(attempt_id()),
-        body: SignalBody::Report {
-            attempt: attempt_id(),
-            kind: ReportKind::Progress {
-                phase: SemanticPhase::Verifying,
-                summary: None,
-            },
+        kind: ReportKind::Progress {
+            phase: SemanticPhase::Verifying,
+            summary: None,
         },
     }
 }
@@ -776,10 +749,6 @@ fn activation(operation: &str, actor_id: &str, profile: &str) -> ActivationOpeni
         )
         .expect("profile exists"),
         case: ActivationCase::OperatorBootstrap,
-        credential: CredentialProvisioning {
-            id: CredentialId::new(&format!("cred-{operation}")).expect("valid credential"),
-            digest: hash('7'),
-        },
     }
 }
 
@@ -826,20 +795,9 @@ fn opening_is_atomic_idempotent_and_queryable<H: StateContractHarness>(
     assert_eq!(view.head, Seq(1));
 
     assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
-        Ok(())
-    );
-    assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('0')),
-        Err(StateError::CredentialInvalid)
-    );
-    let wrong_binding = LaunchSubject::WorkerAttempt {
-        attempt: attempt_id(),
-        credential: CredentialId::new("cred-contract-wrong").expect("valid credential"),
-    };
-    assert_eq!(
-        port.verify_launch_subject(&wrong_binding, &hash('f')),
-        Err(StateError::CredentialBindingMismatch)
+        port.runtime_handle(&worker_subject()),
+        Ok(None),
+        "the durable Attempt locator resolves without caller-supplied authority"
     );
 
     let pending = port.pending_applications().expect("pending query succeeds");
@@ -875,7 +833,7 @@ fn refused_opening_claims_nothing<H: StateContractHarness>(build: &impl Fn(Times
             .is_empty()
     );
     assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
+        port.runtime_handle(&worker_subject()),
         Err(StateError::UnknownRecord)
     );
     assert_eq!(
@@ -927,11 +885,11 @@ fn profile_lifecycle_is_derived_and_atomic<H: StateContractHarness>(
         actor: actor("lead-profile-1"),
         profile: ProfileName::new("lead").expect("valid profile"),
         generation: op("op-boot"),
-        credential: boot.credential.id.clone(),
     };
     assert_eq!(
-        port.verify_launch_subject(&old_subject, &boot.credential.digest),
-        Ok(())
+        port.runtime_handle(&old_subject),
+        Ok(None),
+        "the current activation generation resolves without a bearer credential"
     );
 
     let rotation = with_case(
@@ -945,28 +903,20 @@ fn profile_lifecycle_is_derived_and_atomic<H: StateContractHarness>(
         port.activate_profile(&rotation),
         Ok(StateApplied::AlreadyApplied)
     );
-    let mut changed_rotation = rotation.clone();
-    changed_rotation.credential.digest = hash('6');
-    assert_eq!(
-        port.activate_profile(&changed_rotation),
-        Err(StateError::ConflictingOperation),
-        "fresh provisioning is part of activation identity"
-    );
     let rotated_subject = LaunchSubject::ActorActivation {
         actor: actor("lead-profile-1"),
         profile: ProfileName::new("lead").expect("valid profile"),
         generation: op("op-rotate"),
-        credential: rotation.credential.id.clone(),
     };
     assert_eq!(
-        port.verify_launch_subject(&old_subject, &boot.credential.digest),
-        Err(StateError::CredentialRevoked),
-        "rotation revokes the prior activation generation"
+        port.runtime_handle(&old_subject),
+        Err(StateError::StaleFencing),
+        "rotation fences the prior activation generation"
     );
     assert_eq!(
-        port.verify_launch_subject(&rotated_subject, &rotation.credential.digest),
-        Ok(()),
-        "rotation atomically provisions the fresh generation"
+        port.runtime_handle(&rotated_subject),
+        Ok(None),
+        "rotation atomically records the fresh generation"
     );
 
     assert_eq!(
@@ -983,8 +933,8 @@ fn profile_lifecycle_is_derived_and_atomic<H: StateContractHarness>(
             .is_empty()
     );
     assert_eq!(
-        port.verify_launch_subject(&rotated_subject, &rotation.credential.digest),
-        Err(StateError::CredentialRevoked)
+        port.runtime_handle(&rotated_subject),
+        Err(StateError::UnknownRecord)
     );
     assert_eq!(
         port.deactivate_profile(
@@ -1023,12 +973,10 @@ fn profile_lifecycle_is_derived_and_atomic<H: StateContractHarness>(
     let mut second_worker = opening_for(
         "asg-contract-worker-2",
         "att-contract-worker-2",
-        "cred-contract-worker-2",
         "op-open-worker-2",
     );
     second_worker.assignment.worker.actor = actor("worker-contract-2");
     second_worker.assignment.worker.profile_hash = hash('3');
-    second_worker.worker_credential.digest = hash('2');
     assert_eq!(
         port.open_assignment(&second_worker),
         Ok(StateApplied::Applied)
@@ -1052,21 +1000,13 @@ fn profile_lifecycle_is_derived_and_atomic<H: StateContractHarness>(
         Ok(vec![actor("worker-contract-2")]),
         "deactivation removes only the named shared-profile member"
     );
-    assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
-        Err(StateError::CredentialRevoked)
-    );
     let second_worker_subject = LaunchSubject::WorkerAttempt {
         attempt: second_worker.first_attempt.id,
-        credential: second_worker.worker_credential.id,
     };
     assert_eq!(
-        port.verify_launch_subject(
-            &second_worker_subject,
-            &second_worker.worker_credential.digest
-        ),
-        Ok(()),
-        "deactivation revokes no co-occupant credential"
+        port.runtime_handle(&second_worker_subject),
+        Ok(None),
+        "profile membership changes do not replace Attempt fencing"
     );
 }
 
@@ -1199,10 +1139,6 @@ fn fencing_tracks_clock_expiry_renewal_and_supersession<H: StateContractHarness>
                 expires_at: Timestamp(300),
             },
         },
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-contract-2").expect("valid credential"),
-            digest: hash('6'),
-        },
     };
     let mut nonmonotonic = successor.clone();
     nonmonotonic.attempt.lease.token = FencingToken(3);
@@ -1218,9 +1154,7 @@ fn fencing_tracks_clock_expiry_renewal_and_supersession<H: StateContractHarness>
     );
     let stale_successor = FencedAction {
         call: FencedCall {
-            assignment: assignment_id(),
             attempt: successor.attempt.id.clone(),
-            actor: worker().actor,
             token: FencingToken(3),
             operation: op("op-stale-successor"),
         },
@@ -1231,17 +1165,13 @@ fn fencing_tracks_clock_expiry_renewal_and_supersession<H: StateContractHarness>
         Err(StateError::StaleFencing),
         "the successor's monotonic token fences the predecessor token"
     );
-    assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
-        Err(StateError::CredentialRevoked)
-    );
     let successor_subject = LaunchSubject::WorkerAttempt {
         attempt: successor.attempt.id.clone(),
-        credential: successor.worker_credential.id.clone(),
     };
     assert_eq!(
-        port.verify_launch_subject(&successor_subject, &successor.worker_credential.digest),
-        Ok(())
+        port.runtime_handle(&successor_subject),
+        Ok(None),
+        "the successor Attempt locator resolves from durable Assignment state"
     );
 
     let capped_harness = build(Timestamp(50));
@@ -1348,14 +1278,7 @@ fn response_links_are_causal_and_idempotent<H: StateContractHarness>(
     for altered in [
         FencedAction {
             call: FencedCall {
-                assignment: AssignmentId::new("asg-altered").expect("valid id"),
-                ..linked.call.clone()
-            },
-            ..linked.clone()
-        },
-        FencedAction {
-            call: FencedCall {
-                actor: actor("worker-altered"),
+                attempt: AttemptId::new("att-altered").expect("valid id"),
                 ..linked.call.clone()
             },
             ..linked.clone()
@@ -1371,7 +1294,7 @@ fn response_links_are_causal_and_idempotent<H: StateContractHarness>(
         assert_eq!(
             port.fenced_evidence(&altered, &evidence()),
             Err(StateError::ConflictingOperation),
-            "every fenced identity field participates in replay identity"
+            "every caller-supplied fenced identity field participates in replay identity"
         );
     }
 
@@ -1398,7 +1321,6 @@ fn response_links_are_causal_and_idempotent<H: StateContractHarness>(
     let foreign_opening = opening_for(
         "asg-contract-foreign",
         "att-contract-foreign",
-        "cred-contract-foreign",
         "op-open-foreign",
     );
     assert_eq!(
@@ -1664,11 +1586,6 @@ fn abort_terminal_is_explicit_idempotent_and_causal<H: StateContractHarness>(
         .expect("assignment exists");
     assert_eq!(view.state, AssignmentState::Active);
     assert_eq!(view.attempts, vec![(attempt_id(), AttemptState::Aborted)]);
-    assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
-        Err(StateError::CredentialRevoked)
-    );
-
     let attempt_events = port
         .audit_events(&AuditQuery {
             class: Some(AuditClass::Attempt),
@@ -1697,7 +1614,7 @@ fn abort_terminal_is_explicit_idempotent_and_causal<H: StateContractHarness>(
         .expect("audit query succeeds");
     let replay = port
         .fenced_abort_attempt(&abort_call)
-        .expect("terminal replay bypasses ended state and revoked credential");
+        .expect("terminal replay bypasses mutable ended-state validation");
     assert_eq!(replay.applied, StateApplied::AlreadyApplied);
     assert_eq!(replay.head, response.head);
     assert_eq!(replay.binding_directives, vec![amend]);
@@ -1707,14 +1624,14 @@ fn abort_terminal_is_explicit_idempotent_and_causal<H: StateContractHarness>(
         audit_after_success,
         "exact replay allocates neither order nor audit"
     );
-    let changed_actor = FencedCall {
-        actor: actor("different-worker"),
+    let changed_attempt = FencedCall {
+        attempt: AttemptId::new("att-different-worker").expect("valid attempt"),
         ..abort_call.clone()
     };
     assert_eq!(
-        port.fenced_abort_attempt(&changed_actor),
+        port.fenced_abort_attempt(&changed_attempt),
         Err(StateError::ConflictingOperation),
-        "all fenced identity fields participate before mutable validation"
+        "the Attempt locator participates before mutable validation"
     );
     assert_eq!(
         port.append_signal(&pause("sig-after-aborted")),
@@ -1736,10 +1653,6 @@ fn abort_terminal_is_explicit_idempotent_and_causal<H: StateContractHarness>(
                 token: FencingToken(4),
                 expires_at: Timestamp(200),
             },
-        },
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-contract-after-abort").expect("valid credential"),
-            digest: hash('6'),
         },
     };
     assert_eq!(port.append_attempt(&successor), Ok(StateApplied::Applied));
@@ -1907,26 +1820,22 @@ fn pause_and_amend_still_permit_worker_appends<H: StateContractHarness>(
 
     let report = report_draft("sig-report-under-pause");
     let report_action = action("op-report-under-pause", Some(amend.id.clone()));
-    let mut forged_report = report.clone();
-    forged_report.sender.actor.profile_hash = hash('0');
-    let before_forged_report = visible_facts(port);
-    assert_eq!(
-        port.fenced_report(&report_action, &forged_report),
-        Err(StateError::ActorMismatch),
-        "the full worker snapshot, not ActorId alone, binds a report"
-    );
-    assert_eq!(visible_facts(port), before_forged_report);
-
     let (report_outcome, report_response) = port
         .fenced_report(&report_action, &report)
         .expect("pause and amend permit reports");
-    assert!(matches!(report_outcome, ReportOutcome::Recorded { .. }));
-    assert_eq!(report_response.binding_directives, vec![pause.clone()]);
+    let ReportOutcome::Recorded { signal } = report_outcome else {
+        panic!("report must record without Abort");
+    };
     assert_eq!(
-        port.append_signal(&report),
-        Err(StateError::IncoherentBundle),
-        "even an existing Report has no unfenced replay carriage"
+        signal.sender,
+        SignalSender::WorkerBinding {
+            actor: worker(),
+            assignment: assignment_id(),
+            attempt: attempt_id(),
+        },
+        "Scribe derives Report provenance from the fenced Attempt; the caller cannot assert it"
     );
+    assert_eq!(report_response.binding_directives, vec![pause.clone()]);
 
     let (evidence_outcome, evidence_response) = port
         .fenced_evidence(
@@ -2086,10 +1995,6 @@ fn handoff_refusals_and_acceptance_are_transactional<H: StateContractHarness>(
     let view = port.assignment(&assignment_id()).expect("exists");
     assert_eq!(view.state, AssignmentState::Accepted);
     assert_eq!(view.attempts, vec![(attempt_id(), AttemptState::Accepted)]);
-    assert_eq!(
-        port.verify_launch_subject(&worker_subject(), &hash('f')),
-        Err(StateError::CredentialRevoked)
-    );
     assert!(
         port.pending_applications()
             .expect("query succeeds")
@@ -2227,18 +2132,17 @@ fn runtime_associations_use_the_full_launch_subject<H: StateContractHarness>(
         Err(StateError::ConflictingOperation)
     );
 
-    let wrong_subject = LaunchSubject::WorkerAttempt {
-        attempt: attempt_id(),
-        credential: CredentialId::new("cred-contract-wrong").expect("valid credential"),
+    let unknown_subject = LaunchSubject::WorkerAttempt {
+        attempt: AttemptId::new("att-contract-unknown").expect("valid attempt"),
     };
-    let head_before_wrong_subject = port.assignment(&assignment_id()).expect("exists").head;
+    let head_before_unknown_subject = port.assignment(&assignment_id()).expect("exists").head;
     assert_eq!(
-        port.persist_envelope(&op("op-wrong-subject"), &wrong_subject, &envelope),
-        Err(StateError::CredentialBindingMismatch)
+        port.persist_envelope(&op("op-unknown-subject"), &unknown_subject, &envelope),
+        Err(StateError::UnknownRecord)
     );
     assert_eq!(
         port.assignment(&assignment_id()).expect("exists").head,
-        head_before_wrong_subject,
+        head_before_unknown_subject,
         "association validation failures commit nothing"
     );
 
@@ -2297,7 +2201,6 @@ fn runtime_associations_use_the_full_launch_subject<H: StateContractHarness>(
         actor: actor("lead-association-1"),
         profile: ProfileName::new("lead").expect("valid profile"),
         generation: op("op-association-boot"),
-        credential: activation.credential.id,
     };
     let actor_envelope = EnvelopeSnapshot::new("sanitized actor envelope".into(), hash('7'))
         .expect("bounded envelope");
@@ -2636,7 +2539,6 @@ fn projection_receipts_clear_only_proven_success<H: StateContractHarness>(
     let mut other_opening = opening_for(
         "asg-contract-other",
         "attempt-contract-other",
-        "cred-contract-other",
         "yy-contract-open-other",
     );
     other_opening.assignment.bead = late_key_opening.assignment.bead.clone();

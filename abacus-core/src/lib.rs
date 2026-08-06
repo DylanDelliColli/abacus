@@ -36,8 +36,8 @@ pub use evidence::{
     evaluate_red_green_pair,
 };
 pub use id::{
-    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, CredentialId, HandoffId, IdError,
-    OperationId, ProfileName, SignalId,
+    ActorId, AssignmentId, AttemptId, BeadId, CapabilityId, HandoffId, IdError, OperationId,
+    ProfileName, SignalId,
 };
 pub use lease::{FencingError, FencingToken, Lease, Timestamp, validate_fencing};
 pub use lifecycle::{
@@ -52,8 +52,8 @@ pub use profile::{
 pub use scope::{Atom, ScopeError, ScopeExpr, ScopeKey, ScopeMap, ScopeValue, Selector};
 pub use signal::{
     AppendOutcome, ConflictingDuplicate, DirectiveGateRefusal, DirectiveKind, DirectiveStatus,
-    ReportKind, RequestKind, ResponseAction, ResponseKind, Seq, Signal, SignalBody, SignalDraft,
-    SubjectError, SubjectRef, append_idempotent, binding_directives, directive_status,
-    handoff_gate, unresolved, worker_append_gate,
+    ReportDraft, ReportKind, RequestKind, ResponseAction, ResponseKind, Seq, Signal, SignalBody,
+    SignalDraft, SignalSender, SubjectError, SubjectRef, append_idempotent, binding_directives,
+    directive_status, handoff_gate, unresolved, worker_append_gate,
 };
 pub use signal::{AuthoritySnapshot, BoundedText, BoundedTextError, SemanticPhase};

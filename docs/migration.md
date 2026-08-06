@@ -166,7 +166,7 @@ Acceptance:
 - core tests are pure and deterministic;
 - state tests use only temporary directories/databases;
 - Scribe restart, idempotent request retry, lease expiry, stale fencing, Acceptance interruption/reconciliation, and migration failure are covered;
-- the client/server transport implements the ADR-0003 two-carriage design (credentialed actors, no protocol enrolment surface, relay framing) once its gate clears;
+- the client/server transport implements the accepted ADR-0003 two-carriage design: injected carriage selection with no fallback, relay framing, launch-written non-secret worker Attempt locators resolved by Scribe, and a separately authenticated decision surface;
 - no `br`, `bv`, Herdr, live agent, network, or user-home dependency exists;
 - module and workspace hermetic budgets are recorded.
 

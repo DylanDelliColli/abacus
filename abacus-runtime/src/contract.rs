@@ -6,7 +6,7 @@
 //! subset with real sessions and runs the same rows.
 
 use abacus_core::ports::*;
-use abacus_core::{AttemptId, CredentialId, Timestamp};
+use abacus_core::{AttemptId, Timestamp};
 use std::collections::BTreeMap;
 
 /// Test-side control surface. The fake implements everything; a live
@@ -22,25 +22,18 @@ pub trait RuntimeContractHarness {
     fn arm(&self, failure: crate::fake::FakeFailure);
     /// Prompts the provider accepted for the session, in order.
     fn accepted_prompts(&self, correlation: &str) -> Vec<String>;
-    /// (envelope, secret) startup deliveries the provider accepted.
-    fn startup_deliveries(&self, correlation: &str) -> Vec<(String, String)>;
+    /// Startup Envelopes the provider accepted.
+    fn startup_deliveries(&self, correlation: &str) -> Vec<String>;
     /// Recorded stop calls (`true` = forced).
     fn stops(&self, correlation: &str) -> Vec<bool>;
     /// Every start invocation's argv and environment.
     fn starts(&self) -> Vec<crate::fake::StartRecord>;
 }
 
-const SECRET_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
 fn subject(suffix: &str) -> LaunchSubject {
     LaunchSubject::WorkerAttempt {
         attempt: AttemptId::new(&format!("att-rt-{suffix}")).expect("valid attempt id"),
-        credential: CredentialId::new(&format!("cred-rt-{suffix}")).expect("valid credential id"),
     }
-}
-
-fn secret_for(subject: &LaunchSubject) -> EphemeralLaunchSecret {
-    EphemeralLaunchSecret::new(SECRET_HEX.to_owned(), subject.clone()).expect("valid secret")
 }
 
 fn spec(suffix: &str) -> LaunchSpec {
@@ -63,10 +56,7 @@ fn spec(suffix: &str) -> LaunchSpec {
 }
 
 fn launched(port: &dyn RuntimePort, suffix: &str) -> LaunchOutcome {
-    match port
-        .launch(&spec(suffix), secret_for(&subject(suffix)))
-        .expect("launch succeeds")
-    {
+    match port.launch(&spec(suffix)).expect("launch succeeds") {
         LaunchAttempt::Launched(outcome) => outcome,
         LaunchAttempt::Ambiguous { .. } => panic!("unscripted launch must not be ambiguous"),
     }
@@ -78,8 +68,7 @@ where
     H: RuntimeContractHarness,
     F: Fn() -> H,
 {
-    subject_swap_refuses_before_any_provider_interaction(&build);
-    launch_delivers_startup_material_out_of_argv_and_env(&build);
+    launch_delivers_envelope_out_of_argv_and_env(&build);
     ambiguous_launch_recovers_by_subject_and_correlation(&build);
     a_foreign_subject_never_rebinds_a_correlation(&build);
     generation_rotation_fences_every_verb_until_reassociation(&build);
@@ -89,26 +78,7 @@ where
     version_drift_and_foreign_handles_fail_closed(&build);
 }
 
-fn subject_swap_refuses_before_any_provider_interaction<H: RuntimeContractHarness>(
-    build: &impl Fn() -> H,
-) {
-    let harness = build();
-    let port = harness.port();
-    let mismatched = secret_for(&subject("other"));
-    assert_eq!(
-        port.launch(&spec("swap"), mismatched).err(),
-        Some(RuntimeError::Rejected),
-        "a cross-subject secret is refused"
-    );
-    assert!(
-        harness.starts().is_empty(),
-        "the refusal precedes every provider interaction"
-    );
-}
-
-fn launch_delivers_startup_material_out_of_argv_and_env<H: RuntimeContractHarness>(
-    build: &impl Fn() -> H,
-) {
+fn launch_delivers_envelope_out_of_argv_and_env<H: RuntimeContractHarness>(build: &impl Fn() -> H) {
     let harness = build();
     let outcome = launched(harness.port(), "happy");
     assert_eq!(outcome.startup_delivery, StartupDelivery::Submitted);
@@ -117,25 +87,25 @@ fn launch_delivers_startup_material_out_of_argv_and_env<H: RuntimeContractHarnes
     let deliveries = harness.startup_deliveries("corr-happy");
     assert_eq!(
         deliveries,
-        vec![("sanitized envelope".to_owned(), SECRET_HEX.to_owned())],
-        "envelope and secret ride the startup channel exactly once"
+        vec!["sanitized envelope".to_owned()],
+        "the Envelope rides the startup channel exactly once"
     );
     for start in harness.starts() {
         assert!(
-            !start.args.iter().any(|arg| arg.contains(SECRET_HEX)),
-            "the secret never appears in argv"
+            !start.args.iter().any(|arg| arg == "sanitized envelope"),
+            "the Envelope never appears in argv"
         );
         assert!(
             !start
                 .environment
                 .values()
-                .any(|value| value.contains(SECRET_HEX)),
-            "the secret never appears in the environment"
+                .any(|value| value == "sanitized envelope"),
+            "the Envelope never appears in the environment"
         );
     }
     assert!(
-        !outcome.handle.as_str().contains(SECRET_HEX),
-        "the opaque handle carries no material"
+        !outcome.handle.as_str().contains("sanitized envelope"),
+        "the opaque handle carries no Envelope content"
     );
 }
 
@@ -146,7 +116,7 @@ fn ambiguous_launch_recovers_by_subject_and_correlation<H: RuntimeContractHarnes
     let port = harness.port();
     harness.arm(crate::fake::FakeFailure::AmbiguousStartCreated);
     let attempt = port
-        .launch(&spec("amb"), secret_for(&subject("amb")))
+        .launch(&spec("amb"))
         .expect("ambiguous launch is an outcome, not an error");
     let LaunchAttempt::Ambiguous {
         subject: echoed,
@@ -177,7 +147,7 @@ fn ambiguous_launch_recovers_by_subject_and_correlation<H: RuntimeContractHarnes
     lost.arm(crate::fake::FakeFailure::AmbiguousStartLost);
     let attempt = lost
         .port()
-        .launch(&spec("lost"), secret_for(&subject("lost")))
+        .launch(&spec("lost"))
         .expect("ambiguous launch reported");
     let LaunchAttempt::Ambiguous { correlation, .. } = attempt else {
         panic!("scripted ambiguity must surface");
@@ -303,14 +273,13 @@ fn delivery_and_control_ambiguity_is_reported_never_retried<H: RuntimeContractHa
     ambiguous.arm(crate::fake::FakeFailure::AmbiguousDelivery);
     let outcome = launched(ambiguous.port(), "ambdel");
     assert_eq!(outcome.startup_delivery, StartupDelivery::Ambiguous);
-    // The burn-the-secret half of the doctrine: the submission DID
-    // reach the provider, so exactly one material pair exists and the
-    // unit performs no redelivery. Recovery is the caller's
-    // stop-revoke-successor path, never a runtime retry.
+    // The submission DID reach the provider, so exactly one Envelope
+    // exists and the unit performs no redelivery. Recovery is the
+    // caller's reconcile path, never a runtime retry.
     assert_eq!(
         ambiguous.startup_deliveries("corr-ambdel").len(),
         1,
-        "an ambiguous delivery submitted material exactly once"
+        "an ambiguous delivery submitted the Envelope exactly once"
     );
     let recovered = ambiguous
         .port()
@@ -329,7 +298,7 @@ fn delivery_and_control_ambiguity_is_reported_never_retried<H: RuntimeContractHa
     assert_eq!(
         ambiguous.startup_deliveries("corr-ambdel").len(),
         1,
-        "no path in the unit redelivers the burned secret"
+        "no path in the unit redelivers the Envelope"
     );
 }
 
@@ -403,10 +372,7 @@ fn version_drift_and_foreign_handles_fail_closed<H: RuntimeContractHarness>(
     let harness = build();
     harness.arm(crate::fake::FakeFailure::VersionDrift);
     assert_eq!(
-        harness
-            .port()
-            .launch(&spec("drift"), secret_for(&subject("drift")))
-            .err(),
+        harness.port().launch(&spec("drift")).err(),
         Some(RuntimeError::VersionMismatch),
         "pinned-identity drift fails closed before any session verb"
     );

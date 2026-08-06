@@ -7,7 +7,7 @@
 
 use rusqlite::{Connection, Error as SqliteError, OpenFlags, TransactionBehavior};
 
-const LATEST_SCHEMA_VERSION: u32 = 3;
+const LATEST_SCHEMA_VERSION: u32 = 4;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS repository_meta (
@@ -277,6 +277,64 @@ CREATE UNIQUE INDEX idx_decisions_decided_handoff
     WHERE decided_handoff_id IS NOT NULL;
 "#;
 
+// V4 removes credentials from semantic launch identity while keeping the v2/v3
+// credential tables dormant. Activation generation remains a real association
+// fence, so it moves into its own minimal current-state table. Existing live
+// activation generations are recovered from the old non-revoked owner key;
+// worker credential rows have a different prefix and are ignored.
+//
+// The key rewrites rely on v3's domain invariants: an Attempt had exactly one
+// provisioned credential, while every actor activation rotation advanced its
+// generation as well as its credential. The activation backfill likewise
+// relies on v3 revoking the prior non-worker binding before inserting the next
+// one. The destination primary keys intentionally make any impossible
+// collision abort the transaction rather than selecting a winner.
+const MIGRATION_4: &str = r#"
+UPDATE envelopes
+SET launch_subject_key = substr(
+    launch_subject_key,
+    1,
+    instr(launch_subject_key, ':credential:') - 1
+)
+WHERE instr(launch_subject_key, ':credential:') > 0;
+
+UPDATE runtime_handles
+SET launch_subject_key = substr(
+    launch_subject_key,
+    1,
+    instr(launch_subject_key, ':credential:') - 1
+)
+WHERE instr(launch_subject_key, ':credential:') > 0;
+
+CREATE TABLE active_profile_activations (
+    profile_name TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    generation_operation TEXT NOT NULL,
+    PRIMARY KEY (profile_name, actor_id),
+    FOREIGN KEY (profile_name, actor_id)
+        REFERENCES active_profile_members(profile_name, actor_id)
+        ON DELETE CASCADE
+);
+
+INSERT INTO active_profile_activations(
+    profile_name, actor_id, generation_operation
+)
+SELECT members.profile_name,
+       members.actor_id,
+       substr(
+           bindings.owner_key,
+           length(
+               'activation:' || members.actor_id || ':' ||
+               members.profile_name || ':'
+           ) + 1
+       )
+FROM active_profile_members AS members
+JOIN credential_bindings AS bindings
+  ON bindings.owner_key LIKE
+     'activation:' || members.actor_id || ':' || members.profile_name || ':%'
+ AND bindings.revoked = 0;
+"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     #[error("sqlite error: {0}")]
@@ -335,6 +393,12 @@ pub fn apply_migrations(
         transaction.pragma_update(None, "user_version", 3_u32)?;
         transaction.commit()?;
     }
+    if from_version < 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_4)?;
+        transaction.pragma_update(None, "user_version", 4_u32)?;
+        transaction.commit()?;
+    }
     Ok(MigrationReport {
         from_version,
         to_version: LATEST_SCHEMA_VERSION,
@@ -360,10 +424,10 @@ mod tests {
         let path = temporary_db();
         let first = apply_migrations(&path).expect("first migration");
         assert_eq!(first.from_version, 0);
-        assert_eq!(first.to_version, 3);
+        assert_eq!(first.to_version, 4);
         let second = apply_migrations(&path).expect("second migration");
-        assert_eq!(second.from_version, 3);
-        assert_eq!(second.to_version, 3);
+        assert_eq!(second.from_version, 4);
+        assert_eq!(second.to_version, 4);
         let connection = Connection::open(&path).expect("open migrated database");
         let journal: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -395,6 +459,7 @@ mod tests {
             "workflow_meta",
             "actor_classes",
             "active_profile_members",
+            "active_profile_activations",
             "credential_bindings",
             "response_actions",
             "report_outcomes",
@@ -430,15 +495,15 @@ mod tests {
         assert!(matches!(
             apply_migrations(&path),
             Err(MigrationError::IncompatibleVersion {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             })
         ));
         let connection = Connection::open(&path).expect("reopen database");
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let journal: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .expect("read journal mode");
@@ -459,7 +524,7 @@ mod tests {
 
         let report = apply_migrations(&path).expect("upgrade v1");
         assert_eq!(report.from_version, 1);
-        assert_eq!(report.to_version, 3);
+        assert_eq!(report.to_version, 4);
         let connection = Connection::open(&path).expect("reopen upgraded database");
         let credential_table: String = connection
             .query_row(
@@ -494,7 +559,7 @@ mod tests {
 
         let report = apply_migrations(&path).expect("upgrade v2");
         assert_eq!(report.from_version, 2);
-        assert_eq!(report.to_version, 3);
+        assert_eq!(report.to_version, 4);
         let connection = Connection::open(&path).expect("reopen upgraded database");
         let decided_handoff_column: i64 = connection
             .query_row(
@@ -521,6 +586,91 @@ mod tests {
                 .expect("index lookup");
             assert_eq!(present, 1, "missing v3 index {index}");
         }
+        drop(connection);
+        std::fs::remove_file(path).expect("remove temporary database");
+    }
+
+    #[test]
+    fn v3_database_drops_credential_suffixes_and_preserves_activation_generation() {
+        let path = temporary_db();
+        let connection = Connection::open(&path).expect("create database");
+        connection.execute_batch(MIGRATION_1).expect("apply v1");
+        connection.execute_batch(MIGRATION_2).expect("apply v2");
+        connection.execute_batch(MIGRATION_3).expect("apply v3");
+        connection
+            .execute(
+                "INSERT INTO envelopes(
+                     launch_subject_key, envelope_json, committed_seq
+                 ) VALUES (?1, '{}', 1)",
+                ["attempt:attempt-old:credential:credential-old"],
+            )
+            .expect("insert legacy worker envelope");
+        connection
+            .execute(
+                "INSERT INTO runtime_handles(
+                     launch_subject_key, handle, committed_seq
+                 ) VALUES (?1, 'arh1|workspace|pane|generation', 2)",
+                ["activation:actor-a:lead:generation-a:credential:credential-a"],
+            )
+            .expect("insert legacy activation handle");
+        connection
+            .execute(
+                "INSERT INTO active_profile_members(profile_name, actor_id)
+                 VALUES ('lead', 'actor-a')",
+                [],
+            )
+            .expect("insert active member");
+        connection
+            .execute(
+                "INSERT INTO credential_bindings(
+                     owner_key, credential_id, revoked, record_version, record_json
+                 ) VALUES (
+                     'activation:actor-a:lead:generation-a',
+                     'credential-a', 0, 1, '{}'
+                 )",
+                [],
+            )
+            .expect("insert legacy activation binding");
+        connection
+            .pragma_update(None, "user_version", 3_u32)
+            .expect("mark v3");
+        drop(connection);
+
+        let report = apply_migrations(&path).expect("upgrade v3");
+        assert_eq!(report.from_version, 3);
+        assert_eq!(report.to_version, 4);
+
+        let connection = Connection::open(&path).expect("reopen upgraded database");
+        let envelope_key: String = connection
+            .query_row("SELECT launch_subject_key FROM envelopes", [], |row| {
+                row.get(0)
+            })
+            .expect("normalized envelope key");
+        assert_eq!(envelope_key, "attempt:attempt-old");
+        let handle_key: String = connection
+            .query_row(
+                "SELECT launch_subject_key FROM runtime_handles",
+                [],
+                |row| row.get(0),
+            )
+            .expect("normalized handle key");
+        assert_eq!(handle_key, "activation:actor-a:lead:generation-a");
+        let generation: String = connection
+            .query_row(
+                "SELECT generation_operation
+                 FROM active_profile_activations
+                 WHERE profile_name = 'lead' AND actor_id = 'actor-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved activation generation");
+        assert_eq!(generation, "generation-a");
+        let dormant_binding_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM credential_bindings", [], |row| {
+                row.get(0)
+            })
+            .expect("dormant binding remains readable");
+        assert_eq!(dormant_binding_count, 1);
         drop(connection);
         std::fs::remove_file(path).expect("remove temporary database");
     }

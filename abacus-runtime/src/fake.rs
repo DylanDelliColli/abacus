@@ -48,8 +48,8 @@ struct FakeSession {
     status: String,
     /// (text, deadline) of every accepted prompt, in order.
     prompts: Vec<(String, Timestamp)>,
-    /// (envelope, secret) of every accepted startup delivery.
-    startup_deliveries: Vec<(String, String)>,
+    /// Every accepted startup Envelope, in order.
+    startup_deliveries: Vec<String>,
     stops: Vec<bool>,
     cancels: u32,
     view: String,
@@ -145,7 +145,7 @@ impl FakeRuntimePeer {
     }
 
     /// Startup deliveries accepted for the session.
-    pub fn startup_deliveries(&self, correlation: &str) -> Vec<(String, String)> {
+    pub fn startup_deliveries(&self, correlation: &str) -> Vec<String> {
         self.state.borrow().sessions[correlation]
             .startup_deliveries
             .clone()
@@ -276,7 +276,6 @@ impl RuntimeProvider for FakeRuntimePeer {
         &self,
         identity: &RawSessionIdentity,
         envelope_text: &str,
-        secret_text: &str,
         _deadline: Timestamp,
     ) -> Result<RawStartupDelivery, RawRunError> {
         let ambiguous = self.take_if(FakeFailure::AmbiguousDelivery);
@@ -288,17 +287,13 @@ impl RuntimeProvider for FakeRuntimePeer {
         if ambiguous {
             // The submission WENT OUT; only the acknowledgement was
             // lost. Recording it is what lets the portable suite prove
-            // the burn-the-secret half of the doctrine: material has
-            // reached the provider, so no redelivery may occur.
-            session
-                .startup_deliveries
-                .push((envelope_text.to_owned(), secret_text.to_owned()));
+            // The Envelope reached the provider, so no automatic
+            // redelivery may occur after an ambiguous response.
+            session.startup_deliveries.push(envelope_text.to_owned());
             session.status = "working".to_owned();
             return Err(RawRunError::DeadlineAfterSubmission);
         }
-        session
-            .startup_deliveries
-            .push((envelope_text.to_owned(), secret_text.to_owned()));
+        session.startup_deliveries.push(envelope_text.to_owned());
         session.status = "working".to_owned();
         Ok(RawStartupDelivery::Accepted)
     }

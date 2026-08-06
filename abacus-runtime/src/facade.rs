@@ -14,9 +14,9 @@
 
 use abacus_core::Timestamp;
 use abacus_core::ports::{
-    ClockPort, ControlAction, DeliveryReport, EffectReport, EphemeralLaunchSecret, LaunchAttempt,
-    LaunchCorrelation, LaunchOutcome, LaunchSpec, LaunchSubject, LivenessKind, LivenessObservation,
-    RuntimeError, RuntimeHandle, RuntimePort, StartupDelivery, StopMode,
+    ClockPort, ControlAction, DeliveryReport, EffectReport, LaunchAttempt, LaunchCorrelation,
+    LaunchOutcome, LaunchSpec, LaunchSubject, LivenessKind, LivenessObservation, RuntimeError,
+    RuntimeHandle, RuntimePort, StartupDelivery, StopMode,
 };
 
 use crate::adapter::{RawRunError, RawSessionIdentity, RawStartupDelivery, RuntimeProvider};
@@ -31,21 +31,16 @@ const HANDLE_VERSION: &str = "arh1";
 /// together (R5.17). Not a credential: it carries identity, not proof.
 fn subject_fingerprint(subject: &LaunchSubject) -> String {
     match subject {
-        LaunchSubject::WorkerAttempt {
-            attempt,
-            credential,
-        } => format!("worker:{}:{}", attempt.as_str(), credential.as_str()),
+        LaunchSubject::WorkerAttempt { attempt } => format!("worker:{}", attempt.as_str()),
         LaunchSubject::ActorActivation {
             actor,
             profile,
             generation,
-            credential,
         } => format!(
-            "actor:{}:{}:{}:{}",
+            "actor:{}:{}:{}",
             actor.as_str(),
             profile.as_str(),
-            generation.as_str(),
-            credential.as_str()
+            generation.as_str()
         ),
     }
 }
@@ -185,16 +180,7 @@ where
     P: RuntimeProvider,
     C: ClockPort,
 {
-    fn launch(
-        &self,
-        spec: &LaunchSpec,
-        secret: EphemeralLaunchSecret,
-    ) -> Result<LaunchAttempt, RuntimeError> {
-        // Cross-subject material swap: refused before ANY provider
-        // interaction, including the identity probe.
-        if secret.subject() != &spec.subject {
-            return Err(RuntimeError::Rejected);
-        }
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchAttempt, RuntimeError> {
         self.ensure_identity()?;
         self.provider
             .ensure_namespace(&self.namespace, spec.startup_deadline)
@@ -227,7 +213,6 @@ where
         let startup_delivery = match self.provider.deliver_startup(
             &identity,
             spec.envelope.content(),
-            secret.reveal(),
             spec.delivery_deadline,
         ) {
             Ok(RawStartupDelivery::Accepted) => StartupDelivery::Submitted,

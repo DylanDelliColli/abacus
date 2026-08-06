@@ -42,8 +42,7 @@ pub struct RawStatus {
     pub generation: String,
 }
 
-/// What one startup-material submission reported (Envelope text plus
-/// revealed secret, one provider API call).
+/// What one startup-Envelope submission reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RawStartupDelivery {
     /// The provider accepted one submission. Never proof of
@@ -112,14 +111,13 @@ pub trait RuntimeProvider {
         deadline: Timestamp,
     ) -> Result<RawSessionIdentity, RawRunError>;
 
-    /// Deliver startup material (envelope text plus revealed secret)
-    /// as ONE submission over the pinned socket schema, host-side.
-    /// MUST NOT place either value in argv, environment, or logs.
+    /// Deliver the sanitized Envelope as one submission over the
+    /// pinned socket schema, host-side. MUST NOT place it in argv,
+    /// environment, or logs.
     fn deliver_startup(
         &self,
         identity: &RawSessionIdentity,
         envelope_text: &str,
-        secret_text: &str,
         deadline: Timestamp,
     ) -> Result<RawStartupDelivery, RawRunError>;
 
@@ -235,10 +233,9 @@ impl<P: RuntimeProvider> RuntimeProvider for std::rc::Rc<P> {
         &self,
         identity: &RawSessionIdentity,
         envelope_text: &str,
-        secret_text: &str,
         deadline: Timestamp,
     ) -> Result<RawStartupDelivery, RawRunError> {
-        (**self).deliver_startup(identity, envelope_text, secret_text, deadline)
+        (**self).deliver_startup(identity, envelope_text, deadline)
     }
 
     fn lookup(

@@ -1,14 +1,14 @@
 # `abacus-state` module contract
 
 Status: migration foundation landed (`ABACUS-9NH.7`, commit `6e91149`) —
-transactional SQLite schema v1-v3 under `src/migrations.rs` with WAL and
+transactional SQLite schema v1-v4 under `src/migrations.rs` with WAL and
 busy-timeout configuration. `ABACUS-9NH.11` adds the public, empty-state
 `InMemoryState` and the portable `run_workflow_state_suite`; both consume an
 injected core `ClockPort`, so lease behavior is hermetic and shared with the
 SQLite implementation. `ABACUS-9NH.10` extends that public seam and canonical
 fake with the explicit Abort terminal, decision-terminal discharge, typed audit
-lineage, runtime-observation records, and state-owned constant-time credential
-comparison. The same slice now provides `SqliteState`: schema-v3 private
+lineage, and runtime-observation records. The same slice now provides
+`SqliteState`: versioned private
 versioned row DTOs, one `BEGIN IMMEDIATE` transaction per port call,
 append-only immutable record paths, checked restart reconstruction, and the
 same portable contract suite as the canonical fake. Relational rows are the
@@ -72,9 +72,9 @@ $XDG_RUNTIME_DIR/abacus/<repo-id>.sock
 
 Only Scribe mutates the database. The database and socket directory are user-only. No fallback silently writes to a user home or worktree when these paths are unavailable.
 
-**Credential authentication is this module's own:** Scribe verifies a presented bearer against the launch subject's active bound provisioning — the Attempt's for a worker, the actor activation's for a spawned orchestrator/watchdog — using a **vetted constant-time comparison implemented here** (core holds no cryptographic primitive, I15) and returns only a typed outcome — the stored digest never leaves Scribe. Wrong-token/right-ID must be refused before any provider mutation.
+**Worker identity is resolved, never asserted (ADR-0003, Accepted rev 6):** a worker call carries only the non-secret Attempt locator written by launch composition, the current fencing token, its operation id, and payload. Scribe joins Attempt→Assignment→worker and never accepts a caller field that selects actor, Assignment, capability, scope, or authority. A missing, unknown, terminal, or stale Attempt fails loudly before mutation. Same-uid code that steals a live locator and token can forge worker-side claims and is an explicit trusted-repository v1 non-goal; decision verbs remain unreachable from the worker surface.
 
-**Agent transport (ADR-0003, Proposed rev 5):** one versioned Scribe protocol on two carriages selected by injected configuration — direct UDS where the sandbox permits, or a per-call operator-owned `scribe-rpc` relay (exact two-token argv; one bounded newline-terminated typed-JSON request line on stdin; private 4-byte framing performed by the host client; one structured stdout line; fixed deadline; strictly one request per process and connection, batching forbidden). Actors are credentialed, never asserted: no enrolment verb exists anywhere in the agent-facing protocol; initial enrolment happens on a one-shot pre-listen operator channel, worker credential minting is an authenticated effect of `AssignmentOpening`, bearers are CSPRNG ≥128-bit with digest-only storage and constant-time comparison, and plaintext rides only an ephemeral launch secret — never the persisted Envelope. Host-approval denial is an agent-boundary fact; this client observes only connect failure (`Unavailable`) and protocol errors.
+**Agent transport:** one versioned Scribe protocol on two carriages selected by injected configuration — direct UDS where the sandbox permits, or a per-call operator-owned `scribe-rpc` relay (exact two-token argv; one bounded newline-terminated typed-JSON request line on stdin; private 4-byte framing performed by the host client; one structured stdout line; fixed deadline; strictly one request per process and connection, batching forbidden). The launcher is the sole writer of the non-secret locator; Scribe is its sole semantic resolver; carriage layers transport it opaquely and never derive or override it. Decision calls use the separately authenticated orchestrator surface. Host-approval denial is an agent-boundary fact; this client observes only connect failure (`Unavailable`) and protocol errors.
 
 ## Deep interface
 
@@ -83,9 +83,9 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 ### Repository and actors
 
 - initialize/inspect repository workflow state;
-- five closed activation cases and nothing else — **four are `ActivationCase` variants** (`OperatorBootstrap`, `ActorAuthorizedRotation`, `OperatorRecovery`, `OperatorOrchestratorEnrolment`); the fifth, first-worker registration, is deliberately **not** a variant because it is an authenticated effect of a transaction rather than a request in its own right, so the enum's cardinality is four by design and not drift. The cases: operator-channel-only bootstrap of the initial/orchestrator actor; actor-authorized rotation for an already-registered same ActorId and class; first-worker registration as an atomic effect of `AssignmentOpening`; operator-channel recovery/root rotation for an already-registered orchestrator (never creates an actor); and operator-channel enrolment of an additional orchestrator actor into another validated profile (unknown actors only, orchestrator class only, occupancy still enforced, bootstrap sentinel untouched) — all operator-channel cases are absent from the agent protocol. No standalone or general enrolment verb exists on the public client;
-- authenticated activation/resume for an already-provisioned actor;
-- atomic worker credential **binding** solely as an effect of `AssignmentOpening` or retry `AttemptOpening`: the caller passes opaque id+digest (`CredentialProvisioning`), Scribe persists digest-only and returns idempotent `StateApplied`, plaintext never crosses in either direction;
+- five closed activation cases and nothing else — **four are `ActivationCase` variants** (`OperatorBootstrap`, `ActorAuthorizedRotation`, `OperatorRecovery`, `OperatorOrchestratorEnrolment`); the fifth, first-worker registration, is deliberately **not** a variant because it is an authorized effect of an Assignment-opening transaction rather than a request in its own right, so the enum's cardinality is four by design and not drift. The cases: operator-channel-only bootstrap of the initial/orchestrator actor; actor-authorized reactivation for an already-registered same ActorId and class; first-worker registration as an atomic effect of `AssignmentOpening`; operator-channel recovery of an already-registered orchestrator (never creates an actor); and operator-channel enrolment of an additional orchestrator actor into another validated profile (unknown actors only, orchestrator class only, occupancy still enforced, bootstrap sentinel untouched) — all operator-channel cases are absent from the agent protocol. No standalone or general enrolment verb exists on the public client;
+- authorized activation/resume for an already-registered actor, with an explicit activation generation rather than a bearer credential;
+- atomically record each worker Attempt's durable Assignment ownership, including explicit retries, so one non-secret locator resolves to exactly one worker binding;
 - audit profile activation/change before it authorizes new actions;
 - inspect current actor/runtime associations;
 - record explicit authority transfer.
@@ -97,11 +97,11 @@ The public client exposes workflow outcomes rather than database-shaped CRUD.
 - transition an attempt using core validation;
 - enforce the core-validated optional per-Assignment Attempt cap on explicit retry;
 - persist/read the canonical sanitized Envelope snapshot keyed by the closed launch subject (worker Attempt or actor activation);
-- append an authorized Directive, Report, or Request with a validated bead/Assignment/Attempt/scope subject and full fenced-sender snapshot;
+- append authorized Directives and Requests with their full exercised authority snapshots; append a worker `ReportDraft` only after deriving its worker/Assignment/Attempt sender and subject from the fenced Attempt locator;
 - query immutable Signals by subject, sender, recipient, and causal order;
 - query per-actor and global derived unresolved sets: Signals lacking the typed responding action that resolves or discharges them;
 - return the active Attempt's current binding Directives in every fenced worker response;
-- accept the bare fenced Abort-compliance terminal only for a live, active Attempt with a binding Abort, recording the distinct ended `Aborted` state and revoking its credential;
+- accept the bare fenced Abort-compliance terminal only for a live, active Attempt with a binding Abort, recording the distinct ended `Aborted` state;
 - persist/read the canonical Envelope and bind/unbind an opaque runtime handle, both keyed by the closed launch subject (worker Attempt or actor activation) so spawned orchestrator/watchdog profiles are first-class;
 - reconcile an uncertain runtime association.
 
@@ -147,16 +147,16 @@ Watchdogs are ordinary Herdr-managed agent profiles, never additional daemon pro
 
 ## Protocol rules
 
-- Every agent request carries protocol version, repository identity, ActorId **plus its bearer credential**, request ID, and idempotency key where mutating. Scribe authenticates the credential digest and its (actor, class, profile-hash, activation-generation) binding **before** `authorize` runs; an invalid, binding-mismatched, or revoked credential is a distinct refusal, and any enrolment-shaped request on the agent protocol is unknown/forbidden and audited.
-- Fenced operations carry assignment, attempt, and current fencing token.
+- Worker requests carry protocol/repository identity, the launch-injected non-secret Attempt locator, current fencing token, operation id, and payload. They carry no caller-selected authority. Unknown wire fields are rejected, so an actor/Assignment/capability/scope field is forbidden rather than ignored or treated as a consistency hint.
+- Scribe resolves worker authority from durable Assignment state before mutation. Worker dispatch is typed only as `WorkerWorkflowStatePort`; decision composition uses `DecisionWorkflowStatePort`, so a worker-reachable decision verb is not a routing option.
 - Report, Evidence, and Handoff requests carry the core `FencedAction` shape: the fenced call plus an optional `responds_to` Directive id. The link is part of idempotent request identity, must name a committed Directive for that same Attempt, and is recorded only with the substantive action. Unknown and foreign-Attempt targets refuse without a commit. Lease renewal carries only the bare fenced call, so a semantically void response link cannot cross the seam.
 - Every fenced worker response mechanically surfaces the Attempt's current binding Directives. This is a protocol property of Scribe responses, never worker discipline; the response envelope contains the field even when the set is empty.
 - Scribe commits immutable per-Attempt call/response ordering and applies core's Directive gate before mutation. Exposure and discharge are derived from that ordering and responding workflow actions: a Directive committed before the worker's latest fenced call was surfaced in that call's response. A substantive action's response is derived post-commit, so an amend/answer Directive discharged by that action is absent from the returned binding set; exact replay returns the causally current binding set and Ledger head without another ordering record.
 - A binding Abort refuses Report and Evidence appends through their concrete in-band outcome types, always paired with `FencedResponse`. The audited refusal owns its operation and advances call order but records no payload or `WorkerAction`; validation failures remain outer errors and commit nothing. Pause and Amend do not gate these appends. Renewal remains allowed after Abort so its response can surface the Directive while the lease stays live; Handoff keeps the all-kinds gate.
 - The client protocol is causally ordered and idempotent so concurrent or lost-response retries cannot leapfrog a response that first surfaced a binding Directive.
-- Signal appends carry a closed type/kind, validated mandatory subject, full sender identity/profile/capability/scope snapshot, and the typed link required when the record responds to another Signal.
+- Decision Signal appends carry a closed type/kind, validated mandatory subject, and full exercised authority snapshot. Worker Report requests carry only `ReportDraft`; Scribe derives `WorkerBinding`, subject, and Attempt from the fenced locator and never invents capability/scope provenance.
 - No `read_at` columns and no per-Directive acknowledgement state exist in the schema or public interface. Scribe never accepts a client-asserted read marker or Directive head.
-- Handoff is refused with a distinct ordinary Submission-refusal reason while an amend or pause Directive remains undischarged. After abort, Scribe refuses substantive worker appends through response-bearing ordinary outcomes; renewal remains available for discovery. The sole worker terminal carrier is `fenced_abort_attempt`: a bare call with a live lease and binding Abort, returning the post-commit response after recording `Aborted` and revoking the credential. `AbortNotInForce` claims nothing, and exact replay precedes all validation.
+- Handoff is refused with a distinct ordinary Submission-refusal reason while an amend or pause Directive remains undischarged. After abort, Scribe refuses substantive worker appends through response-bearing ordinary outcomes; renewal remains available for discovery. The sole worker terminal carrier is `fenced_abort_attempt`: a bare call with a live lease and binding Abort, returning the post-commit response after recording `Aborted`. `AbortNotInForce` claims nothing; an ended Attempt is `StaleFencing`; exact replay precedes all mutable validation.
 - Directives may be appended only to an active Attempt. Every decision-driven Attempt terminal records `TerminalAttemptAction { abort_consistent: true }` at the decision's same `Seq`; an unfulfilled Amend remains historically binding but operationally inert after the Attempt ends.
 - Audit kinds contain typed identities and closed outcome/reason classes, never owning record bodies. Direct Signal appends use their Signal ID as the honest audit idempotency identity; other mutations use their operation ID. The initiator is the strongest fact the call proves: full authority, complete recovered worker binding, operator channel, or a projection joined to a committed authorizing operation. V1 profile deactivation is operator-channel-only.
 - Responses are typed success or normalized error; clients do not parse Scribe log text.
@@ -165,7 +165,7 @@ Watchdogs are ordinary Herdr-managed agent profiles, never additional daemon pro
 - Envelope and evidence payload limits are explicit and bounded.
 - Client disconnect does not imply transaction failure or success; retry returns the stored idempotent result.
 
-ADR-0003 settles the wire: a public bounded typed-JSON **facade command envelope**, distinct from the **internal versioned Scribe request schema** for credential-creating calls, with private 4-byte length framing performed by the composing transport layer (the facade process directly, or the fixed-function `scribe-rpc` composer on the relay carriage), strictly one request per process and connection. Framing and internal-schema details remain private to this module and its client; lost/ambiguous exchanges surface as typed Ambiguous with replayable provisioning, never silent retry.
+ADR-0003 settles the wire: a public bounded typed-JSON **facade command envelope**, distinct from the private versioned Scribe request schema, with private 4-byte length framing performed by the composing transport layer (the facade process directly, or the fixed-function `scribe-rpc` composer on the relay carriage), strictly one request per process and connection. Framing and internal-schema details remain private to this module and its client; lost/ambiguous exchanges surface as typed Ambiguous with idempotent replay, never silent retry or carriage fallback.
 
 ## Persistence model
 
@@ -249,8 +249,8 @@ resolve, not an accepted alternate contract.
 
 Default tests use temporary Git common directories, sockets, and SQLite files. They cover:
 
-- credential authentication: no agent-protocol enrolment request exists; invalid, binding-mismatched, and revoked credentials refuse distinctly; digest-only persistence; worker binding atomic with `AssignmentOpening` and retry `AttemptOpening` (id and digest conflicts both refused); expiry/revocation at attempt end and deactivation;
-- state-owned constant-time credential-digest comparison on both matching and mismatching fixed-length digests;
+- server-side worker binding: caller authority is absent, Assignment/actor provenance derives from the Attempt locator, stale/ended Attempts refuse distinctly, and the worker trait cannot express decision verbs;
+- schema-v4 compatibility: legacy credential-bearing launch keys are normalized, current activation generations are reconstructed, and legacy credential tables remain dormant rather than authoritative;
 
 - initialization and single-Scribe behavior;
 - migrations and rollback/backup paths;

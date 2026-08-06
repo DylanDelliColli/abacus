@@ -19,15 +19,15 @@ use crate::content::{CommitId, ContentHash, WorkspaceDigest};
 use crate::edit_scope::{EditScope, WorkPath};
 use crate::evidence::{AcceptancePolicy, Evidence, PairRefusal, PathSet};
 use crate::id::{
-    ActorId, AssignmentId, AttemptId, BeadId, CredentialId, HandoffId, OperationId, ProfileName,
-    SignalId,
+    ActorId, AssignmentId, AttemptId, BeadId, HandoffId, OperationId, ProfileName, SignalId,
 };
 use crate::lease::{FencingToken, Lease, Timestamp};
 use crate::lifecycle::{AssignmentState, AttemptState};
 use crate::profile::ProfileActivation;
 use crate::scope::ScopeMap;
 use crate::signal::{
-    AuthoritySnapshot, DirectiveGateRefusal, Seq, Signal, SignalBody, SignalDraft, SubjectRef,
+    AuthoritySnapshot, DirectiveGateRefusal, ReportDraft, Seq, Signal, SignalBody, SignalDraft,
+    SubjectRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -636,59 +636,30 @@ pub struct DecisionRecord {
     pub resolves: Option<SignalId>,
 }
 
-/// Caller-provisioned credential binding (ADR-0003 integration): the
-/// composing caller generates the CSPRNG secret, retains plaintext
-/// transiently for ephemeral launch delivery, and passes ONLY the
-/// opaque id + digest across this seam. It provisions any launch
-/// subject — a worker Attempt (`AssignmentOpening`/`AttemptOpening`)
-/// or an actor activation (`ActivationOpening`). This provisioning transaction
-/// and seam never receive or persist plaintext — Scribe does see a
-/// presented bearer transiently when authenticating later requests —
-/// which preserves idempotent lost-response retry (the
-/// caller retains the same secret and digest). Redaction/non-Debug
-/// plaintext handling is a composition-layer obligation; no plaintext
-/// type exists in core. The credential's normative binding — worker
-/// actor, class, profile, profile hash — derives from the bundled
-/// record, with the activation generation read and locked inside the same
-/// Scribe transaction — created there for a first worker registered by
-/// `AssignmentOpening`, advanced for a rotation; nothing is
-/// caller-asserted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CredentialProvisioning {
-    pub id: CredentialId,
-    pub digest: ContentHash,
-}
-
 /// The explicit-retry bundle (mirror of [`AssignmentOpening`]): a new
-/// fenced Attempt, its authorizing Retry decision, and the successor
-/// credential binding — committed in ONE transaction, because the
-/// predecessor Attempt's credential is revoked at its end and a
-/// credential-dead retry would be unusable.
+/// fenced Attempt and its authorizing Retry decision, committed in ONE
+/// transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptOpening {
     pub authorizing: RetryDecision,
     pub attempt: AttemptRecord,
-    pub worker_credential: CredentialProvisioning,
 }
 
 /// The architecture §2.4 opening bundle, committed in ONE Scribe
-/// transaction under the Assign decision's single operation identity —
-/// including the worker credential binding, atomically.
+/// transaction under the Assign decision's single operation identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentOpening {
     pub assignment: AssignmentRecord,
     pub first_attempt: AttemptRecord,
     pub authorizing: AssignDecision,
     pub bead_revision: WorkRevision,
-    pub worker_credential: CredentialProvisioning,
 }
 
-/// The closed set of activation cases (ADR-0003 §F1). There is still
-/// no general enrolment verb: creation is operator-channel-only, an
-/// actor-authorized call may only ROTATE an already-registered actor's
-/// credential (same ActorId and class), and a first worker is
-/// registered as an authenticated effect of `AssignmentOpening` —
-/// never through this call.
+/// The closed set of activation cases. There is still no general enrolment
+/// verb: creation is operator-channel-only, an actor-authorized call may only
+/// reactivate an already-registered actor (same ActorId and class), and a
+/// first worker is registered as an effect of `AssignmentOpening` — never
+/// through this call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivationCase {
     /// Initial/orchestrator actor creation. Scribe accepts this ONLY on
@@ -696,13 +667,13 @@ pub enum ActivationCase {
     /// on the agent-facing protocol is unknown/forbidden.
     OperatorBootstrap,
     /// Reactivation of an already-registered actor: Scribe proves the
-    /// target exists with the same ActorId and authority class, the
-    /// caller holds the explicit rotation capability, and only the
-    /// credential and activation generation advance.
+    /// target exists with the same ActorId and authority class, the caller
+    /// holds the explicit rotation capability, and the activation generation
+    /// advances.
     ActorAuthorizedRotation { authority: AuthoritySnapshot },
-    /// Operator-channel recovery/root rotation for an **already
-    /// registered** orchestrator whose credential is lost or revoked
-    /// (R5.13). Accepted ONLY on the pre-listen operator channel —
+    /// Operator-channel recovery for an **already registered** orchestrator
+    /// whose activation is unavailable (R5.13). Accepted ONLY on the
+    /// pre-listen operator channel —
     /// never on the agent protocol, never from a caller-supplied
     /// authority snapshot — and it never creates a new actor: the
     /// target must already exist with the same ActorId and class.
@@ -721,26 +692,21 @@ pub enum ActivationCase {
     OperatorOrchestratorEnrolment,
 }
 
-/// Activation bundled with its credential provisioning and case,
-/// committed atomically (ADR-0003). Credential-creating, so it takes
-/// part in the composer/secret-return lifecycle exactly like the
-/// opening bundles.
+/// Activation bundled with its closed activation case and committed
+/// atomically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationOpening {
     pub activation: ProfileActivation,
     pub case: ActivationCase,
-    pub credential: CredentialProvisioning,
 }
 
-/// Fenced worker call identity (state protocol rules): the
-/// authenticated actor, its Assignment/Attempt, the current fencing
-/// token, and the idempotency operation. A leaked token alone can
-/// never impersonate the bound worker.
+/// Fenced worker call identity (ADR-0003 revision 6): the non-secret
+/// Attempt locator, current fencing token, and idempotency operation.
+/// Scribe derives Assignment and worker authority from durable state;
+/// callers cannot assert either one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FencedCall {
-    pub assignment: AssignmentId,
     pub attempt: AttemptId,
-    pub actor: ActorId,
     pub token: FencingToken,
     pub operation: OperationId,
 }
@@ -1182,7 +1148,7 @@ pub enum StateError {
     /// A renewal that does not extend the current deadline: a
     /// malformed request against a LIVE lease, not an expiry.
     NonExtendingLease,
-    /// The authenticated actor is not the record's bound actor.
+    /// A decision call's authenticated actor is not the record's bound actor.
     ActorMismatch,
     /// Actor's current grant does not cover the subject (I17).
     ScopeUnauthorized,
@@ -1206,13 +1172,6 @@ pub enum StateError {
     /// activating under a different class is refused (this structurally
     /// preserves "a worker cannot accept its own handoff").
     ActorClassMismatch,
-    /// The presented credential digest matches no live credential.
-    CredentialInvalid,
-    /// The credential exists but its (actor, class, profile-hash,
-    /// activation-generation) binding does not match the request.
-    CredentialBindingMismatch,
-    /// The credential was revoked (attempt end / deactivation).
-    CredentialRevoked,
     /// The worker attempted the explicit abort-compliance terminal call
     /// without a currently binding Abort Directive. The operation is not
     /// claimed; voluntary worker self-cancellation remains unrepresentable.
@@ -1307,56 +1266,18 @@ pub struct AssignmentView {
     pub head: Seq,
 }
 
-/// Durable workflow persistence: the Scribe seam, shaped as
-/// transactional use-case operations. `abacus-state` implements it over
-/// SQLite; the 9NH.11 fake implements it for use-case tests. Scribe
-/// allocates all commit ordering; substantive worker mutations ride
-/// [`FencedAction`]/[`FencedResponse`], lease renewal rides the bare
-/// [`FencedCall`], and "pending"/"unresolved" are derived queries,
-/// never flags (I10).
-pub trait WorkflowStatePort {
-    /// Commit the complete opening bundle in one transaction under the
-    /// Assign decision's operation identity.
-    fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError>;
-
-    /// Append a new fenced Attempt atomically with its authorizing
-    /// Retry decision AND its successor credential binding.
-    fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError>;
-
-    /// Record an orchestrator decision (accept/reject/cancel/revoke/
-    /// reclaim/transfer).
-    fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError>;
-
-    /// Audited profile activation (ADR-0002 §7; see [`ActivationCase`]
-    /// for the closed set — operator bootstrap, actor-authorized
-    /// rotation, operator recovery, and operator orchestrator
-    /// enrolment) bundled with the
-    /// activating actor's credential provisioning, because activation
-    /// advances the generation credentials bind to — an activation
-    /// without fresh provisioning would be credential-dead. Initial
-    /// (bootstrap) activation arrives on Scribe's pre-listen operator
-    /// channel; every later activation/reactivation is authorized by an
-    /// already-enrolled decision actor whose authority is recorded.
-    fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError>;
-
-    /// Explicit audited deactivation.
-    fn deactivate_profile(
-        &self,
-        operation: &OperationId,
-        actor: &ActorId,
-        profile: &ProfileName,
-    ) -> Result<StateApplied, StateError>;
-
-    /// Orchestrator-side Signal append. Scribe allocates `Seq` and
-    /// returns the committed Signal — identically on idempotent retry.
-    fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError>;
-
-    /// Fenced worker Report append; Scribe allocates `Seq`. A binding
-    /// Abort is returned in-band with the response envelope.
+/// Worker-reachable Scribe operations. This trait contains no decision,
+/// profile, runtime-association, application, or manager-wide query verb, so
+/// handing only this trait to worker composition makes the authority boundary
+/// a type fact (ADR-0003 revision 6).
+pub trait WorkerWorkflowStatePort {
+    /// Fenced worker Report append; Scribe derives sender, Assignment, and
+    /// subject from the Attempt locator and allocates `Seq`. A binding Abort
+    /// is returned in-band with the response envelope.
     fn fenced_report(
         &self,
         action: &FencedAction,
-        draft: &SignalDraft,
+        draft: &ReportDraft,
     ) -> Result<(ReportOutcome, FencedResponse), StateError>;
 
     /// Fenced worker Evidence append. A binding Abort is returned
@@ -1384,6 +1305,68 @@ pub trait WorkflowStatePort {
     fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError>;
 
     /// Fenced lease renewal.
+    fn renew_lease(
+        &self,
+        call: &FencedCall,
+        until: Timestamp,
+    ) -> Result<(Lease, FencedResponse), StateError>;
+}
+
+/// Internal aggregate implemented by the in-memory and SQLite state engines.
+/// Portable contracts may use it directly; worker composition and dispatch
+/// receive only [`WorkerWorkflowStatePort`].
+pub trait WorkflowStatePort {
+    /// Commit the complete opening bundle in one transaction under the
+    /// Assign decision's operation identity.
+    fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError>;
+
+    /// Append a new fenced Attempt atomically with its authorizing
+    /// Retry decision.
+    fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError>;
+
+    /// Record an orchestrator decision (accept/reject/cancel/revoke/
+    /// reclaim/transfer).
+    fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError>;
+
+    /// Audited profile activation (ADR-0002 §7; see [`ActivationCase`]
+    /// for the closed set). Initial bootstrap arrives on Scribe's
+    /// pre-listen operator channel; every later activation/reactivation
+    /// is authorized by an already-enrolled decision actor whose
+    /// authority is recorded.
+    fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError>;
+
+    /// Explicit audited deactivation.
+    fn deactivate_profile(
+        &self,
+        operation: &OperationId,
+        actor: &ActorId,
+        profile: &ProfileName,
+    ) -> Result<StateApplied, StateError>;
+
+    /// Orchestrator-side Signal append. Scribe allocates `Seq` and
+    /// returns the committed Signal — identically on idempotent retry.
+    fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError>;
+
+    fn fenced_report(
+        &self,
+        action: &FencedAction,
+        draft: &ReportDraft,
+    ) -> Result<(ReportOutcome, FencedResponse), StateError>;
+
+    fn fenced_evidence(
+        &self,
+        action: &FencedAction,
+        evidence: &Evidence,
+    ) -> Result<(EvidenceOutcome, FencedResponse), StateError>;
+
+    fn fenced_submit_handoff(
+        &self,
+        action: &FencedAction,
+        handoff: &HandoffRecord,
+    ) -> Result<(SubmissionOutcome, FencedResponse), StateError>;
+
+    fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError>;
+
     fn renew_lease(
         &self,
         call: &FencedCall,
@@ -1462,23 +1445,6 @@ pub trait WorkflowStatePort {
     /// Signals about an Attempt in causal order.
     fn signals_for(&self, attempt: &AttemptId) -> Result<Vec<Signal>, StateError>;
 
-    /// Authenticate a presented bearer against the subject's active
-    /// bound provisioning — the Attempt's for a worker, the actor
-    /// activation's for a spawned orchestrator/watchdog — returning
-    /// only a typed outcome; the
-    /// stored digest never leaves Scribe. **Implementations MUST use a
-    /// vetted constant-time comparison** (ADR-0003); core deliberately
-    /// contains no cryptographic primitive (I15), so `abacus-state`
-    /// owns that implementation and its contract tests. This supersedes
-    /// the Attempt-only `verify_worker_credential` name: a launch subject
-    /// may be a worker Attempt or an actor activation, so this verb is
-    /// subject-based by design.
-    fn verify_launch_subject(
-        &self,
-        subject: &LaunchSubject,
-        presented_digest: &ContentHash,
-    ) -> Result<(), StateError>;
-
     /// One immutable Handoff by identity (acceptance derives the
     /// decided Attempt from this record).
     fn handoff(&self, id: &HandoffId) -> Result<HandoffRecord, StateError>;
@@ -1509,6 +1475,247 @@ pub trait WorkflowStatePort {
     /// Complete typed audit lineage under AND-composed filters, in Ledger
     /// order. Replay and outer validation errors never add events.
     fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError>;
+}
+
+/// Authenticated decision/composition view. Worker mutations are deliberately
+/// absent: a composer holding this trait cannot accidentally reuse the worker
+/// RPC surface as a decision path (ADR-0003 revision 6).
+pub trait DecisionWorkflowStatePort {
+    fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError>;
+    fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError>;
+    fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError>;
+    fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError>;
+    fn deactivate_profile(
+        &self,
+        operation: &OperationId,
+        actor: &ActorId,
+        profile: &ProfileName,
+    ) -> Result<StateApplied, StateError>;
+    fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError>;
+    fn persist_envelope(
+        &self,
+        operation: &OperationId,
+        subject: &LaunchSubject,
+        envelope: &EnvelopeSnapshot,
+    ) -> Result<StateApplied, StateError>;
+    fn envelope(&self, subject: &LaunchSubject) -> Result<EnvelopeSnapshot, StateError>;
+    fn bind_runtime_handle(
+        &self,
+        operation: &OperationId,
+        subject: &LaunchSubject,
+        handle: &RuntimeHandle,
+    ) -> Result<StateApplied, StateError>;
+    fn unbind_runtime_handle(
+        &self,
+        operation: &OperationId,
+        subject: &LaunchSubject,
+    ) -> Result<StateApplied, StateError>;
+    fn runtime_handle(&self, subject: &LaunchSubject) -> Result<Option<RuntimeHandle>, StateError>;
+    fn record_runtime_observation(
+        &self,
+        operation: &OperationId,
+        record: &RuntimeObservationRecord,
+    ) -> Result<StateApplied, StateError>;
+    fn runtime_observation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<RuntimeObservationRecord, StateError>;
+    fn record_application_attempt(
+        &self,
+        attempt: &ApplicationAttempt,
+    ) -> Result<StateApplied, StateError>;
+    fn record_application_receipt(
+        &self,
+        receipt: &ApplicationReceipt,
+    ) -> Result<StateApplied, StateError>;
+    fn assignment(&self, id: &AssignmentId) -> Result<AssignmentView, StateError>;
+    fn evidence_for(&self, attempt: &AttemptId) -> Result<Vec<EvidenceRecord>, StateError>;
+    fn signals_for(&self, attempt: &AttemptId) -> Result<Vec<Signal>, StateError>;
+    fn handoff(&self, id: &HandoffId) -> Result<HandoffRecord, StateError>;
+    fn decision(&self, operation: &OperationId) -> Result<DecisionRecord, StateError>;
+    fn active_occupants(&self, profile: &ProfileName) -> Result<Vec<ActorId>, StateError>;
+    fn pending_applications(&self) -> Result<Vec<PendingApplication>, StateError>;
+    fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError>;
+    fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError>;
+    fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError>;
+}
+
+impl<T> DecisionWorkflowStatePort for T
+where
+    T: WorkflowStatePort + ?Sized,
+{
+    fn open_assignment(&self, opening: &AssignmentOpening) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::open_assignment(self, opening)
+    }
+
+    fn append_attempt(&self, opening: &AttemptOpening) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::append_attempt(self, opening)
+    }
+
+    fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::record_decision(self, record)
+    }
+
+    fn activate_profile(&self, opening: &ActivationOpening) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::activate_profile(self, opening)
+    }
+
+    fn deactivate_profile(
+        &self,
+        operation: &OperationId,
+        actor: &ActorId,
+        profile: &ProfileName,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::deactivate_profile(self, operation, actor, profile)
+    }
+
+    fn append_signal(&self, draft: &SignalDraft) -> Result<(Signal, StateApplied), StateError> {
+        WorkflowStatePort::append_signal(self, draft)
+    }
+
+    fn persist_envelope(
+        &self,
+        operation: &OperationId,
+        subject: &LaunchSubject,
+        envelope: &EnvelopeSnapshot,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::persist_envelope(self, operation, subject, envelope)
+    }
+
+    fn envelope(&self, subject: &LaunchSubject) -> Result<EnvelopeSnapshot, StateError> {
+        WorkflowStatePort::envelope(self, subject)
+    }
+
+    fn bind_runtime_handle(
+        &self,
+        operation: &OperationId,
+        subject: &LaunchSubject,
+        handle: &RuntimeHandle,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::bind_runtime_handle(self, operation, subject, handle)
+    }
+
+    fn unbind_runtime_handle(
+        &self,
+        operation: &OperationId,
+        subject: &LaunchSubject,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::unbind_runtime_handle(self, operation, subject)
+    }
+
+    fn runtime_handle(&self, subject: &LaunchSubject) -> Result<Option<RuntimeHandle>, StateError> {
+        WorkflowStatePort::runtime_handle(self, subject)
+    }
+
+    fn record_runtime_observation(
+        &self,
+        operation: &OperationId,
+        record: &RuntimeObservationRecord,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::record_runtime_observation(self, operation, record)
+    }
+
+    fn runtime_observation(
+        &self,
+        operation: &OperationId,
+    ) -> Result<RuntimeObservationRecord, StateError> {
+        WorkflowStatePort::runtime_observation(self, operation)
+    }
+
+    fn record_application_attempt(
+        &self,
+        attempt: &ApplicationAttempt,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::record_application_attempt(self, attempt)
+    }
+
+    fn record_application_receipt(
+        &self,
+        receipt: &ApplicationReceipt,
+    ) -> Result<StateApplied, StateError> {
+        WorkflowStatePort::record_application_receipt(self, receipt)
+    }
+
+    fn assignment(&self, id: &AssignmentId) -> Result<AssignmentView, StateError> {
+        WorkflowStatePort::assignment(self, id)
+    }
+
+    fn evidence_for(&self, attempt: &AttemptId) -> Result<Vec<EvidenceRecord>, StateError> {
+        WorkflowStatePort::evidence_for(self, attempt)
+    }
+
+    fn signals_for(&self, attempt: &AttemptId) -> Result<Vec<Signal>, StateError> {
+        WorkflowStatePort::signals_for(self, attempt)
+    }
+
+    fn handoff(&self, id: &HandoffId) -> Result<HandoffRecord, StateError> {
+        WorkflowStatePort::handoff(self, id)
+    }
+
+    fn decision(&self, operation: &OperationId) -> Result<DecisionRecord, StateError> {
+        WorkflowStatePort::decision(self, operation)
+    }
+
+    fn active_occupants(&self, profile: &ProfileName) -> Result<Vec<ActorId>, StateError> {
+        WorkflowStatePort::active_occupants(self, profile)
+    }
+
+    fn pending_applications(&self) -> Result<Vec<PendingApplication>, StateError> {
+        WorkflowStatePort::pending_applications(self)
+    }
+
+    fn superseded_applications(&self) -> Result<Vec<SupersededApplication>, StateError> {
+        WorkflowStatePort::superseded_applications(self)
+    }
+
+    fn unresolved_signals(&self, recipient: Option<&ActorId>) -> Result<Vec<Signal>, StateError> {
+        WorkflowStatePort::unresolved_signals(self, recipient)
+    }
+
+    fn audit_events(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StateError> {
+        WorkflowStatePort::audit_events(self, query)
+    }
+}
+
+impl<T> WorkerWorkflowStatePort for T
+where
+    T: WorkflowStatePort + ?Sized,
+{
+    fn fenced_report(
+        &self,
+        action: &FencedAction,
+        draft: &ReportDraft,
+    ) -> Result<(ReportOutcome, FencedResponse), StateError> {
+        WorkflowStatePort::fenced_report(self, action, draft)
+    }
+
+    fn fenced_evidence(
+        &self,
+        action: &FencedAction,
+        evidence: &Evidence,
+    ) -> Result<(EvidenceOutcome, FencedResponse), StateError> {
+        WorkflowStatePort::fenced_evidence(self, action, evidence)
+    }
+
+    fn fenced_submit_handoff(
+        &self,
+        action: &FencedAction,
+        handoff: &HandoffRecord,
+    ) -> Result<(SubmissionOutcome, FencedResponse), StateError> {
+        WorkflowStatePort::fenced_submit_handoff(self, action, handoff)
+    }
+
+    fn fenced_abort_attempt(&self, call: &FencedCall) -> Result<FencedResponse, StateError> {
+        WorkflowStatePort::fenced_abort_attempt(self, call)
+    }
+
+    fn renew_lease(
+        &self,
+        call: &FencedCall,
+        until: Timestamp,
+    ) -> Result<(Lease, FencedResponse), StateError> {
+        WorkflowStatePort::renew_lease(self, call, until)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,74 +1805,7 @@ pub enum LivenessKind {
     StaleGeneration,
 }
 
-/// Transient launch secret (ADR-0003 sideband). Honest guarantees, and
-/// only these: it is non-`Clone` and has no serde implementation, so
-/// casual duplication and serialization are ownership-level friction;
-/// its `Debug` is redacted; it is moved into `launch` rather than
-/// borrowed. NOT guaranteed: `reveal` hands out a `&str` an adapter
-/// could copy, and the backing `String` is not zeroized on drop —
-/// memory-residency exposure is the accepted v1 residual. It rides
-/// NEXT TO LaunchSpec — never inside it, never argv/env/Envelope.
-pub struct EphemeralLaunchSecret {
-    token: String,
-    /// Identity binding (R5.2/R5.19): the material names the exact
-    /// launch subject it belongs to, so neither two concurrent workers
-    /// nor a worker and an orchestrator can be swapped.
-    subject: LaunchSubject,
-}
-
-/// Launch-material shape refusals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LaunchSecretError {
-    /// Below the ≥128-bit contract (32 hex chars).
-    TooShort,
-    TooLong,
-    NotHex,
-}
-
-impl EphemeralLaunchSecret {
-    /// Canonical bounded token: 32–128 lowercase hex characters, i.e.
-    /// ≥128 bits of *capacity*. This validates encoding and length
-    /// only — actual CSPRNG generation is the composer's external
-    /// obligation and cannot be checked here.
-    pub fn new(token: String, subject: LaunchSubject) -> Result<Self, LaunchSecretError> {
-        if token.len() < 32 {
-            return Err(LaunchSecretError::TooShort);
-        }
-        if token.len() > 128 {
-            return Err(LaunchSecretError::TooLong);
-        }
-        if !token
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(LaunchSecretError::NotHex);
-        }
-        Ok(Self { token, subject })
-    }
-
-    pub fn subject(&self) -> &LaunchSubject {
-        &self.subject
-    }
-
-    /// Read by the runtime adapter for startup delivery. Not
-    /// enforced as single-use: the borrow can be taken repeatedly and
-    /// copied; the ownership move into `launch` is friction, not a
-    /// guarantee.
-    pub fn reveal(&self) -> &str {
-        &self.token
-    }
-}
-
-impl core::fmt::Debug for EphemeralLaunchSecret {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("EphemeralLaunchSecret(REDACTED)")
-    }
-}
-
-/// Closed outcome of startup-material delivery (Envelope AND the
-/// transient secret, carried by ONE provider API submission — one
-/// submission, not a transactional guarantee). A definite failure keeps the handle so the caller can
+/// Closed outcome of startup Envelope delivery. A definite failure keeps the handle so the caller can
 /// stop and reconcile the created session: an outer `Err` means no
 /// usable handle exists at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1676,9 +1816,8 @@ pub enum StartupDelivery {
     /// Definitely not delivered, with the normalized reason; the
     /// session exists and must be stopped/reconciled.
     NotDelivered(RuntimeError),
-    /// Unknown: stop, then for a worker subject revoke the Attempt and
-    /// open a successor with fresh provisioning, or for an actor
-    /// activation deactivate/rotate it — never retry the same secret.
+    /// Unknown: stop and reconcile the possibly-live session; never
+    /// manufacture successful delivery.
     Ambiguous,
 }
 
@@ -1687,32 +1826,19 @@ pub enum StartupDelivery {
 /// subject:** ADR-0002's `SubjectRef` family (Bead, Assignment,
 /// Attempt, scope) is unchanged and gains no fifth variant. Workers run an Assignment Attempt; orchestrators and
 /// watchdogs are spawned profiles running an actor activation
-/// (CONTEXT I12/I16). Each variant carries the credential identity
-/// that prevents cross-subject material swaps.
+/// (CONTEXT I12/I16).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LaunchSubject {
     WorkerAttempt {
         attempt: AttemptId,
-        credential: CredentialId,
     },
     /// A spawned orchestrator/watchdog profile: the actor, its profile,
-    /// the activation generation (the activation's operation identity),
-    /// and its credential.
+    /// and the activation generation (the activation's operation identity).
     ActorActivation {
         actor: ActorId,
         profile: ProfileName,
         generation: OperationId,
-        credential: CredentialId,
     },
-}
-
-impl LaunchSubject {
-    pub fn credential(&self) -> &CredentialId {
-        match self {
-            LaunchSubject::WorkerAttempt { credential, .. }
-            | LaunchSubject::ActorActivation { credential, .. } => credential,
-        }
-    }
 }
 
 /// Bounded recovery key, established BEFORE launch and carried in the
@@ -1773,8 +1899,8 @@ pub enum LaunchAttempt {
 pub struct LaunchOutcome {
     pub handle: RuntimeHandle,
     pub observation: LivenessObservation,
-    /// Covers Envelope and secret together, carried by ONE provider
-    /// API submission — not a transaction; see [`StartupDelivery`].
+    /// Covers Envelope delivery — submission is not application or read;
+    /// see [`StartupDelivery`].
     pub startup_delivery: StartupDelivery,
 }
 
@@ -1827,18 +1953,9 @@ pub enum StopMode {
 /// Agent/session lifecycle mechanics. Every call is bounded by an
 /// explicit deadline; every mutating verb fences stale generations.
 pub trait RuntimePort {
-    /// Launch with the persisted Envelope (inside `spec`) and the
-    /// transient credential secret as separate startup material — the
-    /// adapter delivers both without logging, argv, env, or child
-    /// inheritance.
-    /// Implementations MUST refuse before any provider mutation when
-    /// `secret.subject() != &spec.subject` — this covers concurrent
-    /// worker swaps AND worker/orchestrator cross-subject swaps.
-    fn launch(
-        &self,
-        spec: &LaunchSpec,
-        secret: EphemeralLaunchSecret,
-    ) -> Result<LaunchAttempt, RuntimeError>;
+    /// Launch with the persisted Envelope and injected, non-secret
+    /// launch configuration inside `spec`.
+    fn launch(&self, spec: &LaunchSpec) -> Result<LaunchAttempt, RuntimeError>;
 
     /// Look up / re-associate a possibly-created session after an
     /// ambiguous launch. Never re-launches: it resolves to the existing
@@ -2015,6 +2132,7 @@ pub trait IdGeneratorPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SignalSender;
     use crate::authority::AuthorityClass;
     use crate::evidence::{Argv, FileDigestSet, VerificationOutcome, VerificationSet};
     use crate::id::CapabilityId;
@@ -2290,40 +2408,14 @@ mod tests {
                 authority: authority("state:assign"),
             },
             bead_revision: rev('a'),
-            worker_credential: CredentialProvisioning {
-                id: CredentialId::new("cred-1").unwrap(),
-                digest: ContentHash::new(&"d".repeat(64)).unwrap(),
-            },
         }
-    }
-
-    /// A credential binding as the Ledger would hold it: enough
-    /// structure to revoke precisely (R5.20).
-    #[derive(Debug, Clone)]
-    struct CredentialBinding {
-        credential: CredentialId,
-        digest: ContentHash,
-        actor: String,
-        profile: String,
-        /// Present for worker Attempt bindings.
-        assignment: Option<String>,
-        /// Present for actor activation bindings.
-        generation: Option<String>,
-        /// Operation that durably created this launch subject.
-        authorizing: OperationId,
-        revoked: bool,
     }
 
     /// In-memory state fake proving the transactional seam shape.
     struct FakeState {
         committed: RefCell<BTreeMap<String, String>>,
         current_token: RefCell<FencingToken>,
-        bound_worker: ActorId,
         bound_worker_snapshot: DecisionActor,
-        /// The Assignment/Attempt this fake's fenced calls belong to —
-        /// tokens are not global identities (R5.24).
-        bound_assignment: AssignmentId,
-        bound_attempt: AttemptId,
         /// Lease expiry plus the caller-supplied "now" the fake
         /// evaluates against, so LeaseExpired is reachable.
         lease_expires_at: RefCell<Timestamp>,
@@ -2337,9 +2429,14 @@ mod tests {
         submissions: RefCell<BTreeMap<String, (String, SubmissionOutcome)>>,
         receipts: RefCell<Vec<String>>,
         decisions: RefCell<Vec<DecisionRecord>>,
-        /// Subject key → structured credential binding (workers and
-        /// spawned profiles alike).
-        launch_credentials: RefCell<BTreeMap<String, CredentialBinding>>,
+        /// Attempt locator → owning Assignment. Worker authority is
+        /// resolved from this durable relation rather than asserted by
+        /// the caller.
+        attempt_owners: RefCell<BTreeMap<String, String>>,
+        /// Launch-subject key → operation that authorized the launch.
+        launch_authorizers: RefCell<BTreeMap<String, OperationId>>,
+        /// `actor:profile` → current activation generation.
+        active_activation_generations: RefCell<BTreeMap<String, OperationId>>,
         /// Subject key → persisted Envelope (immutable once written).
         envelopes: RefCell<BTreeMap<String, EnvelopeSnapshot>>,
         /// Association key → currently bound runtime handle.
@@ -2371,43 +2468,17 @@ mod tests {
     }
 
     impl FakeState {
-        /// FULL association key: every `LaunchSubject` field, credential
-        /// included, so a wrong-credential subject can never alias the
-        /// real subject's Envelope or handle (R5.23).
+        /// Full non-secret launch identity used by Envelope and runtime
+        /// associations.
         fn association_key(subject: &LaunchSubject) -> String {
             match subject {
-                LaunchSubject::WorkerAttempt {
-                    attempt,
-                    credential,
-                } => format!("attempt:{}:{}", attempt.as_str(), credential.as_str()),
-                LaunchSubject::ActorActivation {
-                    actor,
-                    profile,
-                    generation,
-                    credential,
-                } => format!(
-                    "activation:{}:{}:{}:{}",
-                    actor.as_str(),
-                    profile.as_str(),
-                    generation.as_str(),
-                    credential.as_str()
-                ),
-            }
-        }
-
-        /// Credential-owner locator: identity WITHOUT the credential,
-        /// used only so `verify_launch_subject` can distinguish a
-        /// binding mismatch from an unknown record.
-        fn owner_locator(subject: &LaunchSubject) -> String {
-            match subject {
-                LaunchSubject::WorkerAttempt { attempt, .. } => {
+                LaunchSubject::WorkerAttempt { attempt } => {
                     format!("attempt:{}", attempt.as_str())
                 }
                 LaunchSubject::ActorActivation {
                     actor,
                     profile,
                     generation,
-                    ..
                 } => format!(
                     "activation:{}:{}:{}",
                     actor.as_str(),
@@ -2415,6 +2486,10 @@ mod tests {
                     generation.as_str()
                 ),
             }
+        }
+
+        fn activation_key(actor: &ActorId, profile: &ProfileName) -> String {
+            format!("{}:{}", actor.as_str(), profile.as_str())
         }
 
         /// **Verb-scoped** idempotency ledger for association mutators:
@@ -2470,19 +2545,15 @@ mod tests {
         }
 
         fn fence(&self, call: &FencedCall) -> Result<(), StateError> {
-            // Identity first: a valid actor+token attached to a foreign
-            // Assignment/Attempt must not mutate (R5.24).
-            if call.assignment != self.bound_assignment || call.attempt != self.bound_attempt {
-                return Err(StateError::IncoherentBundle);
-            }
-            if call.actor != self.bound_worker {
-                return Err(StateError::ActorMismatch);
+            if !self
+                .attempt_owners
+                .borrow()
+                .contains_key(call.attempt.as_str())
+            {
+                return Err(StateError::UnknownRecord);
             }
             if call.token != *self.current_token.borrow() {
                 return Err(StateError::StaleFencing);
-            }
-            if *self.now.borrow() > *self.lease_expires_at.borrow() {
-                return Err(StateError::LeaseExpired);
             }
             if self
                 .attempt_states
@@ -2490,7 +2561,10 @@ mod tests {
                 .get(call.attempt.as_str())
                 .is_some_and(|state| state.is_ended())
             {
-                return Err(StateError::IncoherentBundle);
+                return Err(StateError::StaleFencing);
+            }
+            if *self.now.borrow() > *self.lease_expires_at.borrow() {
+                return Err(StateError::LeaseExpired);
             }
             Ok(())
         }
@@ -2513,33 +2587,34 @@ mod tests {
             self.next_ledger_seq()
         }
 
-        /// Identity check for association operations: the owner must
-        /// exist and the subject's credential must be ITS credential.
-        /// Deliberately independent of revocation, so terminal cleanup
-        /// can still unbind a revoked subject (R5.27).
         fn resolve_subject(&self, subject: &LaunchSubject) -> Result<(), StateError> {
-            let creds = self.launch_credentials.borrow();
-            match creds.get(&Self::owner_locator(subject)) {
-                None => Err(StateError::UnknownRecord),
-                Some(binding) if &binding.credential != subject.credential() => {
-                    Err(StateError::CredentialBindingMismatch)
-                }
-                Some(_) => Ok(()),
+            match subject {
+                LaunchSubject::WorkerAttempt { attempt } => self
+                    .launch_authorizers
+                    .borrow()
+                    .contains_key(&format!("attempt:{}", attempt.as_str()))
+                    .then_some(())
+                    .ok_or(StateError::UnknownRecord),
+                LaunchSubject::ActorActivation {
+                    actor,
+                    profile,
+                    generation,
+                } => match self
+                    .active_activation_generations
+                    .borrow()
+                    .get(&Self::activation_key(actor, profile))
+                {
+                    None => Err(StateError::UnknownRecord),
+                    Some(current) if current != generation => Err(StateError::StaleFencing),
+                    Some(_) => Ok(()),
+                },
             }
         }
 
-        /// FULL call identity for idempotency records: assignment,
-        /// attempt, actor, and fencing token all participate, so an
-        /// exact operation+payload presented under different call
-        /// identity conflicts instead of replaying (R5.28).
+        /// Caller-supplied fenced identity: Attempt locator and token.
+        /// Authority is deliberately absent and resolved server-side.
         fn call_identity(call: &FencedCall) -> String {
-            format!(
-                "asg={}|att={}|actor={}|tok={}",
-                call.assignment.as_str(),
-                call.attempt.as_str(),
-                call.actor.as_str(),
-                call.token.0
-            )
+            format!("att={}|tok={}", call.attempt.as_str(), call.token.0)
         }
 
         /// FULL substantive-action identity: the response link is an
@@ -2586,25 +2661,31 @@ mod tests {
         }
 
         fn worker_initiator(&self, call: &FencedCall) -> AuditInitiator {
+            let assignment = self
+                .attempt_owners
+                .borrow()
+                .get(call.attempt.as_str())
+                .and_then(|raw| AssignmentId::new(raw).ok())
+                .unwrap_or_else(|| AssignmentId::new("asg-1").expect("valid fallback"));
             let actor = self
                 .assignments
                 .borrow()
-                .get(call.assignment.as_str())
+                .get(assignment.as_str())
                 .map(|assignment| assignment.worker.clone())
                 .unwrap_or_else(|| self.bound_worker_snapshot.clone());
             AuditInitiator::WorkerBinding {
                 actor,
-                assignment: call.assignment.clone(),
+                assignment,
                 attempt: call.attempt.clone(),
             }
         }
 
         fn launch_authorizing(&self, subject: &LaunchSubject) -> Result<OperationId, StateError> {
             let operation = self
-                .launch_credentials
+                .launch_authorizers
                 .borrow()
-                .get(&Self::owner_locator(subject))
-                .map(|binding| binding.authorizing.clone())
+                .get(&Self::association_key(subject))
+                .cloned()
                 .ok_or(StateError::Corrupt)?;
             let committed = self.committed.borrow();
             if ["open", "attempt", "act"]
@@ -2629,6 +2710,12 @@ mod tests {
                 .iter()
                 .find(|signal| &signal.id == target)
                 .ok_or(StateError::UnknownRecord)?;
+            let owning_assignment = self
+                .attempt_owners
+                .borrow()
+                .get(action.call.attempt.as_str())
+                .cloned()
+                .ok_or(StateError::UnknownRecord)?;
             match (&signal.subject, &signal.body) {
                 (
                     SubjectRef::Attempt(subject),
@@ -2637,7 +2724,7 @@ mod tests {
                         attempt,
                         ..
                     },
-                ) if assignment == &action.call.assignment
+                ) if assignment.as_str() == owning_assignment.as_str()
                     && subject == &action.call.attempt
                     && attempt == &action.call.attempt =>
                 {
@@ -2711,9 +2798,12 @@ mod tests {
                 .iter()
                 .find(|s| s.id == draft.id)
             {
+                let SignalSender::Authority(sender) = &existing.sender else {
+                    return Err(StateError::IncoherentBundle);
+                };
                 let redraft = SignalDraft {
                     id: existing.id.clone(),
-                    sender: existing.sender.clone(),
+                    sender: sender.clone(),
                     subject: existing.subject.clone(),
                     body: existing.body.clone(),
                 };
@@ -2767,23 +2857,18 @@ mod tests {
             self.actor_classes
                 .borrow_mut()
                 .insert(worker.actor.as_str().to_owned(), worker.class);
-            self.launch_credentials.borrow_mut().insert(
-                format!("attempt:{}", opening.first_attempt.id.as_str()),
-                CredentialBinding {
-                    credential: opening.worker_credential.id.clone(),
-                    digest: opening.worker_credential.digest.clone(),
-                    actor: worker.actor.as_str().to_owned(),
-                    profile: worker.profile.as_str().to_owned(),
-                    assignment: Some(opening.assignment.id.as_str().to_owned()),
-                    generation: None,
-                    authorizing: opening.authorizing.operation.clone(),
-                    revoked: false,
-                },
+            self.attempt_owners.borrow_mut().insert(
+                opening.first_attempt.id.as_str().to_owned(),
+                opening.assignment.id.as_str().to_owned(),
             );
-            // First-worker registration IS an activation case, so it
-            // also records active (profile, actor) membership — a
-            // credentialed but inactive worker would be unqueryable and
-            // undeactivatable (R5.10 addendum).
+            self.launch_authorizers.borrow_mut().insert(
+                format!("attempt:{}", opening.first_attempt.id.as_str()),
+                opening.authorizing.operation.clone(),
+            );
+            // First-worker registration IS an activation case, so it also
+            // records active (profile, actor) membership; otherwise the
+            // worker would be unqueryable and undeactivatable (R5.10
+            // addendum).
             self.active_members
                 .borrow_mut()
                 .entry(format!("occupied:{}", worker.profile.as_str()))
@@ -2835,33 +2920,17 @@ mod tests {
                     Err(StateError::ConflictingOperation)
                 };
             }
-            // ---- commit successor Attempt + its credential together ----
-            // Without this the retry worker would be credential-dead
-            // even though AttemptOpening promises fresh provisioning.
-            // Ownership comes from THIS Assignment's bindings — never
-            // an arbitrary map entry (R5.20).
+            // ---- commit successor Attempt + its durable owner relation ----
             let assignment_id = opening.attempt.assignment.as_str().to_owned();
-            let owner = self
-                .launch_credentials
-                .borrow()
-                .values()
-                .find(|b| b.assignment.as_deref() == Some(assignment_id.as_str()))
-                .map(|b| (b.actor.clone(), b.profile.clone()));
-            let Some((owner_actor, owner_profile)) = owner else {
+            if !self.assignments.borrow().contains_key(&assignment_id) {
                 return Err(StateError::UnknownRecord);
-            };
-            self.launch_credentials.borrow_mut().insert(
+            }
+            self.attempt_owners
+                .borrow_mut()
+                .insert(opening.attempt.id.as_str().to_owned(), assignment_id);
+            self.launch_authorizers.borrow_mut().insert(
                 format!("attempt:{}", opening.attempt.id.as_str()),
-                CredentialBinding {
-                    credential: opening.worker_credential.id.clone(),
-                    digest: opening.worker_credential.digest.clone(),
-                    actor: owner_actor,
-                    profile: owner_profile,
-                    assignment: Some(assignment_id),
-                    generation: None,
-                    authorizing: opening.authorizing.operation.clone(),
-                    revoked: false,
-                },
+                opening.authorizing.operation.clone(),
             );
             self.attempt_states
                 .borrow_mut()
@@ -2880,8 +2949,8 @@ mod tests {
 
         fn record_decision(&self, record: &DecisionRecord) -> Result<StateApplied, StateError> {
             // Resolve the decided Handoff BEFORE recording anything: an
-            // unknown or mismatched Handoff must refuse without
-            // committing a decision or revoking a credential (R5.23).
+            // unknown or mismatched Handoff must refuse without committing a
+            // decision or changing lifecycle state (R5.23).
             if let DecisionKind::Accept { handoff, .. } | DecisionKind::Reject { handoff, .. } =
                 &record.kind
             {
@@ -2890,10 +2959,10 @@ mod tests {
                     return Err(StateError::UnknownRecord);
                 };
                 let owning = self
-                    .launch_credentials
+                    .attempt_owners
                     .borrow()
-                    .get(&format!("attempt:{}", found.attempt.as_str()))
-                    .and_then(|b| b.assignment.clone());
+                    .get(found.attempt.as_str())
+                    .cloned();
                 if owning.as_deref() != Some(record.assignment.as_str()) {
                     return Err(StateError::IncoherentBundle);
                 }
@@ -2911,11 +2980,7 @@ mod tests {
                     _ => None,
                 };
                 if let Some(attempt) = attempt_target {
-                    let owning = self
-                        .launch_credentials
-                        .borrow()
-                        .get(&format!("attempt:{}", attempt.as_str()))
-                        .and_then(|b| b.assignment.clone());
+                    let owning = self.attempt_owners.borrow().get(attempt.as_str()).cloned();
                     if owning.as_deref() != Some(record.assignment.as_str()) {
                         return Err(StateError::IncoherentBundle);
                     }
@@ -2927,12 +2992,6 @@ mod tests {
             )?;
             if applied == StateApplied::Applied {
                 let seq = self.next_ledger_seq();
-                // Terminal Attempt decisions end that Attempt's
-                // credential (ADR-0003); refused/conflicting
-                // operations never reach here, so they revoke nothing.
-                // EVERY Attempt-ending decision kills that Attempt's
-                // credential; Cancel ends every Attempt of the
-                // Assignment (R5.20).
                 let mut ended: Vec<String> = Vec::new();
                 match &record.kind {
                     DecisionKind::Revoke { attempt, .. }
@@ -2947,13 +3006,11 @@ mod tests {
                     DecisionKind::Cancel { .. } => {
                         let assignment = record.assignment.as_str().to_owned();
                         ended.extend(
-                            self.launch_credentials
+                            self.attempt_owners
                                 .borrow()
                                 .iter()
-                                .filter(|(_, b)| {
-                                    b.assignment.as_deref() == Some(assignment.as_str())
-                                })
-                                .map(|(k, _)| k.trim_start_matches("attempt:").to_owned())
+                                .filter(|(_, owner)| owner.as_str() == assignment.as_str())
+                                .map(|(attempt, _)| attempt.clone())
                                 .filter(|attempt| {
                                     self.attempt_states
                                         .borrow()
@@ -2963,14 +3020,6 @@ mod tests {
                         );
                     }
                     DecisionKind::TransferAuthority { .. } => {}
-                }
-                {
-                    let mut creds = self.launch_credentials.borrow_mut();
-                    for attempt in &ended {
-                        if let Some(binding) = creds.get_mut(&format!("attempt:{attempt}")) {
-                            binding.revoked = true;
-                        }
-                    }
                 }
                 {
                     let mut states = self.attempt_states.borrow_mut();
@@ -3149,39 +3198,18 @@ mod tests {
             self.actor_classes
                 .borrow_mut()
                 .insert(activation.actor.as_str().to_owned(), activation.class());
-            // A spawned orchestrator/watchdog's credential is bound to
-            // its activation, mirroring the worker's Attempt binding.
-            {
-                let mut creds = self.launch_credentials.borrow_mut();
-                // Rotation/recovery kills the PRIOR generation for this
-                // actor+profile; other actors/profiles are untouched.
-                for binding in creds.values_mut() {
-                    if binding.generation.is_some()
-                        && binding.actor == activation.actor.as_str()
-                        && binding.profile == activation.profile.as_str()
-                    {
-                        binding.revoked = true;
-                    }
-                }
-                creds.insert(
-                    format!(
-                        "activation:{}:{}:{}",
-                        activation.actor.as_str(),
-                        activation.profile.as_str(),
-                        activation.operation.as_str()
-                    ),
-                    CredentialBinding {
-                        credential: opening.credential.id.clone(),
-                        digest: opening.credential.digest.clone(),
-                        actor: activation.actor.as_str().to_owned(),
-                        profile: activation.profile.as_str().to_owned(),
-                        assignment: None,
-                        generation: Some(activation.operation.as_str().to_owned()),
-                        authorizing: activation.operation.clone(),
-                        revoked: false,
-                    },
-                );
-            }
+            self.active_activation_generations.borrow_mut().insert(
+                Self::activation_key(&activation.actor, &activation.profile),
+                activation.operation.clone(),
+            );
+            self.launch_authorizers.borrow_mut().insert(
+                Self::association_key(&LaunchSubject::ActorActivation {
+                    actor: activation.actor.clone(),
+                    profile: activation.profile.clone(),
+                    generation: activation.operation.clone(),
+                }),
+                activation.operation.clone(),
+            );
             // Membership is recorded for every occupancy class.
             self.active_members
                 .borrow_mut()
@@ -3255,12 +3283,9 @@ mod tests {
                 .entry(occupied_key)
                 .or_default()
                 .remove(actor.as_str());
-            // Credentials die with deactivation (ADR-0003).
-            for binding in self.launch_credentials.borrow_mut().values_mut() {
-                if binding.actor == actor.as_str() && binding.profile == profile.as_str() {
-                    binding.revoked = true;
-                }
-            }
+            self.active_activation_generations
+                .borrow_mut()
+                .remove(&Self::activation_key(actor, profile));
             let seq = self.next_ledger_seq();
             self.append_audit(
                 seq,
@@ -3315,7 +3340,7 @@ mod tests {
         fn fenced_report(
             &self,
             action: &FencedAction,
-            draft: &SignalDraft,
+            draft: &ReportDraft,
         ) -> Result<(ReportOutcome, FencedResponse), StateError> {
             let call = &action.call;
             let request = format!("{}|{draft:?}", Self::action_identity(action));
@@ -3344,17 +3369,6 @@ mod tests {
             }
             self.active_fence(call)?;
             self.validate_response_target(action)?;
-            // The draft must describe THIS call: same Attempt subject,
-            // same sending actor (R5.24).
-            let subject_ok = matches!(
-                (&draft.subject, &draft.body),
-                (SubjectRef::Attempt(s), SignalBody::Report { attempt, .. })
-                    if s == &call.attempt && attempt == &call.attempt
-            );
-            if !subject_ok || draft.sender.actor.actor != call.actor {
-                return Err(StateError::IncoherentBundle);
-            }
-
             let gate = {
                 let signals = self.stored_signals.borrow();
                 let actions = self.response_actions.borrow();
@@ -3386,7 +3400,34 @@ mod tests {
                 ));
             }
 
-            let (signal, applied) = self.commit_signal(draft)?;
+            let assignment = self
+                .attempt_owners
+                .borrow()
+                .get(call.attempt.as_str())
+                .and_then(|raw| AssignmentId::new(raw).ok())
+                .ok_or(StateError::UnknownRecord)?;
+            let actor = self
+                .assignments
+                .borrow()
+                .get(assignment.as_str())
+                .map(|record| record.worker.clone())
+                .ok_or(StateError::UnknownRecord)?;
+            let signal = Signal {
+                id: draft.id.clone(),
+                sender: SignalSender::WorkerBinding {
+                    actor,
+                    assignment,
+                    attempt: call.attempt.clone(),
+                },
+                subject: SubjectRef::Attempt(call.attempt.clone()),
+                body: SignalBody::Report {
+                    attempt: call.attempt.clone(),
+                    kind: draft.kind.clone(),
+                },
+                seq: self.next_ledger_seq(),
+            };
+            self.stored_signals.borrow_mut().push(signal.clone());
+            let applied = StateApplied::Applied;
             self.record_owners.borrow_mut().insert(
                 format!("signal:{}", draft.id.as_str()),
                 call.operation.as_str().to_owned(),
@@ -3608,13 +3649,6 @@ mod tests {
             self.attempt_states
                 .borrow_mut()
                 .insert(call.attempt.as_str().to_owned(), next);
-            if let Some(binding) = self
-                .launch_credentials
-                .borrow_mut()
-                .get_mut(&format!("attempt:{}", call.attempt.as_str()))
-            {
-                binding.revoked = true;
-            }
             self.response_actions.borrow_mut().push(ResponseAction {
                 seq: head,
                 kind: ResponseKind::TerminalAttemptAction {
@@ -3958,35 +3992,6 @@ mod tests {
             Ok(self.stored_signals.borrow().clone())
         }
 
-        fn verify_launch_subject(
-            &self,
-            subject: &LaunchSubject,
-            presented_digest: &ContentHash,
-        ) -> Result<(), StateError> {
-            let key = Self::owner_locator(subject);
-            let credential = subject.credential();
-            // Outcome-level fake only: it proves the refusal taxonomy,
-            // never pretends to be a constant-time implementation.
-            let active = self.launch_credentials.borrow();
-            match active.get(&key) {
-                None => Err(StateError::UnknownRecord),
-                Some(binding) => {
-                    let (id, digest, revoked) =
-                        (&binding.credential, &binding.digest, binding.revoked);
-                    if id != credential {
-                        Err(StateError::CredentialBindingMismatch)
-                    } else if revoked {
-                        // Lifecycle says it is dead; never certify it.
-                        Err(StateError::CredentialRevoked)
-                    } else if digest != presented_digest {
-                        Err(StateError::CredentialInvalid)
-                    } else {
-                        Ok(())
-                    }
-                }
-            }
-        }
-
         fn handoff(&self, id: &HandoffId) -> Result<HandoffRecord, StateError> {
             self.handoffs
                 .borrow()
@@ -4069,10 +4074,7 @@ mod tests {
         FakeState {
             committed: RefCell::new(BTreeMap::new()),
             current_token: RefCell::new(FencingToken(3)),
-            bound_worker: ActorId::new("worker-1").unwrap(),
             bound_worker_snapshot: worker_snapshot(),
-            bound_assignment: AssignmentId::new("asg-1").unwrap(),
-            bound_attempt: AttemptId::new("att-1").unwrap(),
             lease_expires_at: RefCell::new(Timestamp(100)),
             now: RefCell::new(Timestamp(50)),
             next_seq: RefCell::new(0),
@@ -4084,13 +4086,18 @@ mod tests {
             submissions: RefCell::new(BTreeMap::new()),
             receipts: RefCell::new(Vec::new()),
             decisions: RefCell::new(Vec::new()),
-            launch_credentials: RefCell::new(BTreeMap::new()),
+            attempt_owners: RefCell::new(BTreeMap::from([(
+                "att-1".to_owned(),
+                "asg-1".to_owned(),
+            )])),
+            launch_authorizers: RefCell::new(BTreeMap::new()),
+            active_activation_generations: RefCell::new(BTreeMap::new()),
             envelopes: RefCell::new(BTreeMap::new()),
             handles: RefCell::new(BTreeMap::new()),
             operations: RefCell::new(BTreeMap::new()),
             record_owners: RefCell::new(BTreeMap::new()),
             projections: RefCell::new(BTreeMap::new()),
-            assignments: RefCell::new(BTreeMap::new()),
+            assignments: RefCell::new(BTreeMap::from([("asg-1".to_owned(), opening().assignment)])),
             application_attempts: RefCell::new(BTreeMap::new()),
             active_members: RefCell::new(BTreeMap::new()),
             handoffs: RefCell::new(Vec::new()),
@@ -4106,9 +4113,7 @@ mod tests {
 
     fn good_call(operation: &str) -> FencedCall {
         FencedCall {
-            assignment: AssignmentId::new("asg-1").unwrap(),
             attempt: AttemptId::new("att-1").unwrap(),
-            actor: ActorId::new("worker-1").unwrap(),
             token: FencingToken(3),
             operation: op(operation),
         }
@@ -4130,25 +4135,12 @@ mod tests {
             .count()
     }
 
-    fn worker_authority(capability: &str) -> AuthoritySnapshot {
-        AuthoritySnapshot {
-            actor: worker_snapshot(),
-            capability: CapabilityId::new(capability).unwrap(),
-            scope: ScopeExpr::Universal,
-        }
-    }
-
-    fn report_draft(id: &str) -> SignalDraft {
-        SignalDraft {
+    fn report_draft(id: &str) -> ReportDraft {
+        ReportDraft {
             id: SignalId::new(id).unwrap(),
-            sender: worker_authority("state:report"),
-            subject: SubjectRef::Attempt(AttemptId::new("att-1").unwrap()),
-            body: SignalBody::Report {
-                attempt: AttemptId::new("att-1").unwrap(),
-                kind: ReportKind::Progress {
-                    phase: crate::signal::SemanticPhase::Verifying,
-                    summary: None,
-                },
+            kind: ReportKind::Progress {
+                phase: crate::signal::SemanticPhase::Verifying,
+                summary: None,
             },
         }
     }
@@ -4216,24 +4208,10 @@ mod tests {
             port.open_assignment(&altered),
             Err(StateError::ConflictingOperation)
         );
-        // Same operation with a changed credential id or digest is a
-        // conflict, never a silent rebind (R2).
-        let mut cred_id = opening();
-        cred_id.worker_credential.id = CredentialId::new("cred-2").unwrap();
-        assert_eq!(
-            port.open_assignment(&cred_id),
-            Err(StateError::ConflictingOperation)
-        );
-        let mut cred_digest = opening();
-        cred_digest.worker_credential.digest = ContentHash::new(&"e".repeat(64)).unwrap();
-        assert_eq!(
-            port.open_assignment(&cred_digest),
-            Err(StateError::ConflictingOperation)
-        );
     }
 
     #[test]
-    fn retry_bundle_carries_and_fences_its_credential() {
+    fn retry_bundle_records_its_attempt_locator_atomically() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         // Ownership resolves from this Assignment's existing bindings.
@@ -4253,10 +4231,6 @@ mod tests {
                     expires_at: Timestamp(200),
                 },
             },
-            worker_credential: CredentialProvisioning {
-                id: CredentialId::new("cred-2").unwrap(),
-                digest: ContentHash::new(&"f".repeat(64)).unwrap(),
-            },
         };
         assert_eq!(
             port.append_attempt(&retry_opening),
@@ -4266,16 +4240,10 @@ mod tests {
             port.append_attempt(&retry_opening),
             Ok(StateApplied::AlreadyApplied)
         );
-        let mut altered = retry_opening.clone();
-        altered.worker_credential.digest = ContentHash::new(&"9".repeat(64)).unwrap();
+        let mut altered = retry_opening;
+        altered.attempt.lease.expires_at = Timestamp(201);
         assert_eq!(
             port.append_attempt(&altered),
-            Err(StateError::ConflictingOperation)
-        );
-        let mut altered_id = retry_opening;
-        altered_id.worker_credential.id = CredentialId::new("cred-9").unwrap();
-        assert_eq!(
-            port.append_attempt(&altered_id),
             Err(StateError::ConflictingOperation)
         );
     }
@@ -4312,9 +4280,10 @@ mod tests {
     }
 
     #[test]
-    fn fenced_calls_authenticate_actor_and_token() {
+    fn fenced_calls_resolve_actor_and_check_token() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
+        assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
         let evidence = crate::evidence::Evidence::new(
             Argv::new(vec!["cargo".into(), "test".into()]).unwrap(),
             VerificationSet::new(
@@ -4332,17 +4301,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let wrong_actor = FencedAction {
-            call: FencedCall {
-                actor: ActorId::new("intruder").unwrap(),
-                ..good_call("op-evi")
-            },
-            responds_to: None,
-        };
-        assert_eq!(
-            port.fenced_evidence(&wrong_actor, &evidence),
-            Err(StateError::ActorMismatch)
-        );
         let stale = FencedAction {
             call: FencedCall {
                 token: FencingToken(2),
@@ -4618,10 +4576,6 @@ mod tests {
             )
             .unwrap(),
             case: ActivationCase::OperatorBootstrap,
-            credential: CredentialProvisioning {
-                id: CredentialId::new(&format!("cred-{op_id}")).unwrap(),
-                digest: ContentHash::new(&"c".repeat(64)).unwrap(),
-            },
         }
     }
 
@@ -4723,7 +4677,7 @@ mod tests {
             Ok(StateApplied::AlreadyApplied)
         );
         let mut conflicting = second.clone();
-        conflicting.credential.digest = ContentHash::new(&"b".repeat(64)).unwrap();
+        conflicting.activation.profile_hash = ContentHash::new(&"b".repeat(64)).unwrap();
         assert_eq!(
             port.activate_profile(&conflicting),
             Err(StateError::ConflictingOperation)
@@ -4755,8 +4709,8 @@ mod tests {
         );
     }
 
-    /// R5.13: a lost/revoked initial orchestrator credential recovers
-    /// through the operator channel — without reopening one-shot
+    /// R5.13: an initial orchestrator recovers through the operator
+    /// channel — without reopening one-shot
     /// bootstrap and without creating a new actor.
     #[test]
     fn operator_recovery_rotates_an_existing_orchestrator_only() {
@@ -4785,7 +4739,7 @@ mod tests {
             Ok(StateApplied::AlreadyApplied)
         );
         let mut conflicting = recovery;
-        conflicting.credential.digest = ContentHash::new(&"b".repeat(64)).unwrap();
+        conflicting.activation.profile_hash = ContentHash::new(&"b".repeat(64)).unwrap();
         assert_eq!(
             port.activate_profile(&conflicting),
             Err(StateError::ConflictingOperation)
@@ -4807,18 +4761,11 @@ mod tests {
             port.activate_profile(&base),
             Ok(StateApplied::AlreadyApplied)
         );
-        // Same operation, different credential id → conflict.
-        let mut cred_id = base.clone();
-        cred_id.credential.id = CredentialId::new("cred-zz").unwrap();
+        // Same operation, different profile snapshot → conflict.
+        let mut profile_hash = base.clone();
+        profile_hash.activation.profile_hash = ContentHash::new(&"7".repeat(64)).unwrap();
         assert_eq!(
-            port.activate_profile(&cred_id),
-            Err(StateError::ConflictingOperation)
-        );
-        // Same operation, different digest → conflict.
-        let mut digest = base.clone();
-        digest.credential.digest = ContentHash::new(&"7".repeat(64)).unwrap();
-        assert_eq!(
-            port.activate_profile(&digest),
+            port.activate_profile(&profile_hash),
             Err(StateError::ConflictingOperation)
         );
         // Same operation, different authority case → conflict.
@@ -4903,7 +4850,7 @@ mod tests {
         );
 
         // An existing actor cannot silently change class.
-        let mut reclassed = opening_for("asg-1", "att-1", "cred-1", "op-assign-2");
+        let mut reclassed = opening_for("asg-1", "att-1", "op-assign-2");
         reclassed.assignment.worker.class = AuthorityClass::Orchestrator;
         assert_eq!(
             port.open_assignment(&reclassed),
@@ -4990,17 +4937,7 @@ mod tests {
     }
 
     impl RuntimePort for FakeRuntime {
-        fn launch(
-            &self,
-            _spec: &LaunchSpec,
-            secret: EphemeralLaunchSecret,
-        ) -> Result<LaunchAttempt, RuntimeError> {
-            // Contract checks: the secret Debug is redacted, and it is
-            // consumed here without duplication (non-Clone).
-            assert_eq!(format!("{secret:?}"), "EphemeralLaunchSecret(REDACTED)");
-            if secret.subject() != &_spec.subject {
-                return Err(RuntimeError::Rejected);
-            }
+        fn launch(&self, _spec: &LaunchSpec) -> Result<LaunchAttempt, RuntimeError> {
             Ok(LaunchAttempt::Launched(LaunchOutcome {
                 handle: self.live.clone(),
                 observation: LivenessObservation {
@@ -5021,7 +4958,7 @@ mod tests {
             // needed — but the Attempt must match too (R5.17).
             // Recovery works for BOTH subject kinds, keyed by the
             // pre-known (subject, correlation) pair.
-            let known = subject == &worker_subject("att-1", "cred-1")
+            let known = subject == &worker_subject("att-1")
                 || subject == &actor_subject("lead-1", "lead", "act-1");
             if correlation == &LaunchCorrelation::new("corr-1").unwrap() && known {
                 return Ok(Some(LaunchOutcome {
@@ -5125,12 +5062,7 @@ mod tests {
     }
 
     /// A coherent second Assignment: every identity updated together.
-    fn opening_for(
-        assignment: &str,
-        attempt: &str,
-        credential: &str,
-        operation: &str,
-    ) -> AssignmentOpening {
+    fn opening_for(assignment: &str, attempt: &str, operation: &str) -> AssignmentOpening {
         let mut o = opening();
         let asg = AssignmentId::new(assignment).unwrap();
         let att = AttemptId::new(attempt).unwrap();
@@ -5140,14 +5072,12 @@ mod tests {
         o.authorizing.operation = op(operation);
         o.authorizing.assignment = asg;
         o.authorizing.first_attempt = att;
-        o.worker_credential.id = CredentialId::new(credential).unwrap();
         o
     }
 
-    fn worker_subject(attempt: &str, credential: &str) -> LaunchSubject {
+    fn worker_subject(attempt: &str) -> LaunchSubject {
         LaunchSubject::WorkerAttempt {
             attempt: AttemptId::new(attempt).unwrap(),
-            credential: CredentialId::new(credential).unwrap(),
         }
     }
 
@@ -5156,13 +5086,12 @@ mod tests {
             actor: ActorId::new(actor).unwrap(),
             profile: ProfileName::new(profile).unwrap(),
             generation: op(generation),
-            credential: CredentialId::new(&format!("cred-{generation}")).unwrap(),
         }
     }
 
     fn spec() -> LaunchSpec {
         LaunchSpec {
-            subject: worker_subject("att-1", "cred-1"),
+            subject: worker_subject("att-1"),
             agent_kind: "claude".into(),
             executable: "/usr/local/bin/agent".into(),
             args: vec!["--project".into()],
@@ -5184,13 +5113,7 @@ mod tests {
             live: RuntimeHandle::new("gen-2-token"),
         };
         let port: &dyn RuntimePort = &runtime;
-        let attempt_outcome = port
-            .launch(
-                &spec(),
-                EphemeralLaunchSecret::new("a".repeat(32), worker_subject("att-1", "cred-1"))
-                    .unwrap(),
-            )
-            .unwrap();
+        let attempt_outcome = port.launch(&spec()).unwrap();
         let LaunchAttempt::Launched(outcome) = attempt_outcome else {
             panic!("expected launched")
         };
@@ -5235,41 +5158,6 @@ mod tests {
         assert_eq!(recovered, live);
     }
 
-    #[test]
-    fn launch_material_is_bounded_and_identity_bound() {
-        let subject = worker_subject("att-1", "cred-1");
-        // Shape: >=128 bits of lowercase hex, bounded.
-        assert_eq!(
-            EphemeralLaunchSecret::new("short".into(), subject.clone()).err(),
-            Some(LaunchSecretError::TooShort)
-        );
-        assert_eq!(
-            EphemeralLaunchSecret::new("z".repeat(32), subject.clone()).err(),
-            Some(LaunchSecretError::NotHex)
-        );
-        assert_eq!(
-            EphemeralLaunchSecret::new("a".repeat(129), subject.clone()).err(),
-            Some(LaunchSecretError::TooLong)
-        );
-        // Swap defense: material for another Attempt is refused before
-        // any provider mutation.
-        let runtime = FakeRuntime {
-            live: RuntimeHandle::new("gen-2-token"),
-        };
-        let port: &dyn RuntimePort = &runtime;
-        let wrong =
-            EphemeralLaunchSecret::new("b".repeat(32), worker_subject("att-9", "cred-1")).unwrap();
-        assert_eq!(port.launch(&spec(), wrong), Err(RuntimeError::Rejected));
-        // Same Attempt, wrong credential: also refused before mutation.
-        let wrong_cred =
-            EphemeralLaunchSecret::new("c".repeat(32), worker_subject("att-1", "cred-other"))
-                .unwrap();
-        assert_eq!(
-            port.launch(&spec(), wrong_cred),
-            Err(RuntimeError::Rejected)
-        );
-    }
-
     /// R5.11: the launch response is DISCARDED, and recovery still
     /// works from the pre-known correlation in the LaunchSpec.
     #[test]
@@ -5279,9 +5167,7 @@ mod tests {
         };
         let port: &dyn RuntimePort = &runtime;
         let spec = spec();
-        let secret =
-            EphemeralLaunchSecret::new("a".repeat(32), worker_subject("att-1", "cred-1")).unwrap();
-        let _discarded = port.launch(&spec, secret);
+        let _discarded = port.launch(&spec);
         let recovered = port
             .recover_launch(&spec.subject, &spec.correlation, Timestamp(9))
             .unwrap()
@@ -5292,13 +5178,9 @@ mod tests {
         assert_eq!(recovered.startup_delivery, StartupDelivery::Ambiguous);
         // A right correlation with the WRONG Attempt must not rebind.
         assert!(
-            port.recover_launch(
-                &worker_subject("att-9", "cred-1"),
-                &spec.correlation,
-                Timestamp(9)
-            )
-            .unwrap()
-            .is_none()
+            port.recover_launch(&worker_subject("att-9"), &spec.correlation, Timestamp(9))
+                .unwrap()
+                .is_none()
         );
         let unknown = LaunchCorrelation::new("corr-absent").unwrap();
         assert!(
@@ -5309,42 +5191,10 @@ mod tests {
         assert!(LaunchCorrelation::new("BAD").is_err());
     }
 
-    /// The wrong-token/right-ID requirement now lives at the seam that
-    /// owns the check; core asserts only the outcome taxonomy.
+    /// A retry Attempt's locator resolves, and a conflicting retry
+    /// does not disturb the installed durable relation.
     #[test]
-    fn scribe_verifies_worker_credential_outcomes() {
-        let state = fake_state();
-        let port: &dyn WorkflowStatePort = &state;
-        assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        let right_digest = ContentHash::new(&"d".repeat(64)).unwrap();
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &right_digest),
-            Ok(())
-        );
-        // Right ID, WRONG token → refused.
-        assert_eq!(
-            port.verify_launch_subject(
-                &worker_subject("att-1", "cred-1"),
-                &ContentHash::new(&"e".repeat(64)).unwrap()
-            ),
-            Err(StateError::CredentialInvalid)
-        );
-        // Wrong credential identity → binding mismatch.
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-other"), &right_digest),
-            Err(StateError::CredentialBindingMismatch)
-        );
-        // Unknown Attempt → unknown record.
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-9", "cred-1"), &right_digest),
-            Err(StateError::UnknownRecord)
-        );
-    }
-
-    /// R5.16: a retry Attempt's credential must be usable, and a
-    /// conflicting retry must not disturb the installed one.
-    #[test]
-    fn retry_credential_is_installed_and_verifiable() {
+    fn retry_attempt_locator_is_installed_and_resolvable() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
@@ -5363,43 +5213,18 @@ mod tests {
                     expires_at: Timestamp(200),
                 },
             },
-            worker_credential: CredentialProvisioning {
-                id: CredentialId::new("cred-2").unwrap(),
-                digest: ContentHash::new(&"f".repeat(64)).unwrap(),
-            },
         };
         assert_eq!(port.append_attempt(&retry), Ok(StateApplied::Applied));
-        // Right digest passes on the successor Attempt.
-        assert_eq!(
-            port.verify_launch_subject(
-                &worker_subject("att-2", "cred-2"),
-                &ContentHash::new(&"f".repeat(64)).unwrap()
-            ),
-            Ok(())
-        );
-        // Wrong digest refuses.
-        assert_eq!(
-            port.verify_launch_subject(
-                &worker_subject("att-2", "cred-2"),
-                &ContentHash::new(&"a".repeat(64)).unwrap()
-            ),
-            Err(StateError::CredentialInvalid)
-        );
+        assert_eq!(port.runtime_handle(&worker_subject("att-2")), Ok(None));
         // A conflicting retry under the same operation leaves the
-        // installed successor credential intact.
+        // installed successor relation intact.
         let mut conflicting = retry;
-        conflicting.worker_credential.digest = ContentHash::new(&"9".repeat(64)).unwrap();
+        conflicting.attempt.lease.expires_at = Timestamp(201);
         assert_eq!(
             port.append_attempt(&conflicting),
             Err(StateError::ConflictingOperation)
         );
-        assert_eq!(
-            port.verify_launch_subject(
-                &worker_subject("att-2", "cred-2"),
-                &ContentHash::new(&"f".repeat(64)).unwrap()
-            ),
-            Ok(())
-        );
+        assert_eq!(port.runtime_handle(&worker_subject("att-2")), Ok(None));
     }
 
     /// R5.10: shared profiles (the normal ten-worker case) have real
@@ -5420,7 +5245,7 @@ mod tests {
             },
         );
         assert_eq!(port.activate_profile(&w1), Ok(StateApplied::Applied));
-        let mut second = opening_for("asg-3", "att-3", "cred-3", "op-assign-b");
+        let mut second = opening_for("asg-3", "att-3", "op-assign-b");
         second.assignment.worker = DecisionActor {
             actor: ActorId::new("worker-2").unwrap(),
             class: AuthorityClass::Worker,
@@ -5470,51 +5295,16 @@ mod tests {
         );
     }
 
-    /// R5.18: the lifecycle says credentials die at deactivation and
-    /// on terminal Attempt decisions — the fake must stop certifying
-    /// them, and refused operations must revoke nothing.
+    /// Ended Attempts fail with the stale-fencing taxonomy while an
+    /// unrelated Assignment remains writable.
     #[test]
-    fn credentials_are_revoked_by_lifecycle_events() {
-        let digest = ContentHash::new(&"d".repeat(64)).unwrap();
-
-        // (a) Worker deactivation revokes.
+    fn ended_attempt_is_stale_without_collateral() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
-            Ok(())
-        );
-        // A refused deactivation (non-member) revokes nothing.
-        assert_eq!(
-            port.deactivate_profile(
-                &op("d-bad"),
-                &ActorId::new("worker-9").unwrap(),
-                &ProfileName::new("worker").unwrap()
-            ),
-            Err(StateError::NotTheOccupant)
-        );
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
-            Ok(())
-        );
-        assert_eq!(
-            port.deactivate_profile(
-                &op("d-1"),
-                &ActorId::new("worker-1").unwrap(),
-                &ProfileName::new("worker").unwrap()
-            ),
-            Ok(StateApplied::Applied)
-        );
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
-            Err(StateError::CredentialRevoked)
-        );
-
-        // (b) An explicit Revoke decision revokes that Attempt.
-        let state = fake_state();
-        let port: &dyn WorkflowStatePort = &state;
-        assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
+        let mut other = opening_for("asg-2", "att-7", "op-assign-c");
+        other.assignment.worker.actor = ActorId::new("worker-2").unwrap();
+        assert_eq!(port.open_assignment(&other), Ok(StateApplied::Applied));
         let revoke = DecisionRecord {
             operation: op("op-revoke"),
             assignment: AssignmentId::new("asg-1").unwrap(),
@@ -5555,83 +5345,38 @@ mod tests {
             "a decision terminal and its audit share one causal position"
         );
         assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
-            Err(StateError::CredentialRevoked)
+            port.fenced_evidence(&good_action("op-after-revoke"), &passing_evidence()),
+            Err(StateError::StaleFencing),
+            "an ended Attempt is a stale predecessor, not an incoherent bundle"
         );
-        // A conflicting same-operation decision revokes nothing new.
-        let state = fake_state();
-        let port: &dyn WorkflowStatePort = &state;
-        assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        let benign = DecisionRecord {
-            operation: op("op-x"),
-            assignment: AssignmentId::new("asg-1").unwrap(),
-            authority: authority("state:assign"),
-            kind: DecisionKind::Cancel {
-                reason: reason("obsolete"),
+        let other_action = FencedAction {
+            call: FencedCall {
+                attempt: AttemptId::new("att-7").unwrap(),
+                token: FencingToken(3),
+                operation: op("op-other-worker"),
             },
-            resolves: None,
-        };
-        assert_eq!(port.record_decision(&benign), Ok(StateApplied::Applied));
-        let mut conflicting = benign;
-        conflicting.kind = DecisionKind::Revoke {
-            attempt: AttemptId::new("att-1").unwrap(),
-            reason: reason("different content"),
+            responds_to: None,
         };
         assert_eq!(
-            port.record_decision(&conflicting),
-            Err(StateError::ConflictingOperation)
-        );
-        // The refused decision itself revoked nothing new; the earlier
-        // committed Cancel legitimately ended this Assignment's
-        // Attempts, so the credential is dead for that reason.
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
-            Err(StateError::CredentialRevoked)
-        );
-
-        // No-collateral proof: a second Assignment's worker credential
-        // survives the first Assignment's Cancel.
-        let state = fake_state();
-        let port: &dyn WorkflowStatePort = &state;
-        assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        let other = opening_for("asg-2", "att-7", "cred-7", "op-assign-c");
-        assert_eq!(port.open_assignment(&other), Ok(StateApplied::Applied));
-        let cancel_first = DecisionRecord {
-            operation: op("op-cancel-1"),
-            assignment: AssignmentId::new("asg-1").unwrap(),
-            authority: authority("state:assign"),
-            kind: DecisionKind::Cancel {
-                reason: reason("obsolete"),
-            },
-            resolves: None,
-        };
-        assert_eq!(
-            port.record_decision(&cancel_first),
-            Ok(StateApplied::Applied)
-        );
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-1", "cred-1"), &digest),
-            Err(StateError::CredentialRevoked)
-        );
-        assert_eq!(
-            port.verify_launch_subject(&worker_subject("att-7", "cred-7"), &digest),
-            Ok(())
+            port.fenced_evidence(&other_action, &passing_evidence())
+                .unwrap()
+                .0,
+            EvidenceOutcome::Recorded
         );
     }
 
-    /// R5.20: rotation kills the prior generation for that
+    /// Rotation fences the prior generation for that
     /// actor+profile and leaves everything else alone.
     #[test]
     fn rotation_revokes_only_the_prior_generation() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
-        let digest = ContentHash::new(&"c".repeat(64)).unwrap();
         assert_eq!(
             port.activate_profile(&activation("act-1", "lead-1", "lead")),
             Ok(StateApplied::Applied)
         );
         let gen1 = actor_subject("lead-1", "lead", "act-1");
-        assert_eq!(port.verify_launch_subject(&gen1, &digest), Ok(()));
+        assert_eq!(port.runtime_handle(&gen1), Ok(None));
         assert_eq!(
             port.activate_profile(&activation_with(
                 "act-2",
@@ -5644,19 +5389,15 @@ mod tests {
             Ok(StateApplied::Applied)
         );
         // Old generation dead, new generation valid.
+        assert_eq!(port.runtime_handle(&gen1), Err(StateError::StaleFencing));
         assert_eq!(
-            port.verify_launch_subject(&gen1, &digest),
-            Err(StateError::CredentialRevoked)
-        );
-        assert_eq!(
-            port.verify_launch_subject(&actor_subject("lead-1", "lead", "act-2"), &digest),
-            Ok(())
+            port.runtime_handle(&actor_subject("lead-1", "lead", "act-2")),
+            Ok(None)
         );
     }
 
     /// R5.19: a spawned orchestrator/watchdog profile is launchable
-    /// and associable through the same closed subject, and its
-    /// credential is verifiable via its activation.
+    /// and associable through the same closed subject.
     #[test]
     fn orchestrator_profiles_are_launchable_subjects() {
         let state = fake_state();
@@ -5667,11 +5408,6 @@ mod tests {
             Ok(StateApplied::Applied)
         );
         let subject = actor_subject("lead-1", "lead", "act-1");
-        // The activation's credential verifies through the same port.
-        assert_eq!(
-            port.verify_launch_subject(&subject, &ContentHash::new(&"c".repeat(64)).unwrap()),
-            Ok(())
-        );
         // Envelope persistence and handle association accept it too.
         assert_eq!(
             port.persist_envelope(
@@ -5708,7 +5444,7 @@ mod tests {
         assert_eq!(port.runtime_handle(&subject).unwrap(), Some(handle));
         // Cross-subject isolation: an unrelated worker subject is not
         // even resolvable here, let alone able to read these records.
-        let worker = worker_subject("att-1", "cred-1");
+        let worker = worker_subject("att-1");
         assert_eq!(port.runtime_handle(&worker), Err(StateError::UnknownRecord));
         assert_eq!(port.envelope(&worker), Err(StateError::UnknownRecord));
         assert_eq!(
@@ -5716,21 +5452,17 @@ mod tests {
             Ok(StateApplied::Applied)
         );
         assert_eq!(port.runtime_handle(&subject).unwrap(), None);
-        // Launch material for this subject is distinct from any worker's.
-        let material = EphemeralLaunchSecret::new("a".repeat(32), subject.clone()).unwrap();
-        assert_eq!(material.subject(), &subject);
-        assert_ne!(material.subject(), &worker);
     }
 
-    /// R5.23 #1: a wrong-credential subject shares identity fields but
-    /// must never alias the real subject's association.
+    /// R5.23 #1: an unknown Attempt locator must never alias a real
+    /// subject's association.
     #[test]
-    fn wrong_credential_subject_cannot_alias_associations() {
+    fn unknown_attempt_cannot_alias_associations() {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        let right = worker_subject("att-1", "cred-1");
-        let wrong = worker_subject("att-1", "cred-bogus");
+        let right = worker_subject("att-1");
+        let unknown = worker_subject("att-nope");
         let envelope =
             EnvelopeSnapshot::new("real".into(), ContentHash::new(&"e".repeat(64)).unwrap())
                 .unwrap();
@@ -5742,38 +5474,24 @@ mod tests {
             port.bind_runtime_handle(&op("bind-1"), &right, &RuntimeHandle::new("h-real")),
             Ok(StateApplied::Applied)
         );
-        // The wrong-credential subject is refused outright — no read,
-        // no orphan record, no mutation of the real association
-        // (R5.27).
+        // The unknown locator is refused outright — no read, orphan
+        // record, or mutation of the real association.
+        assert_eq!(port.envelope(&unknown), Err(StateError::UnknownRecord));
         assert_eq!(
-            port.envelope(&wrong),
-            Err(StateError::CredentialBindingMismatch)
+            port.runtime_handle(&unknown),
+            Err(StateError::UnknownRecord)
         );
         assert_eq!(
-            port.runtime_handle(&wrong),
-            Err(StateError::CredentialBindingMismatch)
+            port.bind_runtime_handle(&op("bind-2"), &unknown, &RuntimeHandle::new("h-fake")),
+            Err(StateError::UnknownRecord)
         );
         assert_eq!(
-            port.bind_runtime_handle(&op("bind-2"), &wrong, &RuntimeHandle::new("h-fake")),
-            Err(StateError::CredentialBindingMismatch)
-        );
-        assert_eq!(
-            port.unbind_runtime_handle(&op("unbind-1"), &wrong),
-            Err(StateError::CredentialBindingMismatch)
-        );
-        // An entirely unknown owner is a distinct refusal.
-        assert_eq!(
-            port.runtime_handle(&worker_subject("att-nope", "cred-1")),
+            port.unbind_runtime_handle(&op("unbind-1"), &unknown),
             Err(StateError::UnknownRecord)
         );
         assert_eq!(
             port.runtime_handle(&right).unwrap(),
             Some(RuntimeHandle::new("h-real"))
-        );
-        // But verification still distinguishes mismatch from unknown.
-        assert_eq!(
-            port.verify_launch_subject(&wrong, &ContentHash::new(&"d".repeat(64)).unwrap()),
-            Err(StateError::CredentialBindingMismatch)
         );
     }
 
@@ -5785,9 +5503,9 @@ mod tests {
         let state = fake_state();
         let port: &dyn WorkflowStatePort = &state;
         assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        let second = opening_for("asg-2", "att-2", "cred-2", "op-assign-2");
+        let second = opening_for("asg-2", "att-2", "op-assign-2");
         assert_eq!(port.open_assignment(&second), Ok(StateApplied::Applied));
-        let subject = worker_subject("att-1", "cred-1");
+        let subject = worker_subject("att-1");
         let h1 = RuntimeHandle::new("h1");
         let h2 = RuntimeHandle::new("h2");
         assert_eq!(
@@ -5816,7 +5534,7 @@ mod tests {
         assert_eq!(port.runtime_handle(&subject).unwrap(), Some(h2));
         // Same verb+operation against a DIFFERENT subject conflicts.
         assert_eq!(
-            port.bind_runtime_handle(&op("op-new"), &worker_subject("att-2", "cred-2"), &h1),
+            port.bind_runtime_handle(&op("op-new"), &worker_subject("att-2"), &h1),
             Err(StateError::ConflictingOperation)
         );
     }
@@ -5840,10 +5558,7 @@ mod tests {
         );
         // No side effects: the Assignment never opened.
         assert_eq!(
-            port.verify_launch_subject(
-                &worker_subject("att-1", "cred-1"),
-                &ContentHash::new(&"d".repeat(64)).unwrap()
-            ),
+            port.runtime_handle(&worker_subject("att-1")),
             Err(StateError::UnknownRecord)
         );
         // Retry bundles are checked too.
@@ -5862,10 +5577,6 @@ mod tests {
                     token: FencingToken(2),
                     expires_at: Timestamp(200),
                 },
-            },
-            worker_credential: CredentialProvisioning {
-                id: CredentialId::new("cred-2").unwrap(),
-                digest: ContentHash::new(&"f".repeat(64)).unwrap(),
             },
         };
         assert_eq!(
@@ -5912,8 +5623,7 @@ mod tests {
         let mut spec = spec();
         spec.subject = subject.clone();
         spec.agent_kind = "claude".into();
-        let material = EphemeralLaunchSecret::new("a".repeat(32), subject.clone()).unwrap();
-        let attempt = port.launch(&spec, material).unwrap();
+        let attempt = port.launch(&spec).unwrap();
         assert!(matches!(attempt, LaunchAttempt::Launched(_)));
         // Ambiguous recovery resolves for the activation subject too.
         let recovered = port
@@ -5921,17 +5631,10 @@ mod tests {
             .unwrap()
             .expect("activation recovers from its pre-known key");
         assert_eq!(recovered.startup_delivery, StartupDelivery::Ambiguous);
-        // Worker material is refused for this subject.
-        let worker_material =
-            EphemeralLaunchSecret::new("b".repeat(32), worker_subject("att-1", "cred-1")).unwrap();
-        assert_eq!(
-            port.launch(&spec, worker_material),
-            Err(RuntimeError::Rejected)
-        );
     }
 
-    /// R5.24: the fenced seam binds Assignment, Attempt, actor, token,
-    /// and lease — a valid token is not a global identity.
+    /// R5.24: the fenced seam binds the Attempt locator, token, and
+    /// lease while resolving Assignment and worker authority itself.
     #[test]
     fn fenced_calls_are_fully_bound() {
         let state = fake_state();
@@ -5954,19 +5657,7 @@ mod tests {
         )
         .unwrap();
 
-        // Right actor + right token, FOREIGN Assignment → refused.
-        let foreign_assignment = FencedAction {
-            call: FencedCall {
-                assignment: AssignmentId::new("asg-other").unwrap(),
-                ..good_call("op-e1")
-            },
-            responds_to: None,
-        };
-        assert_eq!(
-            port.fenced_evidence(&foreign_assignment, &evidence),
-            Err(StateError::IncoherentBundle)
-        );
-        // Foreign Attempt → refused.
+        // Unknown Attempt locator → loud refusal.
         let foreign_attempt = FencedAction {
             call: FencedCall {
                 attempt: AttemptId::new("att-other").unwrap(),
@@ -5976,7 +5667,7 @@ mod tests {
         };
         assert_eq!(
             port.fenced_evidence(&foreign_attempt, &evidence),
-            Err(StateError::IncoherentBundle)
+            Err(StateError::UnknownRecord)
         );
         // Stale token → distinct refusal.
         let stale = FencedAction {
@@ -5999,14 +5690,8 @@ mod tests {
             port.fenced_submit_handoff(&good_action("op-h9"), &other_handoff),
             Err(StateError::IncoherentBundle)
         );
-        // A Report drafted against another Attempt is refused.
-        let mut foreign_draft = report_draft("sig-foreign");
-        foreign_draft.subject = SubjectRef::Attempt(AttemptId::new("att-other").unwrap());
-        assert_eq!(
-            port.fenced_report(&good_action("op-r9"), &foreign_draft)
-                .err(),
-            Some(StateError::IncoherentBundle)
-        );
+        // ReportDraft has no caller-supplied sender, subject, or
+        // authority fields; those facts are resolved by Scribe.
         // Renewal is owned by its operation: exact replay is absorbed,
         // a different deadline under the same operation conflicts.
         assert_eq!(
@@ -6073,7 +5758,7 @@ mod tests {
         // Two Assignments; the SECOND is accepted, so its close must
         // name the second bead — no parser, no fallback.
         assert_eq!(port.open_assignment(&opening()), Ok(StateApplied::Applied));
-        let mut second = opening_for("asg-2", "att-2", "cred-2", "zz-open");
+        let mut second = opening_for("asg-2", "att-2", "zz-open");
         second.assignment.bead = BeadId::new("ABACUS-second").unwrap();
         assert_eq!(port.open_assignment(&second), Ok(StateApplied::Applied));
         let cancel_second = DecisionRecord {
@@ -6868,14 +6553,7 @@ mod tests {
         for altered in [
             FencedAction {
                 call: FencedCall {
-                    assignment: AssignmentId::new("asg-other").unwrap(),
-                    ..base.call.clone()
-                },
-                ..base.clone()
-            },
-            FencedAction {
-                call: FencedCall {
-                    actor: ActorId::new("intruder").unwrap(),
+                    attempt: AttemptId::new("att-other").unwrap(),
                     ..base.call.clone()
                 },
                 ..base.clone()

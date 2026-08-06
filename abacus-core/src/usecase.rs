@@ -14,15 +14,15 @@
 use crate::ports::{
     AdviceDisposition, ApplicationAttempt, ApplicationOutcome, ApplicationReceipt,
     AssignmentOpening, BeadSnapshot, CloseReason, DecisionKind, DecisionReason, DecisionRecord,
-    EffectReport, EphemeralLaunchSecret, EvidenceOutcome, FencedAction, FencedResponse,
+    DecisionWorkflowStatePort, EffectReport, EvidenceOutcome, FencedAction, FencedResponse,
     HandoffRecord, LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec, LaunchSubject,
     MutationOutcome, ObservedCloseReason, PendingApplication, ReceiptCandidate, ReportOutcome,
     RuntimeError, RuntimeHandle, RuntimePort, StateApplied, StateError, StopMode,
     SubmissionOutcome, WorkAdvicePort, WorkError, WorkGraphPort, WorkProjection, WorkRevision,
-    WorkStatus, WorkflowStatePort, appraise_advice,
+    WorkStatus, WorkerWorkflowStatePort, appraise_advice,
 };
 use crate::{
-    AssignmentId, AuthoritySnapshot, BeadId, Evidence, HandoffId, OperationId, SignalDraft,
+    AssignmentId, AuthoritySnapshot, BeadId, Evidence, HandoffId, OperationId, ReportDraft,
     SignalId,
 };
 
@@ -115,7 +115,7 @@ fn project_pending<S, W>(
     attempt_operation: &OperationId,
 ) -> Result<ProjectionOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
     // The recoverable crash window outranks everything else: a
@@ -273,7 +273,7 @@ pub fn accept_handoff<S, W>(
     attempt_operation: &OperationId,
 ) -> Result<AcceptanceOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
     let record = DecisionRecord {
@@ -327,7 +327,7 @@ pub fn reconcile_pending<S, W>(
     attempt_operations: &[OperationId],
 ) -> Result<ReconciliationPass, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
     let pending = state.pending_applications()?;
@@ -368,7 +368,7 @@ fn recover_receipt<S>(
     candidate: &ReceiptCandidate,
 ) -> Result<ProjectionOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
 {
     state.record_application_receipt(&ApplicationReceipt {
         target: pending.operation.clone(),
@@ -405,7 +405,7 @@ pub fn redrive_pending<S, W>(
     attempt_operation: &OperationId,
 ) -> Result<RedriveOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
     let pending = state
@@ -523,7 +523,7 @@ pub fn assign_ready<S, W>(
     attempt_operation: &OperationId,
 ) -> Result<AssignmentOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     W: WorkGraphPort + ?Sized,
 {
     let bead = &opening.assignment.bead;
@@ -646,7 +646,7 @@ pub fn end_attempt<S, R>(
     unbind_operation: &OperationId,
 ) -> Result<TeardownOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     R: RuntimePort + ?Sized,
 {
     let record = DecisionRecord {
@@ -700,7 +700,15 @@ pub enum LaunchRefusal {
     /// than a bypass: a gate a caller can skip by forgetting is not a
     /// gate.
     MissingWorkerOpening,
+    /// The reserved locator key was already present in caller-composed
+    /// environment. Launch composition is its only writer; accepting an
+    /// upstream value would recreate distributed identity resolution.
+    AttemptLocatorAlreadyPresent,
 }
+
+/// Reserved launch-configuration key carrying the non-secret Attempt locator.
+/// Only [`launch_subject`] writes it.
+pub const ATTEMPT_LOCATOR_ENV: &str = "ABACUS_ATTEMPT";
 
 /// Outcome of the launch sequence (architecture §3.3–3.5): Envelope
 /// persisted, launch attempted, handle associated. Every compensation
@@ -737,28 +745,32 @@ pub enum LaunchSequenceOutcome {
     NotLaunched { error: RuntimeError },
 }
 
-/// Launch a subject: persist the canonical Envelope FIRST, then launch
-/// with the transient credential secret, then durably associate the
-/// returned handle.
+/// Launch a subject: write the non-secret Attempt locator into reserved
+/// launch configuration, persist the canonical Envelope FIRST, then launch
+/// and durably associate the returned handle.
 ///
 /// The ordering is the contract (architecture §3.3): nothing may reach
 /// a live session that is not already durable, so a persist failure
-/// aborts before any provider interaction. Subject/secret identity
-/// agreement is the adapter's refusal to make (it must refuse before
-/// any provider mutation); this sequence does not duplicate that gate.
+/// aborts before any provider interaction. The caller cannot pre-populate the
+/// reserved locator key; this composition point is its one writer.
 pub fn launch_subject<S, R>(
     state: &S,
     runtime: &R,
     spec: &LaunchSpec,
-    secret: EphemeralLaunchSecret,
     worker_opening: Option<&OperationId>,
     persist_operation: &OperationId,
     bind_operation: &OperationId,
 ) -> Result<LaunchSequenceOutcome, StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: DecisionWorkflowStatePort + ?Sized,
     R: RuntimePort + ?Sized,
 {
+    if spec.environment.contains_key(ATTEMPT_LOCATOR_ENV) {
+        return Ok(LaunchSequenceOutcome::Refused {
+            reason: LaunchRefusal::AttemptLocatorAlreadyPresent,
+        });
+    }
+
     // A worker may not run against work the graph never confirmed as
     // started. Checked FIRST, before the Envelope is persisted and long
     // before any provider contact: an unconfirmed projection means a
@@ -786,9 +798,16 @@ where
         }
     }
 
+    let mut launch_spec = spec.clone();
+    if let LaunchSubject::WorkerAttempt { attempt } = &spec.subject {
+        launch_spec
+            .environment
+            .insert(ATTEMPT_LOCATOR_ENV.to_owned(), attempt.as_str().to_owned());
+    }
+
     state.persist_envelope(persist_operation, &spec.subject, &spec.envelope)?;
 
-    let attempt = match runtime.launch(spec, secret) {
+    let attempt = match runtime.launch(&launch_spec) {
         Ok(attempt) => attempt,
         Err(error) => return Ok(LaunchSequenceOutcome::NotLaunched { error }),
     };
@@ -824,10 +843,10 @@ where
 pub fn record_report<S>(
     state: &S,
     action: &FencedAction,
-    draft: &SignalDraft,
+    draft: &ReportDraft,
 ) -> Result<(ReportOutcome, FencedResponse), StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: WorkerWorkflowStatePort + ?Sized,
 {
     state.fenced_report(action, draft)
 }
@@ -839,7 +858,7 @@ pub fn record_evidence<S>(
     evidence: &Evidence,
 ) -> Result<(EvidenceOutcome, FencedResponse), StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: WorkerWorkflowStatePort + ?Sized,
 {
     state.fenced_evidence(action, evidence)
 }
@@ -853,7 +872,7 @@ pub fn submit_handoff<S>(
     handoff: &HandoffRecord,
 ) -> Result<(SubmissionOutcome, FencedResponse), StateError>
 where
-    S: WorkflowStatePort + ?Sized,
+    S: WorkerWorkflowStatePort + ?Sized,
 {
     state.fenced_submit_handoff(action, handoff)
 }
@@ -994,10 +1013,6 @@ mod tests {
                 },
             },
             bead_revision: rev('e'),
-            worker_credential: CredentialProvisioning {
-                id: CredentialId::new("cred-1").expect("valid credential"),
-                digest: rev('f').0,
-            },
         }
     }
 
@@ -1140,7 +1155,7 @@ mod tests {
     /// Scripts exactly one launch answer and records what was asked.
     struct ScriptedRuntime {
         answer: RefCell<Option<Result<LaunchAttempt, RuntimeError>>>,
-        launches: RefCell<Vec<(LaunchSubject, LaunchCorrelation)>>,
+        launches: RefCell<Vec<LaunchSpec>>,
         stop_answer: RefCell<Option<Result<EffectReport, RuntimeError>>>,
         events: EventLog,
     }
@@ -1167,15 +1182,9 @@ mod tests {
     }
 
     impl RuntimePort for ScriptedRuntime {
-        fn launch(
-            &self,
-            spec: &LaunchSpec,
-            _secret: EphemeralLaunchSecret,
-        ) -> Result<LaunchAttempt, RuntimeError> {
+        fn launch(&self, spec: &LaunchSpec) -> Result<LaunchAttempt, RuntimeError> {
             self.events.borrow_mut().push("launch");
-            self.launches
-                .borrow_mut()
-                .push((spec.subject.clone(), spec.correlation.clone()));
+            self.launches.borrow_mut().push(spec.clone());
             self.answer
                 .borrow_mut()
                 .take()
@@ -1268,7 +1277,6 @@ mod tests {
     fn worker_subject() -> LaunchSubject {
         LaunchSubject::WorkerAttempt {
             attempt: AttemptId::new("att-1").expect("valid attempt"),
-            credential: CredentialId::new("cred-1").expect("valid credential"),
         }
     }
 
@@ -1288,10 +1296,6 @@ mod tests {
         }
     }
 
-    fn launch_secret() -> EphemeralLaunchSecret {
-        EphemeralLaunchSecret::new("a".repeat(32), worker_subject()).expect("valid secret")
-    }
-
     fn launched_outcome() -> LaunchOutcome {
         LaunchOutcome {
             handle: RuntimeHandle::new("arh1|abacus-workers-r1|p2|g1"),
@@ -1306,9 +1310,7 @@ mod tests {
     fn worker_action(operation: &str) -> FencedAction {
         FencedAction {
             call: FencedCall {
-                assignment: AssignmentId::new("asg-1").expect("valid assignment"),
                 attempt: AttemptId::new("att-1").expect("valid attempt"),
-                actor: worker_actor().actor,
                 token: FencingToken(1),
                 operation: op(operation),
             },
@@ -1316,21 +1318,12 @@ mod tests {
         }
     }
 
-    fn report_draft() -> SignalDraft {
-        SignalDraft {
+    fn report_draft() -> ReportDraft {
+        ReportDraft {
             id: SignalId::new("sig-report-1").expect("valid signal id"),
-            sender: AuthoritySnapshot {
-                actor: worker_actor(),
-                capability: CapabilityId::new("state:report").expect("valid capability"),
-                scope: ScopeExpr::Universal,
-            },
-            subject: SubjectRef::Attempt(AttemptId::new("att-1").expect("valid attempt")),
-            body: SignalBody::Report {
-                attempt: AttemptId::new("att-1").expect("valid attempt"),
-                kind: ReportKind::Progress {
-                    phase: SemanticPhase::Verifying,
-                    summary: None,
-                },
+            kind: ReportKind::Progress {
+                phase: SemanticPhase::Verifying,
+                summary: None,
             },
         }
     }
@@ -1416,7 +1409,7 @@ mod tests {
         fail_persist: Cell<bool>,
         fail_bind: Cell<bool>,
         events: EventLog,
-        report_calls: RefCell<Vec<(FencedAction, SignalDraft)>>,
+        report_calls: RefCell<Vec<(FencedAction, ReportDraft)>>,
         report_answer: RefCell<Option<(ReportOutcome, FencedResponse)>>,
         evidence_calls: RefCell<Vec<(FencedAction, Evidence)>>,
         evidence_answer: RefCell<Option<(EvidenceOutcome, FencedResponse)>>,
@@ -1499,7 +1492,7 @@ mod tests {
         fn fenced_report(
             &self,
             action: &FencedAction,
-            draft: &SignalDraft,
+            draft: &ReportDraft,
         ) -> Result<(ReportOutcome, FencedResponse), StateError> {
             self.report_calls
                 .borrow_mut()
@@ -1615,13 +1608,6 @@ mod tests {
             unimplemented!()
         }
         fn signals_for(&self, _: &AttemptId) -> Result<Vec<Signal>, StateError> {
-            unimplemented!()
-        }
-        fn verify_launch_subject(
-            &self,
-            _: &LaunchSubject,
-            _: &ContentHash,
-        ) -> Result<(), StateError> {
             unimplemented!()
         }
         fn handoff(&self, _: &HandoffId) -> Result<HandoffRecord, StateError> {
@@ -2610,7 +2596,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
@@ -2652,7 +2637,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             None,
             &op("op-persist"),
             &op("op-bind"),
@@ -2681,7 +2665,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
@@ -2696,6 +2679,50 @@ mod tests {
             },
             "a confirmed projection is the permission to launch"
         );
+        let launches = runtime.launches.borrow();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(
+            launches[0]
+                .environment
+                .get(ATTEMPT_LOCATOR_ENV)
+                .map(String::as_str),
+            Some("att-1"),
+            "launch composition writes the durable Attempt locator into the exact worker launch"
+        );
+    }
+
+    #[test]
+    fn a_caller_cannot_prepopulate_the_attempt_locator() {
+        let state = RecordingState::default();
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+        let mut spec = launch_spec();
+        spec.environment
+            .insert(ATTEMPT_LOCATOR_ENV.to_owned(), "att-forged".to_owned());
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &spec,
+            Some(&op("op-assign")),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("the refusal is in-band");
+
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::Refused {
+                reason: LaunchRefusal::AttemptLocatorAlreadyPresent,
+            }
+        );
+        assert!(
+            state.events.borrow().is_empty(),
+            "the forged locator refuses before any state or provider effect"
+        );
+        assert!(runtime.launches.borrow().is_empty());
     }
 
     #[test]
@@ -2710,7 +2737,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
@@ -2757,7 +2783,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
@@ -2785,7 +2810,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
@@ -2814,7 +2838,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
@@ -2847,7 +2870,6 @@ mod tests {
             &state,
             &runtime,
             &launch_spec(),
-            launch_secret(),
             Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),

@@ -89,9 +89,9 @@ fn unsupported_row_representation_fails_open_loudly() {
         .expect("insert state sentinel");
     connection
         .execute(
-            "INSERT INTO credential_bindings(
-                 owner_key, credential_id, revoked, record_version, record_json
-             ) VALUES ('attempt:att-version', 'cred-version', 0, 999, '{}')",
+            "INSERT INTO envelopes(
+                 launch_subject_key, envelope_json, committed_seq, record_version, record_json
+             ) VALUES ('attempt:att-version', '{}', 1, 999, '{}')",
             [],
         )
         .expect("insert unsupported row");
