@@ -8,13 +8,13 @@
 
 use abacus_core::ports::{
     AdviceDisposition, AssignDecision, AssignmentOpening, AssignmentRecord, AttemptRecord,
-    CredentialProvisioning, StateApplied, WorkGraphPort, WorkStatus, WorkflowStatePort,
+    StateApplied, WorkGraphPort, WorkStatus, WorkflowStatePort,
 };
 use abacus_core::usecase::{AssignmentOutcome, ProjectionOutcome, assign_ready, select_ready};
 use abacus_core::{
     ActorId, AssignmentId, AttemptId, AuthorityClass, AuthoritySnapshot, BeadId, CapabilityId,
-    CommitId, ContentHash, CredentialId, DecisionActor, EditScope, FencingToken, Lease,
-    OperationId, ProfileName, ScopeExpr, Timestamp, WorkPath,
+    CommitId, ContentHash, DecisionActor, EditScope, FencingToken, Lease, OperationId, ProfileName,
+    ScopeExpr, Timestamp, WorkPath,
     assignment::AttemptPolicy,
     evidence::{AcceptancePolicy, Argv, PathSet, PolicyForm, VerificationSet},
 };
@@ -102,10 +102,6 @@ fn opening_from(
             },
         },
         bead_revision: revision.clone(),
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-journey-1").expect("valid credential id"),
-            digest: hash('f'),
-        },
     }
 }
 

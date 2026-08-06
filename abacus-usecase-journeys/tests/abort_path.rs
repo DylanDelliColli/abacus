@@ -15,14 +15,14 @@
 
 use abacus_core::ports::{
     AssignDecision, AssignmentOpening, AssignmentRecord, AttemptRecord, AuditClass, AuditInitiator,
-    AuditQuery, AuditSubject, CredentialProvisioning, FencedAction, FencedCall, ReportOutcome,
-    StateApplied, StateError, WorkflowStatePort,
+    AuditQuery, AuditSubject, FencedAction, FencedCall, ReportOutcome, StateApplied, StateError,
+    WorkflowStatePort,
 };
 use abacus_core::usecase::record_report;
 use abacus_core::{
     ActorId, AssignmentId, AttemptId, AuthorityClass, AuthoritySnapshot, BeadId, BoundedText,
-    CapabilityId, CommitId, ContentHash, CredentialId, DecisionActor, DirectiveGateRefusal,
-    DirectiveKind, EditScope, FencingToken, Lease, OperationId, ProfileName, ReportKind, ScopeExpr,
+    CapabilityId, CommitId, ContentHash, DecisionActor, DirectiveGateRefusal, DirectiveKind,
+    EditScope, FencingToken, Lease, OperationId, ProfileName, ReportDraft, ReportKind, ScopeExpr,
     ScopeMap, SemanticPhase, SignalBody, SignalDraft, SignalId, SubjectRef, Timestamp, WorkPath,
     assignment::AttemptPolicy,
     evidence::{AcceptancePolicy, Argv, PathSet, PolicyForm, VerificationSet},
@@ -109,10 +109,6 @@ fn opening() -> AssignmentOpening {
             authority: authority(lead(), "state:assign"),
         },
         bead_revision: abacus_core::ports::WorkRevision(hash('e')),
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-journey-3").expect("valid credential id"),
-            digest: hash('f'),
-        },
     }
 }
 
@@ -134,9 +130,7 @@ fn abort_directive() -> SignalDraft {
 
 fn worker_call(operation: &str) -> FencedCall {
     FencedCall {
-        assignment: assignment_id(),
         attempt: attempt_id(),
-        actor: worker().actor,
         token: FencingToken(1),
         operation: op(operation),
     }
@@ -149,17 +143,17 @@ fn worker_action(operation: &str) -> FencedAction {
     }
 }
 
-fn progress(id: &str) -> SignalDraft {
-    SignalDraft {
+/// A worker Report is now only an id and a kind. The worker states
+/// WHICH Attempt it is (on the FencedCall) and WHAT it is reporting;
+/// it no longer asserts its own sender, subject, or body. Scribe
+/// resolves those from durable Assignment state, so a worker cannot
+/// name an authority it does not hold (ADR-0003 §2).
+fn progress(id: &str) -> ReportDraft {
+    ReportDraft {
         id: SignalId::new(id).expect("valid signal id"),
-        sender: authority(worker(), "state:report"),
-        subject: SubjectRef::Attempt(attempt_id()),
-        body: SignalBody::Report {
-            attempt: attempt_id(),
-            kind: ReportKind::Progress {
-                phase: SemanticPhase::Verifying,
-                summary: None,
-            },
+        kind: ReportKind::Progress {
+            phase: SemanticPhase::Verifying,
+            summary: None,
         },
     }
 }

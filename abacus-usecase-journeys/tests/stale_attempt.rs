@@ -11,15 +11,14 @@
 
 use abacus_core::ports::{
     AssignDecision, AssignmentOpening, AssignmentRecord, AttemptOpening, AttemptRecord,
-    CredentialProvisioning, DecisionKind, DecisionReason, DecisionRecord, FencedAction, FencedCall,
-    RetryDecision, StateApplied, StateError, WorkflowStatePort,
+    DecisionKind, DecisionReason, DecisionRecord, FencedAction, FencedCall, RetryDecision,
+    StateApplied, StateError, WorkflowStatePort,
 };
 use abacus_core::usecase::record_report;
 use abacus_core::{
     ActorId, AssignmentId, AttemptId, AuthorityClass, AuthoritySnapshot, BeadId, CapabilityId,
-    CommitId, ContentHash, CredentialId, DecisionActor, EditScope, FencingToken, Lease,
-    OperationId, ProfileName, ReportKind, ScopeExpr, ScopeMap, SemanticPhase, SignalBody,
-    SignalDraft, SignalId, SubjectRef, Timestamp, WorkPath,
+    CommitId, ContentHash, DecisionActor, EditScope, FencingToken, Lease, OperationId, ProfileName,
+    ReportDraft, ReportKind, ScopeExpr, ScopeMap, SemanticPhase, SignalId, Timestamp, WorkPath,
     assignment::AttemptPolicy,
     evidence::{AcceptancePolicy, Argv, PathSet, PolicyForm, VerificationSet},
 };
@@ -109,10 +108,6 @@ fn opening() -> AssignmentOpening {
             authority: authority(lead(), "state:assign"),
         },
         bead_revision: abacus_core::ports::WorkRevision(hash('e')),
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-journey-2a").expect("valid credential id"),
-            digest: hash('f'),
-        },
     }
 }
 
@@ -151,10 +146,6 @@ fn retry() -> AttemptOpening {
                 expires_at: Timestamp(2_000),
             },
         },
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-journey-2b").expect("valid credential id"),
-            digest: hash('9'),
-        },
     }
 }
 
@@ -162,9 +153,7 @@ fn retry() -> AttemptOpening {
 fn report_from(attempt: AttemptId, token: FencingToken, operation: &str) -> FencedAction {
     FencedAction {
         call: FencedCall {
-            assignment: assignment_id(),
             attempt,
-            actor: worker().actor,
             token,
             operation: op(operation),
         },
@@ -172,17 +161,17 @@ fn report_from(attempt: AttemptId, token: FencingToken, operation: &str) -> Fenc
     }
 }
 
-fn progress(id: &str, attempt: AttemptId) -> SignalDraft {
-    SignalDraft {
+/// A worker Report is now only an id and a kind: the Attempt comes from
+/// the FencedCall, and Scribe resolves sender and subject from durable
+/// Assignment state. This journey depends on that directly - the
+/// predecessor below cannot dress its write up as the successor's,
+/// because it no longer supplies any identity at all.
+fn progress(id: &str) -> ReportDraft {
+    ReportDraft {
         id: SignalId::new(id).expect("valid signal id"),
-        sender: authority(worker(), "state:report"),
-        subject: SubjectRef::Attempt(attempt.clone()),
-        body: SignalBody::Report {
-            attempt,
-            kind: ReportKind::Progress {
-                phase: SemanticPhase::Verifying,
-                summary: None,
-            },
+        kind: ReportKind::Progress {
+            phase: SemanticPhase::Verifying,
+            summary: None,
         },
     }
 }
@@ -200,7 +189,7 @@ fn a_superseded_worker_cannot_keep_writing() {
     let (_, first_response) = record_report(
         &state,
         &report_from(first_attempt(), FencingToken(1), "op-journey-2-report-1"),
-        &progress("sig-journey-2-1", first_attempt()),
+        &progress("sig-journey-2-1"),
     )
     .expect("the live worker may report");
     assert_eq!(first_response.applied, StateApplied::Applied);
@@ -229,27 +218,31 @@ fn a_superseded_worker_cannot_keep_writing() {
     let stale = record_report(
         &state,
         &report_from(first_attempt(), FencingToken(1), "op-journey-2-report-2"),
-        &progress("sig-journey-2-2", first_attempt()),
+        &progress("sig-journey-2-2"),
     );
     // The journey's claim: the write is REFUSED, loudly, never silently
-    // accepted and never silently dropped. That claim holds today.
+    // accepted and never silently dropped - and the refusal's CLASS
+    // carries WHY, because "stop, your successor owns this" and "your
+    // request construction is buggy" demand opposite worker responses.
     //
-    // The refusal's CLASS does not: production currently answers
-    // `IncoherentBundle`, whose contract means "the bundle's identities
-    // disagree", when the honest answer is "your Attempt was
-    // superseded". A worker cannot distinguish "stop, my successor owns
-    // this" from "my request construction is buggy", and those demand
-    // opposite responses. Filed as ABACUS-gf6; this assertion tightens
-    // to the exact variant when that lands.
+    // This assertion first landed pinning `IncoherentBundle` as an
+    // honest record of ABACUS-gf6: production answered "the bundle's
+    // identities disagree" when the true answer was "your Attempt was
+    // superseded". gf6 has since landed. A terminal Assignment or an
+    // ended Attempt is now refused with `StaleFencing`, decided BEFORE
+    // lease expiry is consulted, so a superseded worker is told the
+    // truth whether or not its lease still has time on it. The
+    // assertion is tightened to the intended variant and is no longer
+    // a defect record.
     assert!(
         stale.is_err(),
         "a superseded Attempt's writes must be refused, got {stale:?}"
     );
     assert_eq!(
         stale,
-        Err(StateError::IncoherentBundle),
-        "pinning today's ACTUAL refusal so ABACUS-gf6 cannot regress \
-         silently - this is the defect, recorded, not the intent"
+        Err(StateError::StaleFencing),
+        "a superseded Attempt must be told its fencing is stale, not \
+         that its bundle is incoherent"
     );
 
     // The successor is unaffected and writes normally: supersession
@@ -261,7 +254,7 @@ fn a_superseded_worker_cannot_keep_writing() {
             FencingToken(2),
             "op-journey-2-report-3",
         ),
-        &progress("sig-journey-2-3", successor_attempt()),
+        &progress("sig-journey-2-3"),
     )
     .expect("the successor worker may report");
     assert_eq!(successor_response.applied, StateApplied::Applied);

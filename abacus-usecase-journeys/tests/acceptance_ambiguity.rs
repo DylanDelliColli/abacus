@@ -14,9 +14,9 @@
 
 use abacus_core::ports::{
     AssignDecision, AssignmentOpening, AssignmentRecord, AttemptRecord, AuditApplicationOutcome,
-    AuditKind, AuditQuery, CredentialProvisioning, DecisionReason, EvidenceOutcome, FencedAction,
-    FencedCall, HandoffRecord, OperationSet, StateApplied, SubmissionOutcome, WorkGraphPort,
-    WorkStatus, WorkflowStatePort,
+    AuditKind, AuditQuery, DecisionReason, EvidenceOutcome, FencedAction, FencedCall,
+    HandoffRecord, OperationSet, StateApplied, SubmissionOutcome, WorkGraphPort, WorkStatus,
+    WorkflowStatePort,
 };
 use abacus_core::usecase::{
     AcceptanceDecision, ProjectionOutcome, ProjectionUnresolved, RedriveOutcome, accept_handoff,
@@ -24,9 +24,8 @@ use abacus_core::usecase::{
 };
 use abacus_core::{
     ActorId, AssignmentId, AttemptId, AuthorityClass, AuthoritySnapshot, BeadId, CapabilityId,
-    CommitId, ContentHash, CredentialId, DecisionActor, EditScope, Evidence, FencingToken,
-    HandoffId, Lease, OperationId, ProfileName, ScopeExpr, ScopeMap, Timestamp, WorkPath,
-    WorkspaceDigest,
+    CommitId, ContentHash, DecisionActor, EditScope, Evidence, FencingToken, HandoffId, Lease,
+    OperationId, ProfileName, ScopeExpr, ScopeMap, Timestamp, WorkPath, WorkspaceDigest,
     assignment::AttemptPolicy,
     evidence::{
         AcceptancePolicy, Argv, FileDigestSet, PathSet, PolicyForm, VerificationOutcome,
@@ -120,19 +119,13 @@ fn opening() -> AssignmentOpening {
             authority: authority("state:assign"),
         },
         bead_revision: abacus_core::ports::WorkRevision(hash('e')),
-        worker_credential: CredentialProvisioning {
-            id: CredentialId::new("cred-journey-4").expect("valid credential id"),
-            digest: hash('f'),
-        },
     }
 }
 
 fn worker_action(operation: &str) -> FencedAction {
     FencedAction {
         call: FencedCall {
-            assignment: assignment_id(),
             attempt: attempt_id(),
-            actor: worker().actor,
             token: FencingToken(1),
             operation: op(operation),
         },
