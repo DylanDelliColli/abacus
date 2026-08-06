@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 6 — cross-review PASS on all structural findings; operator ratified the Directive scope narrowing on 2026-08-06 and it is folded through the table, validation, backlog, and normative set. Awaiting final narrow re-review, then sign-off.
+- **Status:** Proposed, revision 7 — cross-review PASS on all structural findings; the Directive narrowing is ratified and re-confirmed by the operator against a corrected worst case, on the stated principle of starting simple and building a contingency only against observed evidence. Awaiting final narrow re-review, then sign-off.
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
@@ -338,7 +338,7 @@ this shape:
 | Required proof | How it holds |
 |---|---|
 | Crash after **Report or Request** commit, before ring, recovers on restart | No ring state exists to lose; the next run recomputes from the Ledger |
-| Crash after **Directive** commit, before ring — **narrowed by operator ratification, 2026-08-06** | **Not by this module, by design.** With no standing Directive obligation the next run derives nothing. Recovery rides `FencedResponse.binding_directives`, which every fenced call *including lease renewal* returns, so an alive worker recovers within one renewal interval by itself. A bounded self-service recovery, explicitly **not** a next-tick guarantee. The operator ratified this narrowing with its cost stated; see the resolved scope decision below |
+| Crash after **Directive** commit, before ring — **narrowed by operator ratification, 2026-08-06, confirmed against the corrected cost** | **Not by this module, by design.** With no standing Directive obligation the next run derives nothing. A worker that keeps renewing successfully recovers at its next renewal via `FencedResponse.binding_directives`, bounded by its renewal cadence. A worker that is alive but **not** renewing — hung, starved, stalled — recovers not at all: it crosses expiry into a reclaimable-lease obligation that, being operator-class, is report-only and rings nobody, and the Directive is never self-delivered. Explicitly not a next-tick guarantee and, in the second case, not a bounded one |
 | Duplicate and ambiguous deliveries are harmless, and a later tick reconciles afresh | The derivation is idempotent and the nudge is content-free. A duplicate nudge is **not** literally a no-op — it can prompt an agent to act again, and that action can produce a distinct Report. The honest claim is narrower: the nudge carries no authority, and any action it provokes still passes the ordinary fencing and idempotency gates that guard every worker write |
 | Stale generations never target the wrong Attempt | The runtime seam is generation-fenced and already returns `HandleStale` |
 | Herdr or service outage catches up | The next run recomputes; nothing was queued to be lost |
@@ -412,23 +412,46 @@ every `FencedResponse` carries `binding_directives`. **A worker that stays
 alive must renew its lease, and every renewal hands it the current binding
 Directives.** So an idle-but-alive worker learns of a lost Directive at its
 next renewal — bounded by the renewal interval, not by lease expiry — and it
-learns directly, not via the operator. A worker that stops renewing has genuinely
-stopped, and its expiry becomes a reclaimable-lease obligation, which is the
-correct target.
+learns directly, not via the operator.
 
-The residual exposure is therefore narrower than "up to one lease period of
-idle worker time": it is one renewal interval, for a worker that is alive but
-between renewals, in the window where a ring was lost or a crash landed between
-commit and ring. It is not zero, and it is not the same as a next-tick
-guarantee.
+**That bound holds only for a worker that keeps renewing successfully, and
+revision 6 wrongly stated it as though it covered every live worker.** Renewal
+delivers binding Directives only if the worker actually invokes renewal. A
+worker that is alive but hung, starved, or stalled invokes nothing, sees
+nothing, and crosses expiry without ever learning of the Directive. Revision 6
+also asserted that "a worker that stops renewing has genuinely stopped," which
+contradicts both this ADR's own §5 — a live worker may hold an expired lease —
+and CONTEXT's statement that a worker may be alive and simply stopped. Expiry
+establishes reclaimability, never death; that error has now been made three
+times in this document and is called out here so the fourth reader does not
+repeat it.
+
+The honest exposure has two cases, not one:
+
+- **A continuously renewing worker** recovers at its next *successful* renewal,
+  bounded by its renewal cadence, and recovers by itself.
+- **A live non-renewing worker** does not recover at all. It crosses strict
+  expiry, becomes a reclaimable-lease obligation, and — because §5 makes
+  operator-class obligations **report-only** — that obligation rings nobody. It
+  waits in a run report until the operator reads it and takes a fenced
+  decision. Nothing bounds that interval, and the Directive is never
+  self-delivered.
+
+The second case is strictly worse than revision 6 described, and it is worse
+than it would have been before §5 removed operator ringing — an interaction
+between two separately reasonable choices that no single section made visible.
 
 The options were:
 
-1. **Ratify the narrower scope — CHOSEN.** Directives get the commit-time
-   doorbell plus the renewal-carried binding set, and the crash-window proof is
-   explicitly narrowed to Reports and Requests. Ships nothing new, and accepts
-   that a lost Directive ring costs at most one lease-renewal interval of an
-   alive worker's time — recovered by the worker itself, not by the operator.
+1. **Ratify the narrower scope — CHOSEN, and re-confirmed against the corrected
+   cost.** Directives get the commit-time doorbell plus the renewal-carried
+   binding set, and the crash-window proof is explicitly narrowed to Reports
+   and Requests. Ships nothing new. The cost was first presented as "at most
+   one lease-renewal interval of an alive worker's time," which was wrong — it
+   holds only for a worker that keeps renewing. The operator was told the
+   corrected worst case, including that a live non-renewing worker never
+   self-recovers and ends in an unbounded report-only obligation, and confirmed
+   the choice against it.
 2. **Add a binding-Directive attention read.** A fourth read-only query
    surfacing Active Attempts with undischarged binding Directives, holding the
    proof for all three Signal types. Not free: "binding" includes Pause, and a
@@ -436,16 +459,32 @@ The options were:
    needs a defensible rule for which binding Directives constitute an unmet
    obligation versus a steady state. That rule, not the query, was the cost.
 
-**What the operator accepted, stated so no later reader mistakes it for an
-oversight:** there is no next-tick guarantee for Directives. If a ring is lost
-or a crash lands between commit and ring, an alive worker recovers at its next
-lease renewal and no sooner. The reason this was judged sufficient is that the
-recovery is self-service and bounded — it reaches the worker directly rather
-than paging a human — and the failure it does not cover, a worker that has
-stopped renewing entirely, is already an obligation class aimed at the right
-target. Option 2 was declined because its cost was a policy rule about which
-standing instructions count as unmet, and rules of exactly that shape are what
-accreted into the predecessor system's ceremony.
+**What the narrowing actually costs, stated so no later reader mistakes it for
+an oversight:** there is no next-tick guarantee for Directives, and for one
+class of worker there is no guarantee at all. A worker that keeps renewing
+recovers by itself at its next renewal. A worker that is alive but not renewing
+never sees the Directive, and its expiry produces a report-only operator
+obligation that rings nobody — recovery then waits on a human reading a run
+report and issuing a fenced decision.
+
+Option 2 was declined because its cost was a policy rule about which standing
+instructions count as unmet versus a legitimate steady state, and rules of
+exactly that shape are what accreted into the predecessor system's ceremony.
+
+**The operator's stated reason for accepting it is the governing one, and it
+outranks the specific arithmetic above** (operator, 2026-08-06): *start simple
+and build a contingency if needed; avoid architecting solutions to problems we
+have not actually faced.* The hung-worker case is real but hypothetical — it
+has not been observed, and the worker it describes is already failing at its
+actual job rather than merely at reading messages. Building the rule now would
+mean paying a permanent complexity cost against a projection.
+
+This is deliberately a **contingency, not a gap left open by accident.** Option
+2 remains fully available: §5 forecloses nothing about it, the query would be
+additive and read-only like the other three, and this section is its
+specification. The evidence that would trigger it is concrete rather than
+atmospheric — a live, non-renewing worker observed missing a Directive in
+practice, even once. Absent that observation, the rule is not written.
 
 If operating experience shows the renewal interval is too coarse in practice,
 option 2 remains available and this section is its starting point. Reopening it
