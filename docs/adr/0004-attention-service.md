@@ -336,7 +336,7 @@ this shape:
 | Required proof | How it holds |
 |---|---|
 | Crash after **Report or Request** commit, before ring, recovers on restart | No ring state exists to lose; the next run recomputes from the Ledger |
-| Crash after **Directive** commit, before ring — **OPEN, operator decision required** | **This proof does not hold under §5.** With no standing Directive obligation, the next run derives nothing. Recovery comes on the worker's next fenced call, or — if it makes none — only when its lease expires, which is slower and surfaces to the *operator* rather than to the worker. `ABACUS-IKQ` names the crash-window proof and a reliable doorbell as non-negotiable v1 scope, so narrowing it is a scope change requiring explicit ratification, not an authorial judgment call. See §5 and the open question below |
+| Crash after **Directive** commit, before ring — **OPEN, operator decision required** | **Not by this module.** With no standing Directive obligation the next run derives nothing. Recovery instead rides `FencedResponse.binding_directives`, which every fenced call *including lease renewal* returns — so an alive worker recovers within one renewal interval, by itself. That is a real bound, not a next-tick guarantee. `ABACUS-IKQ` names the crash-window proof non-negotiable, so narrowing it is a scope change requiring ratification, not an authorial call. See the open question below |
 | Duplicate and ambiguous deliveries are harmless, and a later tick reconciles afresh | The derivation is idempotent and the nudge is content-free. A duplicate nudge is **not** literally a no-op — it can prompt an agent to act again, and that action can produce a distinct Report. The honest claim is narrower: the nudge carries no authority, and any action it provokes still passes the ordinary fencing and idempotency gates that guard every worker write |
 | Stale generations never target the wrong Attempt | The runtime seam is generation-fenced and already returns `HandleStale` |
 | Herdr or service outage catches up | The next run recomputes; nothing was queued to be lost |
@@ -385,19 +385,35 @@ Costs, stated honestly:
 ## Open question for the operator (blocks acceptance)
 
 §5 removes the Directive obligation class on the grounds that existing
-mechanisms cover it. Cross-review accepts that the lease-expiry path is an
-honest liveness bound but rejects it as a silent substitute for the
-crash-window proof `ABACUS-IKQ` calls non-negotiable, and that objection is
-correct. The two are not equivalent: a lost Directive ring is recovered on the
-worker's next fenced call — which never comes if the worker is idle — and
-otherwise only at lease expiry, targeting the operator instead of the worker.
+mechanisms cover it. Cross-review accepted the lease path as an honest
+liveness bound but rejected it as a silent substitute for the crash-window
+proof `ABACUS-IKQ` calls non-negotiable, and that objection stands.
+
+One correction to how both this ADR and that review characterized the fallback,
+because it changes the size of the gap rather than the principle. Both said
+recovery waits on "the worker's next fenced call — which never comes if the
+worker is idle." That is wrong. `renew_lease` returns a `FencedResponse`, and
+every `FencedResponse` carries `binding_directives`. **A worker that stays
+alive must renew its lease, and every renewal hands it the current binding
+Directives.** So an idle-but-alive worker learns of a lost Directive at its
+next renewal — bounded by the renewal interval, not by lease expiry — and it
+learns directly, not via the operator. A worker that stops renewing has genuinely
+stopped, and its expiry becomes a reclaimable-lease obligation, which is the
+correct target.
+
+The residual exposure is therefore narrower than "up to one lease period of
+idle worker time": it is one renewal interval, for a worker that is alive but
+between renewals, in the window where a ring was lost or a crash landed between
+commit and ring. It is not zero, and it is not the same as a next-tick
+guarantee.
 
 The operator chooses one:
 
-1. **Ratify the narrower scope.** Directives get the commit-time doorbell and
-   lease expiry, and the crash-window proof is explicitly narrowed to Reports
-   and Requests. Cheapest, ships nothing new, and accepts that a lost Directive
-   ring costs up to one lease period of idle worker time.
+1. **Ratify the narrower scope.** Directives get the commit-time doorbell plus
+   the renewal-carried binding set, and the crash-window proof is explicitly
+   narrowed to Reports and Requests. Cheapest, ships nothing new, and accepts
+   that a lost Directive ring costs at most one lease-renewal interval of an
+   alive worker's time — recovered by the worker itself, not by the operator.
 2. **Add a binding-Directive attention read.** A fourth read-only query
    surfaces Active Attempts carrying undischarged binding Directives, and the
    proof holds for all three Signal types. This is not free: "binding" includes
