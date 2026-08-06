@@ -1,101 +1,271 @@
-# ADR-0003: Scribe agent transport on Linux
+# ADR-0003: Scribe agent transport and caller authority on Linux
 
-- **Status:** Proposed, revision 5 — substantive composer/schema/AttemptOpening/runtime-sideband changes post-date the revision-4 C2 pass; the adversarial seam review is closed and landed, while the faithful runtime-carriage prototype and operator sign-off remain blocking.
-- **Date:** 2026-08-04
-- **Companions:** `docs/compatibility/2026-08-04-scribe-socket.md` (all probe evidence, normative for provider facts), ADR-0001 §3 (Scribe seam), ADR-0002 §5 (reachability-vs-authority doctrine), `abacus-state/README.md`, bead `ABACUS-HPG.7`
+- **Status:** **Accepted** (2026-08-06), revision 6 — Claude C2 cross-review PASS; operator sign-off as named decider.
+- **Date:** 2026-08-04; revised 2026-08-06
+- **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
+- **Companions:** `docs/compatibility/2026-08-04-scribe-socket.md` (provider evidence), ADR-0001 §3 (Scribe seam), ADR-0002 §5 (reachability is not authority), `abacus-state/README.md`, beads `ABACUS-HPG.7` and `ABACUS-719`
 
-## Problem
+## Context
 
-Scribe listens on a user-only Unix socket at `$XDG_RUNTIME_DIR/abacus/<repo-id>.sock`, and agents reach durable state only through it (ADR-0001 §3). The compatibility evidence establishes an asymmetric provider gap on Linux:
+Scribe listens on a user-only Unix socket at
+`$XDG_RUNTIME_DIR/abacus/<repo-id>.sock`, and agents reach durable state only
+through it. Compatibility evidence establishes an asymmetric Linux transport
+fact:
 
-- The operative **Claude** session reaches the socket directly with no grant — all probe rows pass, including host-listener/sandboxed-client payload.
-- **Codex v0.146.0 cannot reach it at all**: its Linux seccomp sandbox blocks `AF_UNIX`/`socketpair` creation outright, the documented `unix_sockets` allowlist is macOS-only, and the follow-up probe shows the agent/exec layer closes or fails to forward inherited descriptors before model-issued commands run (raw `codex sandbox` preserves `pass_fds`; the agent layer does not).
+- the operative Claude carriage can open the socket directly;
+- Codex 0.146.x under the ordinary Linux sandbox cannot create the required
+  `AF_UNIX` connection, even when the socket path itself is readable.
 
-Until resolved, a sandboxed Linux Codex session cannot hold any ABACUS role. The transport gate (`ABACUS-HPG.5`) blocks `abacus-state`'s client/server implementation (`ABACUS-9NH.9`), and no fallback may be guessed into the design (compatibility record, "Transport-gate decision").
+The inherited-descriptor alternative crosses the raw Codex sandbox but does
+not survive into model-issued commands. The command-scoped host relay does:
+fresh direct and Herdr-launched Codex sessions successfully invoked an exact
+operator-approved executable/subcommand, supplied one dynamic request on
+stdin, received one typed response, and failed closed when that rule was
+absent. The checked compatibility record contains the controls, discarded
+rows, versions, artifact hashes, and cleanup evidence.
 
-## Constraints (binding, from prior decisions)
+Transport is only half of the seam. Revision 5 made every worker an
+authenticated bearer-credential holder. Adversarial review found that this
+solved the wrong problem at high cost: launch secrets had to survive model
+context compaction, stay unavailable to same-uid project children, rotate and
+revoke, and cross both launch carriages without entering argv, environment,
+the worktree, or transcripts. The resulting credential vocabulary had spread
+through core, state, runtime, storage, protocol, and tests before any worker
+call actually authenticated in the production journey.
 
-1. **No compensation machinery**: no watcher, polling, retry loop, or second ABACUS-owned resident process (I12). A "reconnecting wrapper" that becomes a resident bridge is the named failure shape.
-2. **Fail loud**: transactional calls with distinct refusals; workers halt when Scribe is unreachable (CONTEXT §6). Workspace request-files violate this and are rejected already.
-3. **Reachability is never authority** (ADR-0002 §5): whatever carries bytes, Scribe authenticates and authorizes every versioned request against the actor's grants; lease fencing bounds stolen-channel damage.
-4. **No sandbox weakening**: no broad grants, no `danger` modes, no loopback TCP (denied anyway, and weakens peer identity).
-5. **Repository content can never self-authorize host execution** (HPG.4 pattern): any host approval is environment/operator policy for an exact, operator-owned executable surface.
+The observed legacy failure class was different. Distributed machinery chose
+or inherited caller identity from environment and role state; one path ignored
+the worker marker and silently acted as a manager. Caller-asserted identity
+therefore preserves the contamination failure even when cryptographically
+authenticated: a bad launcher can faithfully authenticate the wrong asserted
+principal. Scribe already owns the durable relation
+`Attempt -> Assignment -> bound worker`. A worker call needs to identify the
+Attempt it concerns; it must never choose the authority under which Scribe
+records or authorizes that call.
 
-## Options and evidence status
+## Binding constraints
 
-| # | Option | Evidence status |
-|---|---|---|
-| 1 | Inherited pre-connected FD from the host-side spawner | **Blocked on current Codex.** Viable through the raw sandbox layer (marker relayed intact via FD 9 under the exact profile) but the agent/exec layer closes/does not forward descriptors to model-issued commands (`bad file descriptor`). Requires an upstream named-descriptor-preservation feature; security/recovery hazards below would still apply. Evidence preserved for the upstream ask. |
-| 2 | **Command-scoped host-approved Scribe client subcommand** (primary candidate) | Pattern proven for the Herdr facade (HPG.4, cross-reviewed PASS): exact operator-owned executable + subcommand surface, host-side execution outside seccomp, fail-closed absent approval. The Scribe surface answers the recorded broad-CLI objection by excluding anything that executes project-supplied commands. **Both feasibility legs PASSED** (direct and Herdr-spawn r2). |
-| 3 | Upstream Codex enhancement | Track regardless of decision: (a) Linux `unix_sockets` allowlist parity with macOS; (b) named-descriptor preservation through agent command execution. Either restores a cleaner direct transport later; neither is waitable-on for v1. |
-| 4 | v1 scope reduction (Claude-only agents until upstream moves) | Honest fallback; loses the two-lineage adversarial property this build has demonstrated daily. Only if 2 fails its probe. |
-
-## Required analysis (hazard checklist for the decision section)
-
-The accepted design must answer each explicitly:
-
-1. Full-chain validation on the real agent path, not a sandbox-layer proxy (the avenue-1 lesson).
-2. Herdr spawn preservation: whatever the transport, worker sessions launched via the runtime facade must inherit/reach it identically.
-3. Exposure to child/project commands: verification commands run project-supplied code; the transport must not leak into them (CLOEXEC-by-default posture for any descriptor; approval surfaces excluded from project command paths).
-4. Concurrent framing and reply theft on a shared channel.
-5. Scribe crash/restart recovery without a resident reconnecting bridge (I12) — per-call connections (option 2) trivially satisfy this; long-lived channels must state their story.
-6. Bearer-channel identity: possession confers transport, never identity; Scribe authenticates every versioned request (constraint 3).
-7. Descriptor/process lifecycle discipline: envelope-declared coordinates, no low-FD collisions, no surviving into unrelated children.
-8. Asymmetry accounting: Claude keeps the direct socket path; the design must state both transports as one versioned protocol with two carriages, not two protocols.
+1. **No compensation machinery.** No watcher, polling bridge, reconnecting
+   wrapper, retry daemon, request-file queue, or second ABACUS-owned resident
+   process is added (CONTEXT I12).
+2. **One protocol, two injected carriages.** Direct UDS and host relay carry
+   the same versioned request/response model. Carriage selection is injected
+   configuration, never try-direct-then-fallback probing (I13).
+3. **No request data in argv.** The relay is an exact two-token invocation of
+   an operator-owned executable and fixed subcommand; it rejects every extra
+   argument or flag.
+4. **One request per process and connection.** Batching and shared reply
+   channels are forbidden in v1. A future batching design is C2.
+5. **No sandbox weakening.** No danger mode, broad filesystem/network grant,
+   loopback transport, or repository-controlled executable surface is an
+   alternative.
+6. **Reachability is not authority.** Access to the socket or relay grants no
+   decision authority. The worker and decision interfaces are separate at the
+   core type seam and at the versioned protocol seam.
+7. **No silent retry or fallback.** Denial, unavailability, malformed frames,
+   unresolved callers, stale fencing, and ambiguous outcomes remain distinct
+   typed results. A client disconnect never proves whether a transaction
+   committed; explicit replay uses the same operation identity.
 
 ## Decision
 
-**One versioned Scribe protocol, two carriages, selected by injected configuration — never by try-direct-then-fallback probing.** Direct UDS for sandboxes that can open it (the operative Claude session today); a **per-call, command-scoped, host-approved relay verb of the facade binary itself** (`/operator/path/abacus scribe-rpc`) for sandboxes that cannot (Codex on Linux) — dispatched as a fixed function before any argument parsing, configuration load, or project discovery, so CONTEXT's Facade-exclusivity invariant stays intact and the approved surface stays exactly two tokens. Both feasibility legs passed on the real agent path (direct and Herdr-spawn r2; evidence in the compatibility record).
+The operator approved this revision with the explicit implementation-contact
+expectation: "I'll approve the current version - I think it's going to be hard
+to critique this any further without actually testing an implementation in
+practice." Acceptance therefore authorizes implementation; it does not make
+the text immune from evidence. An implementation finding that cannot satisfy
+this decision honestly amends the ADR instead of acquiring a workaround.
 
-### Carriage rules
+### 1. One versioned protocol over direct and relay carriages
 
-1. **No request data in argv, ever, and the client rejects every unsupported argument or flag.** Codex `prefix_rule` matching is prefix-only and admits trailing argv, so the facade binary's fixed-dispatch `scribe-rpc` verb is itself the enforcement point: it accepts exactly its literal subcommand, refuses anything further (usage/64, probe-verified), and exposes no project command or path surface.
-2. **Strictly one request per process, one process per connection — batching is forbidden in v1.** This is a security invariant, not a latency preference: a multi-request process or shared channel reopens the reply-theft, concurrency, and crash-recovery hazards this shape closes. Any future batching is a C2 change requiring framing, correlation, concurrency/backpressure, and restart analysis. Worker fan-in is independent bounded connections into the single Scribe writer.
-3. **Invocation shape — `scribe-rpc` is a fixed-function typed state-facade COMPOSER, not a byte relay.** The early-dispatch verb reads one bounded high-level **facade command envelope** (public schema); for credential-creating calls (`AssignmentOpening`, `AttemptOpening`, and credential-rotating `ActivationOpening`) it CSPRNG-generates the secret — or accepts an explicitly replayed transient provisioning for reissue — derives id+digest, composes the **internal versioned Scribe request** (a distinct schema from the public envelope for credential-creating calls), performs the private 4-byte framing, and returns one bounded **typed facade response**; on confirmed `Applied`/`AlreadyApplied` that response carries the transient launch secret. **No silent internal retry exists** (CONTEXT's no-silent-retry rule): a lost/ambiguous exchange returns typed `Ambiguous` *plus the same transient provisioning*, and the decision actor explicitly reissues with it. The exact six-step trace per carriage:
+Claude uses the direct UDS carriage where the configured sandbox permits it.
+Linux Codex uses the per-call host relay
+`/operator/path/abacus scribe-rpc`. The relay is fixed-dispatched before
+ordinary argument parsing, repository discovery, or project configuration. It
+reads one bounded newline-terminated typed request from stdin, privately
+applies Scribe's framing, writes one bounded typed response, and exits under a
+fixed deadline. It is a typed Scribe client, not a byte relay and not a
+general facade for host execution.
 
-   **Direct (capable sandbox):** (1) actor invokes the typed facade command; (2) the facade process composes the opening — CSPRNG secret, id+digest; (3) it opens the UDS directly and sends the internal framed Scribe request; (4) Scribe authenticates the credential/authorizes and commits atomically; (5) the facade returns the typed response — transient launch secret on success, typed `Ambiguous` with the same provisioning for explicit reissue; (6) the actor hands the secret to immediate spawn via the runtime sideband (`EphemeralLaunchSecret` beside `LaunchSpec`, never inside it).
+The exact relay command has two tokens and accepts no trailing material.
+Codex prefix rules match prefixes, so the executable itself enforces that
+closed argv shape. Request fields, repository identity, Attempt locator,
+fencing token, operation identity, payload, socket path, executable path, and
+environment overrides never appear in argv. The relay resolves the repository
+socket only from a bounded repo ID plus its operator-injected runtime base;
+arbitrary socket paths are unrepresentable.
 
-   **Relay (Codex on Linux):** (1) the agent's exec tool requests exactly the two-token approved command `/operator/path/abacus scribe-rpc` (fixed dispatch before any argument parsing, configuration load, or project discovery) and holds the live exec session; (2) the agent issues ONE `write_stdin` with one bounded newline-terminated facade command envelope line — carrying the explicitly replayed provisioning when reissuing; (3) the host-side composer performs direct-carriage steps 2–3; (4) Scribe behaves identically; (5) the composer emits one bounded typed stdout line — success with transient secret, or typed `Ambiguous` plus the same provisioning — and exits under its fixed deadline; (6) identical spawn handoff via the runtime sideband. Shell caveat as before: Codex represents exec through `zsh -lc`; the guarantee is a plain two-token command execpolicy safely parses, with no pipe, redirection, or assignment.
+Host approval is environment policy, not repository policy. The loaded-rule
+probe proves propagation, while the absent-rule probe proves fail-closed
+behavior before any ABACUS process, socket connection, or retry exists. A
+host-rule denial is therefore an agent-boundary failure, not a `StateError`.
 
-3a. **Startup-material delivery: `abacus-runtime` speaks the pinned Herdr socket schema (P1 decision).** Source verification of pinned Herdr v0.8.0 shows `AgentStartParams` carries only name/kind/pane_id/args/timeout_ms, and the only high-level delivery verb is `agent prompt`, which requires its text in argv — so the non-argv/non-env sideband is **impossible through the high-level CLI adapter**. ABACUS therefore adopts an explicit exception to the "high-level CLI first, direct socket deferred" rule, narrowly for startup-material delivery: the **host-side** `abacus-runtime` speaks the pinned Herdr socket schema for the startup `AgentPrompt`, so Envelope and secret ride JSON on Herdr's UDS and never appear in argv or environment. This does not conflict with HPG.4's socket rejection, which was about *agent-facing* Herdr reachability: the sandboxed agent still never reaches Herdr. Compatibility evidence for this exact startup path is a required gate (below).
+### 2. Worker calls name an Attempt, never an authority
 
-3b. **Secret ingress across the approval boundary: `runtime-rpc` — a narrow use-case verb, NEVER a `LaunchSpec` sink.** A sandbox-side `abacus` process cannot spawn a host-approved command, so the runtime seam needs its own approved carriage: a second fixed-dispatch verb, `/operator/path/abacus runtime-rpc`, two tokens, dispatched before any argument parsing, configuration load, or project discovery.
+ABACUS launch composition writes one non-secret Attempt locator into the exact
+worker launch it creates. That locator is transport data, not a credential and
+not an authority claim. It may be visible in the launched process environment;
+no confidentiality property depends on it. The worker-facing facade obtains
+it from injected launch configuration and carries it opaquely on both direct
+and relay requests. The model supplies no ActorId, authority class, profile,
+profile hash, capability, scope, credential, runtime handle, pane, terminal,
+or generation selector.
 
-**Its public stdin schema is a narrow use-case request and contains no execution material whatsoever** — repo-id, the authenticated requesting actor's credential, the **closed launch-subject selector** (worker Attempt or actor activation — spawned orchestrator/watchdog profiles are launchable too, per CONTEXT I12/I16), the bound transient credential/replay identity, and operation id/deadline. It carries no executable, no argv, no cwd, no environment, no Envelope, and no client-asserted authority snapshot. Accepting a client-supplied `LaunchSpec` over a host-approved command would be arbitrary host execution and would defeat HPG.4 entirely; possession of the `runtime-rpc` approval likewise confers no Herdr authority by itself.
+There is exactly one writer of the locator: ABACUS launch composition, which
+already knows the Attempt it is launching. There is exactly one semantic
+resolver: Scribe. Relay, framing, and CLI layers transport the value but never
+interpret it or derive authority from it. Repository configuration, current
+working directory, provider pane names, inherited manager variables, and
+model context are not identity evidence.
 
-Host-side composition, in order: (1) authenticate the requesting actor's credential and authorize `runtime:launch` through Scribe/core — no project discovery happens before authorization; (2) load the already-persisted Envelope and subject facts from the Ledger, keyed by the closed launch subject (worker Attempt or actor activation) — worktree facts apply to worker subjects; (3) resolve agent executable, args, and environment **only** from operator-owned allowlisted provider configuration — repository or request content may select at most a *validated provider/profile identifier*, never an executable or argv; (4) hash the presented subject token and ask **Scribe** to verify — Scribe owns the vetted constant-time comparison and returns only a typed outcome, since `abacus-core` deliberately contains no cryptographic primitive (I15) — that `(LaunchSubject, CredentialId, digest)` matches that subject's **active bound provisioning** — the Attempt's for a worker, the actor activation's for a spawned profile — the stored digest never leaves the host, only the outcome — refusing before any provider mutation; (5) construct the internal `LaunchSpec` (carrying the pre-known bounded launch correlation for ambiguous-launch recovery) and call `RuntimePort::launch` with the identity-bound secret. `LaunchSpec` is therefore an internal type that never crosses the approval boundary in either direction.
+For every worker mutation Scribe resolves, in order:
 
-The Linux-Codex full chain is: exec `abacus scribe-rpc` → typed opening response carrying the transient secret → exec `abacus runtime-rpc` with the narrow request → typed launch response. Claude's chain differs only in the first hop (direct UDS composition in-process); it needs the same `runtime-rpc` approval because Herdr access is host-side either way. A single host composer performing state-open+launch atomically was considered and rejected: it would broaden the deliberately state-only `scribe-rpc` surface.
+1. the locator to one durable Attempt;
+2. that Attempt to its Assignment;
+3. the Assignment's recorded worker binding;
+4. the current Attempt/Assignment lifecycle, Lease, and fencing token;
+5. the requested worker verb and its ordinary core invariants.
 
-4. **Repository/socket routing without ambient discovery (I13):** the frame carries a bounded validated `repo-id`; the relay resolves `<injected runtime base>/abacus/<repo-id>.sock` from operator-installed configuration compiled/configured at install time. Arbitrary socket paths are unrepresentable.
-5. **Approval evidence is proof, not policy.** The probes ran under `auto_review` to demonstrate approval *propagation*; the deployed mechanism is exclusively the operator-installed exact `decision=allow` exec-policy rule. The loaded-rule and absent-rule fresh-session controls are HPG.5 preconditions (below), not optional captures.
+Only the resolved binding supplies audit and Signal provenance. A caller field
+that purports to select actor, profile, capability, scope, or decision
+authority is unknown/forbidden; the wire decoder rejects unknown fields rather
+than ignoring them, so such a field is never accepted even as a consistency
+hint and never used. Missing, malformed, detached, unmapped, ambiguous, stale,
+or generation-incoherent launch associations refuse loudly before mutation.
+No environment, asserted identity, pane inference, or other fallback is tried.
 
-### Actor authentication (F1): operator-rooted credentials, no ABACUS-owned persisted plaintext
+The fencing token stays in every mutating worker call. Runtime-handle
+generation fences provider-session association; the Lease token fences
+workflow Attempt ownership and supersession. Neither substitutes for the
+other. A well-formed call from an ended Attempt or terminal Assignment returns
+the stale-fencing refusal, not the bundle-incoherence refusal: its identities
+may agree even though its authority to mutate has ended.
 
-UDS peer credentials prove only the shared uid, and the relay collapses even that — so an asserted `ActorId` is *identification*, never authentication. v1 uses **operator-rooted bearer credentials**:
+### 3. Worker and decision interfaces are structurally separate
 
-- **Enrolment is structurally absent from the entire agent-facing Scribe protocol, on BOTH carriages.** No versioned-socket request enrolls an actor: a handcrafted enrolment message on the direct UDS (or any relay frame) is an unknown/forbidden request, refused and audited. The operator root is concrete: **initial actor enrolment happens before the agent socket accepts requests**, through a one-shot startup/admin channel inherited from the operator launcher (a pre-listen descriptor/channel that closes before agent service begins; an equivalent one-time bootstrap secret never exposed to agents is an acceptable implementation). There is **no standalone or general enrolment verb anywhere in the protocol**; atomic worker credential binding is an *authenticated, authorized effect of `AssignmentOpening` or `AttemptOpening`* by an already-enrolled decision actor — an effect of that transaction, never a request in its own right. **Integration shape (seam-verified):** the caller/CLI generates the CSPRNG secret, retains plaintext transiently for ephemeral launch delivery, and passes only an opaque `CredentialProvisioning { id, digest }` inside `AssignmentOpening`; Scribe commits the binding atomically and returns only idempotent `StateApplied` — plaintext never crosses the seam in either direction, and retry replays the same digest. Initial operator bootstrap uses the same generate-secret/pass-digest pattern over the pre-listen channel. Distinct `CredentialInvalid` / `CredentialBindingMismatch` / `CredentialRevoked` refusals exist in the state taxonomy, separate from post-authentication `ActorMismatch`/`ScopeUnauthorized`. Recovery and root rotation are a **distinct operator-channel case** (`ActivationCase::OperatorRecovery`): accepted only on the pre-listen channel, never on the agent protocol, never from a caller-supplied authority snapshot, and it rotates an **already-registered** orchestrator (same ActorId and class) without creating an actor — which is what lets bootstrap stay strictly one-shot. Never first-caller occupancy. **Additional orchestrator actors** enrol through a distinct operator-channel case (`OperatorOrchestratorEnrolment`): pre-listen channel only, orchestrator class only, for an actor Scribe does not yet know, subject to ordinary occupancy and configuration validation, and it never touches the one-shot bootstrap sentinel — this is the topology activation path CONTEXT I16 and ADR-0002 §7 require, not a general enrolment verb on the agent surface.
-- **Credential mechanics:** bearers are CSPRNG-generated and unpredictable (≥128 bits); Scribe stores only their digest; comparison is constant-time; every agent-protocol enrolment attempt is refused as unknown/forbidden and audited.
-- **Credential binding:** each credential binds `(ActorId, authority class, profile content hash, activation generation)`; a component mismatch refuses distinctly.
-- **Workers:** the opening transaction persists only a **credential id + hash and audit metadata** in the Ledger — never plaintext (architecture forbids secrets in assignment context, and the persisted Envelope is repository-local Ledger state). The plaintext is a separate **ephemeral launch secret** delivered by the launcher at spawn outside the persisted Envelope, redacted from logs and audit, and revoked at attempt end or deactivation.
-- **Every request** carries `(ActorId, credential)`; Scribe validates hash+binding before `ValidatedProfileSet::authorize` runs. Fencing tokens additionally bound worker mutations.
-- **Plaintext lifecycle trace (no ABACUS-owned durable plaintext; provider transcripts excepted per the residual below; no silent retry):** the composer (the facade process on the direct carriage; the `scribe-rpc` fixed-function verb on the relay) generates the secret and discloses the transient launch secret to the invoking decision actor only after confirmed `Applied`/`AlreadyApplied`. A lost/ambiguous exchange returns typed `Ambiguous` with the same transient provisioning, and the actor **explicitly reissues** with it — no internal loop. The actor's transcript is the already-accepted residual; the secret feeds immediate spawn over a non-argv, non-env channel. If the composer dies after commit but before disclosure, there is **no plaintext recovery**: the authorized actor explicitly revokes that Attempt and appends a successor via the retry bundle with fresh provisioning.
-- **Honest residual exposure (corrected):** there is **no ABACUS-owned durable store or log** of plaintext — but plaintext is *not* absent at rest generally. The secret rides the model prompt and repeated tool-call stdin, and HPG.3 evidence records that Claude and Codex persist native session histories and transcripts; that **provider-owned transcript persistence is an accepted, operator-visible residual** lasting until provider retention/cleanup. What bounds it is revocation: credentials die at attempt end, deactivation, or rotation, so a recovered transcript secret is inert. Same-uid memory capture during the live window is likewise accepted on a single-operator machine.
+The state seam is split over the same in-memory and SQLite implementations:
 
-**`LaunchSubject` is runtime association identity, not a workflow subject:** ADR-0002's `SubjectRef` family is unchanged and gains no fifth variant.
+- the **worker interface** contains only fenced Report, Evidence, Handoff,
+  Abort-compliance, Lease-renewal operations, plus the explicitly selected
+  reads a worker requires;
+- the **decision interface** contains Assignment/Attempt openings, decisions,
+  Directives and Requests, profile activation/deactivation, runtime-association
+  composition, application attempts/receipts, and decision-side reads.
 
-### Failure taxonomy (F3): denial at the boundary where it occurs
+The worker RPC dispatcher receives only the worker trait. It cannot name or
+invoke a decision verb; this is a type fact rather than a routing convention.
+Worker-facing core use cases are likewise generic only over the worker trait,
+so the separation holds before protocol dispatch as well as at it.
+The authenticated, operator-started decision composer receives the decision
+trait and holds the operator-granted decision capability. Scribe still checks
+and records the exact decision actor, profile hash, capability, and scope on
+every decision. Worker-side Attempt resolution never manufactures decision
+authority.
 
-Host-rule **denial happens before any ABACUS process runs**, so it can never be a `StateError`: the agent observes its exec refused; a worker treats that as an environment failure — halt, preserve worktree, typed blocked Report if state is reachable, else silence bounded by lease expiry. `RuntimeError::NotPermitted` remains a *runtime/deployment-boundary* observation for facade-spawned operations. The state client's own taxonomy contains only what the executed relay can observe: connect failure → `Unavailable` (probe-verified: ENOENT, exit 70, once, loud), protocol/frame errors → their distinct refusals.
+The portable state contract may exercise an internal aggregate bound so both
+implementations receive one behavioral suite. That aggregate is test
+convenience only; it is never handed to worker composition or the worker
+dispatcher.
 
-### Hazard mapping (F5)
+### 4. Worker credential machinery is removed
 
-1 full-chain: both legs probed on the real agent path. 2 Herdr spawn: r2 certification. 3 child exposure: per-call process exits before any project command; credentials never in argv/env of children; no descriptor survives. 4 reply theft: forbidden-batching rule — no shared channel exists. 5 crash/restart: per-call connection; nothing to reconnect. 6 bearer identity: credentialed authentication above; authorization via `authorize`; leases bound workers. 7 lifecycle: operator-owned checksummed client outside agent-writable roots; frames bounded; deadlines fixed. 8 asymmetry: one protocol, two carriages, injected selection, no fallback probing.
+Worker bearers do not exist in v1. Consequently:
 
-## Validation gates and acceptance obligations
+- `CredentialProvisioning` is absent from `AssignmentOpening`,
+  `AttemptOpening`, and `ActivationOpening`;
+- `verify_launch_subject` and the credential-invalid,
+  credential-binding-mismatch, and credential-revoked state errors are absent;
+- `LaunchSubject::WorkerAttempt` contains only the Attempt, while
+  `LaunchSubject::ActorActivation` contains actor, profile, and activation
+  generation;
+- `RuntimePort::launch` accepts `LaunchSpec` without an
+  `EphemeralLaunchSecret` sideband;
+- Assignment/Attempt termination and profile deactivation perform no
+  credential rotation or revocation;
+- no credential file, slot, digest, CSPRNG provisioning, constant-time
+  comparison, launch-secret prompt, or transcript lifecycle remains.
 
-- ~~Avenue-2 direct probe~~ — PASSED. ~~Herdr-spawn variant~~ — PASSED (r2; r1 discarded, never counted).
-- **Runtime-carriage gates — disposable prototype, not production (blocking, pre-acceptance):** because `runtime-rpc` and the Herdr adapter land in Phase 4/5 (which depend on Phases 1–2), the pre-acceptance evidence is a **faithful disposable fixed-function prototype**: dynamic `write_stdin` of the **narrow** request into a prototype `runtime-rpc` → direct pinned-Herdr-socket startup delivery → verification that `/proc/<pid>/cmdline` and `/proc/<pid>/environ` contain no secret material at any hop. The gate must additionally prove that hostile `executable`/`args`/`cwd`/`env`/Envelope fields are **unrepresentable or refused** by the public schema, and that an unauthorized actor cannot reach Herdr at all. Production full-chain contract and live tests are `ABACUS-GYH.5`/`ABACUS-KBP` obligations, not Phase 1 gates — this keeps HPG.7/HPG.5 free of a phase dependency cycle.
-- **HPG.5 preconditions (blocking):** fresh-session control with the operator-installed loaded exec-policy rule (the actual production path); the absent-rule fresh-session control capturing the exact denial taxonomy at the agent boundary; and a **full-chain dynamic-stdin probe of the fixed-function composer contract** — exec plus a runtime-supplied `write_stdin` facade command through the live session, exercising a credential-creating call that returns a transient secret and a typed `Ambiguous` reissue path. The disposable byte-relay feasibility result transfers only the exact two-token host-execution fact; the composer behavior is this separate gate.
-- **Contract updates on acceptance (HPG.7 acceptance items):** architecture, migration, `abacus-state`, and `abacus-cli` contracts updated for the two-carriage transport, operator-rooted credentials (enrolment outside the agent surface; hash-only persistence; ephemeral launch secrets), the typed-JSON stdin envelope with host-side framing, injected carriage selection, and the no-fallback rule; `ABACUS-9NH.9` consumes the credential and dynamic-stdin obligations; the compatibility appendix's persisted-Envelope/stdin wording is revised to match.
-- On all of the above plus C2 pass and operator sign-off: `ABACUS-HPG.5` reruns its gate against the chosen transport and closes; `ABACUS-9NH.9` unblocks.
+Existing credential columns/tables may remain dormant until an otherwise
+necessary schema migration touches them; their mere removal earns no migration
+or deletion project. New state writes and semantic association keys never
+depend on them. If an existing schema-version transition is required to keep
+credential-bearing launch keys or versioned records readable, the state module
+performs the smallest forward compatibility migration; that is compatibility
+work, not credential-retention behavior.
+
+Generic multi-orchestrator activation credential topology is deferred until a
+second orchestrator exists. The v1 decision composer remains authenticated;
+this ADR does not convert decision calls into caller-asserted authority.
+
+### 5. Terminal/pane derivation is deferred, not prohibited
+
+Receiver derivation from Unix peer process to controlling terminal to Herdr
+pane was evaluated and rejected for the current two-carriage mechanism. The
+faithful Codex relay uses nonempty `write_stdin`; installed Codex 0.146.1
+therefore creates an inner PTY, starts a new session, and makes that inner PTY
+the relay process's controlling terminal. It is not the outer Herdr pane.
+Moreover the persisted `arh1|namespace|pane|generation` handle has no existing
+OS-TTY-to-pane reverse index. The receiver would derive no pane or the wrong
+terminal on the relay carriage.
+
+This option remains deliberately reopenable as additive direct-carriage
+hardening if provider behavior or the runtime adapter changes. It must never
+replace or alter the public worker message shape, become a per-request Herdr
+dependency, or introduce a fallback from failed terminal derivation to
+caller-asserted identity.
+
+### 6. Accepted v1 non-goal
+
+ABACUS v1 is a trusted-repository, local single-user system. It does not defend
+worker provenance against a hostile same-uid process that can read or copy
+another worker's non-secret locator and fencing token. Such a process may forge
+worker-side lifecycle calls and claims under the target Attempt. The Handoff
+gate still rechecks its structural commit, scope, base, cleanliness, evidence
+identity, and policy predicates, but it does not reproduce verification
+commands. The decisive containment is structural: the worker interface cannot
+reach Assignment, decision, Directive, profile, or application-authority
+verbs. Defending same-uid worker provenance requires a stronger OS/provider
+trust boundary and is outside v1; this ADR does not imply that mode bits,
+environment opacity, or model obedience provide one.
+
+## Consequences
+
+- Model-context compaction loses no authentication material. A worker-facing
+  facade re-reads non-secret launch configuration on each invocation.
+- A bad launcher can omit or stale a locator, causing a loud refusal, but it
+  cannot smuggle manager authority through worker request fields.
+- Scribe remains the sole writer and authority resolver; transport layers stay
+  stateless and per-call, so Scribe restart requires no reconnecting bridge.
+- Direct and relay carriages remain asymmetric in reachability but identical in
+  protocol and identity semantics.
+- The type split makes adding a worker-reachable decision verb a deliberate
+  core seam change with full C3 fan-out.
+- Removing credentials deletes substantial core/state/runtime vocabulary and
+  testing cost without weakening the authenticated decision surface.
+
+## Validation and acceptance obligations
+
+1. Preserve the passing direct, relay, Herdr-launched relay, loaded-rule,
+   absent-rule, one-request/one-connection, bounded framing, and cleanup rows in
+   the compatibility record. Credential-specific historical rows remain
+   evidence of revision 5, not revision-6 requirements.
+2. Contract-test identical worker request semantics on both carriages: locator,
+   fencing token, operation identity, and payload only; actor/authority/profile/
+   capability/scope and override fields refuse before mutation.
+3. Contract-test the trait separation: a worker dispatcher cannot express a
+   decision call, while the authenticated decision composer records exact
+   decision authority.
+4. Add the contamination regression: manager identity variables deliberately
+   exist in a worker launch; the worker Report is attributed through the
+   Assignment binding; manager decision and manager-wide query/dispatch verbs
+   are unavailable on the worker interface.
+5. Preserve portable in-memory/SQLite parity for locator resolution, replay,
+   stale fencing, terminal Assignment/Attempt refusal, and audit provenance.
+6. Prove `Passed` Evidence is emitted by the execution adapter after observing
+   the subprocess and cannot be asserted directly through the worker command
+   interface. State honestly that Handoff rechecks structural evidence binding
+   and policy but does not rerun every command; rerun only when policy requires
+   it or execution outcome is missing/ambiguous.
+7. After C2 cross-review and operator signature, update architecture, migration,
+   module contracts, compatibility conclusions, and the HPG.5/HPG.7 bead state
+   before implementing the breaking seams.
