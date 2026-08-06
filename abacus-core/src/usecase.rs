@@ -14,11 +14,12 @@
 use crate::ports::{
     AdviceDisposition, ApplicationAttempt, ApplicationOutcome, ApplicationReceipt,
     AssignmentOpening, BeadSnapshot, CloseReason, DecisionKind, DecisionReason, DecisionRecord,
-    EphemeralLaunchSecret, EvidenceOutcome, FencedAction, FencedResponse, HandoffRecord,
-    LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec, LaunchSubject, MutationOutcome,
-    ObservedCloseReason, PendingApplication, ReceiptCandidate, ReportOutcome, RuntimeError,
-    RuntimePort, StateApplied, StateError, SubmissionOutcome, WorkAdvicePort, WorkError,
-    WorkGraphPort, WorkProjection, WorkRevision, WorkStatus, WorkflowStatePort, appraise_advice,
+    EffectReport, EphemeralLaunchSecret, EvidenceOutcome, FencedAction, FencedResponse,
+    HandoffRecord, LaunchAttempt, LaunchCorrelation, LaunchOutcome, LaunchSpec, LaunchSubject,
+    MutationOutcome, ObservedCloseReason, PendingApplication, ReceiptCandidate, ReportOutcome,
+    RuntimeError, RuntimeHandle, RuntimePort, StateApplied, StateError, StopMode,
+    SubmissionOutcome, WorkAdvicePort, WorkError, WorkGraphPort, WorkProjection, WorkRevision,
+    WorkStatus, WorkflowStatePort, appraise_advice,
 };
 use crate::{
     AssignmentId, AuthoritySnapshot, BeadId, Evidence, HandoffId, OperationId, SignalDraft,
@@ -565,6 +566,125 @@ where
     })
 }
 
+/// The typed authorizing input for ending an Attempt: the two decision
+/// kinds that end one Attempt while leaving its Assignment active.
+/// Accept and Cancel are deliberately absent — Accept has its own saga,
+/// and Cancel ends every Attempt of an Assignment, so neither belongs
+/// at this single-Attempt teardown (S2 mirror of [`AcceptanceDecision`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptEnd {
+    pub operation: OperationId,
+    pub assignment: AssignmentId,
+    pub authority: AuthoritySnapshot,
+    pub attempt: crate::AttemptId,
+    pub kind: AttemptEndKind,
+    pub reason: DecisionReason,
+    pub resolves: Option<SignalId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptEndKind {
+    /// The decision actor withdraws the Attempt.
+    Revoke,
+    /// The decision actor reclaims a stalled or expired Attempt.
+    Reclaim,
+}
+
+/// Outcome of ending an Attempt and tearing down its runtime session.
+///
+/// The decision is committed FIRST in every variant: the Ledger is
+/// authoritative, and a stop that fails or is unknown must never
+/// un-end an Attempt. Runtime observations are non-authoritative
+/// (CONTEXT §5), so correctness never depends on the process actually
+/// being dead — fencing already refuses a zombie's writes. Teardown is
+/// hygiene layered on top of that guarantee, never a substitute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeardownOutcome {
+    /// Decision committed; no runtime association existed. Normal, not
+    /// an error: an Attempt may end before it ever launched.
+    NoRuntimeAssociation { decision: StateApplied },
+    /// Decision committed, session stopped, association removed.
+    ToreDown { decision: StateApplied },
+    /// Decision committed; the stop's effect is UNKNOWN. The
+    /// association is deliberately LEFT BOUND — unbinding here would
+    /// discard the only handle to a session that may still be running.
+    /// An explicit unresolved runtime condition for the caller to
+    /// observe and escalate; never a hidden retry (I12).
+    StopAmbiguous {
+        decision: StateApplied,
+        handle: RuntimeHandle,
+    },
+    /// Decision committed; the stop failed definitively. The
+    /// association is likewise left bound, with the normalized reason.
+    StopFailed {
+        decision: StateApplied,
+        handle: RuntimeHandle,
+        error: RuntimeError,
+    },
+}
+
+/// End one Attempt and tear down its runtime session.
+///
+/// Ordering is the contract: the terminal decision commits first, which
+/// is what makes a successor Attempt legal and instantly makes the
+/// predecessor's writes refusable. Only then is the session stopped and
+/// its association removed. Nothing here retries.
+///
+/// KNOWN GAP, deliberately not closed here: `unbind_runtime_handle`
+/// names only the subject, so a re-association that lands between the
+/// handle read and the unbind would be erased. Compare-and-swap unbind
+/// arrives with the launch-association recovery work (ABACUS-bpr) and
+/// this sequence adopts it then; the window is narrow because the
+/// Attempt is already terminal, but it is real and named rather than
+/// papered over.
+pub fn end_attempt<S, R>(
+    state: &S,
+    runtime: &R,
+    ending: &AttemptEnd,
+    subject: &LaunchSubject,
+    stop_deadline: crate::Timestamp,
+    unbind_operation: &OperationId,
+) -> Result<TeardownOutcome, StateError>
+where
+    S: WorkflowStatePort + ?Sized,
+    R: RuntimePort + ?Sized,
+{
+    let record = DecisionRecord {
+        operation: ending.operation.clone(),
+        assignment: ending.assignment.clone(),
+        authority: ending.authority.clone(),
+        kind: match ending.kind {
+            AttemptEndKind::Revoke => DecisionKind::Revoke {
+                attempt: ending.attempt.clone(),
+                reason: ending.reason.clone(),
+            },
+            AttemptEndKind::Reclaim => DecisionKind::Reclaim {
+                attempt: ending.attempt.clone(),
+                reason: ending.reason.clone(),
+            },
+        },
+        resolves: ending.resolves.clone(),
+    };
+    let decision = state.record_decision(&record)?;
+
+    let Some(handle) = state.runtime_handle(subject)? else {
+        return Ok(TeardownOutcome::NoRuntimeAssociation { decision });
+    };
+
+    match runtime.stop(&handle, StopMode::Graceful, stop_deadline) {
+        Ok(EffectReport::Applied) => {
+            state.unbind_runtime_handle(unbind_operation, subject)?;
+            Ok(TeardownOutcome::ToreDown { decision })
+        }
+        Ok(EffectReport::Ambiguous) => Ok(TeardownOutcome::StopAmbiguous { decision, handle }),
+        Err(error) => Ok(TeardownOutcome::StopFailed {
+            decision,
+            handle,
+            error,
+        }),
+    }
+}
+
 /// Why a launch was refused BEFORE the Envelope was persisted or any
 /// provider was contacted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1021,6 +1141,7 @@ mod tests {
     struct ScriptedRuntime {
         answer: RefCell<Option<Result<LaunchAttempt, RuntimeError>>>,
         launches: RefCell<Vec<(LaunchSubject, LaunchCorrelation)>>,
+        stop_answer: RefCell<Option<Result<EffectReport, RuntimeError>>>,
         events: EventLog,
     }
 
@@ -1029,6 +1150,17 @@ mod tests {
             Self {
                 answer: RefCell::new(Some(answer)),
                 launches: RefCell::new(Vec::new()),
+                stop_answer: RefCell::new(None),
+                events,
+            }
+        }
+
+        /// A runtime that only ever answers a stop.
+        fn stopping(answer: Result<EffectReport, RuntimeError>, events: EventLog) -> Self {
+            Self {
+                answer: RefCell::new(None),
+                launches: RefCell::new(Vec::new()),
+                stop_answer: RefCell::new(Some(answer)),
                 events,
             }
         }
@@ -1117,7 +1249,11 @@ mod tests {
             _: StopMode,
             _: Timestamp,
         ) -> Result<EffectReport, RuntimeError> {
-            unimplemented!()
+            self.events.borrow_mut().push("stop");
+            self.stop_answer
+                .borrow_mut()
+                .take()
+                .expect("this scenario scripts no stop answer")
         }
 
         fn reassociate(
@@ -1286,6 +1422,8 @@ mod tests {
         evidence_answer: RefCell<Option<(EvidenceOutcome, FencedResponse)>>,
         handoff_calls: RefCell<Vec<(FencedAction, HandoffRecord)>>,
         handoff_answer: RefCell<Option<(SubmissionOutcome, FencedResponse)>>,
+        /// The runtime association a teardown will find, if any.
+        bound_handle: RefCell<Option<RuntimeHandle>>,
     }
 
     impl WorkflowStatePort for RecordingState {
@@ -1450,10 +1588,12 @@ mod tests {
             _: &OperationId,
             _: &LaunchSubject,
         ) -> Result<StateApplied, StateError> {
-            unimplemented!()
+            self.events.borrow_mut().push("unbind_runtime_handle");
+            *self.bound_handle.borrow_mut() = None;
+            Ok(StateApplied::Applied)
         }
         fn runtime_handle(&self, _: &LaunchSubject) -> Result<Option<RuntimeHandle>, StateError> {
-            unimplemented!()
+            Ok(self.bound_handle.borrow().clone())
         }
         fn record_runtime_observation(
             &self,
@@ -2297,6 +2437,157 @@ mod tests {
             state.pending.borrow().len(),
             1,
             "the projection stays pending and reconcilable"
+        );
+    }
+
+    fn ending() -> AttemptEnd {
+        AttemptEnd {
+            operation: op("op-revoke"),
+            assignment: AssignmentId::new("asg-1").expect("valid assignment"),
+            authority: AuthoritySnapshot {
+                actor: lead_actor(),
+                capability: CapabilityId::new("state:revoke").expect("valid capability"),
+                scope: ScopeExpr::Universal,
+            },
+            attempt: AttemptId::new("att-1").expect("valid attempt"),
+            kind: AttemptEndKind::Revoke,
+            reason: DecisionReason::new("worker stalled").expect("valid reason"),
+            resolves: None,
+        }
+    }
+
+    #[test]
+    fn ending_an_attempt_commits_the_decision_before_stopping_the_session() {
+        let state = RecordingState::default();
+        *state.bound_handle.borrow_mut() = Some(launched_outcome().handle);
+        let runtime =
+            ScriptedRuntime::stopping(Ok(EffectReport::Applied), Rc::clone(&state.events));
+
+        let outcome = end_attempt(
+            &state,
+            &runtime,
+            &ending(),
+            &worker_subject(),
+            Timestamp(500),
+            &op("op-unbind"),
+        )
+        .expect("teardown runs");
+        assert_eq!(
+            outcome,
+            TeardownOutcome::ToreDown {
+                decision: StateApplied::Applied
+            }
+        );
+
+        // The ORDER is the contract: the Ledger ends the Attempt first -
+        // which is what makes a successor legal and the predecessor's
+        // writes refusable - and only then is the session reaped.
+        assert_eq!(
+            *state.events.borrow(),
+            vec!["stop", "unbind_runtime_handle"]
+        );
+        assert_eq!(state.decisions.borrow().len(), 1);
+        assert_eq!(
+            state.decisions.borrow()[0].kind,
+            DecisionKind::Revoke {
+                attempt: AttemptId::new("att-1").expect("valid"),
+                reason: DecisionReason::new("worker stalled").expect("valid"),
+            }
+        );
+        assert!(state.bound_handle.borrow().is_none());
+    }
+
+    #[test]
+    fn an_ambiguous_stop_keeps_the_association_and_surfaces_the_handle() {
+        let state = RecordingState::default();
+        *state.bound_handle.borrow_mut() = Some(launched_outcome().handle);
+        let runtime =
+            ScriptedRuntime::stopping(Ok(EffectReport::Ambiguous), Rc::clone(&state.events));
+
+        let outcome = end_attempt(
+            &state,
+            &runtime,
+            &ending(),
+            &worker_subject(),
+            Timestamp(500),
+            &op("op-unbind"),
+        )
+        .expect("teardown runs");
+
+        assert_eq!(
+            outcome,
+            TeardownOutcome::StopAmbiguous {
+                decision: StateApplied::Applied,
+                handle: launched_outcome().handle,
+            },
+            "an unknown stop is surfaced, never swallowed and never retried"
+        );
+        assert!(
+            state.bound_handle.borrow().is_some(),
+            "unbinding here would discard the only handle to a session \
+             that may still be running"
+        );
+        assert_eq!(state.decisions.borrow().len(), 1, "the Attempt still ended");
+    }
+
+    #[test]
+    fn a_failed_stop_leaves_the_attempt_ended_and_the_handle_surfaced() {
+        let state = RecordingState::default();
+        *state.bound_handle.borrow_mut() = Some(launched_outcome().handle);
+        let runtime = ScriptedRuntime::stopping(
+            Err(RuntimeError::ProviderUnavailable),
+            Rc::clone(&state.events),
+        );
+
+        let outcome = end_attempt(
+            &state,
+            &runtime,
+            &ending(),
+            &worker_subject(),
+            Timestamp(500),
+            &op("op-unbind"),
+        )
+        .expect("teardown runs");
+
+        assert_eq!(
+            outcome,
+            TeardownOutcome::StopFailed {
+                decision: StateApplied::Applied,
+                handle: launched_outcome().handle,
+                error: RuntimeError::ProviderUnavailable,
+            },
+            "a failed reap must never un-end the Attempt: the Ledger is \
+             authoritative and fencing already refuses the zombie's writes"
+        );
+        assert!(state.bound_handle.borrow().is_some());
+    }
+
+    #[test]
+    fn ending_an_attempt_that_never_launched_is_a_typed_outcome() {
+        let state = RecordingState::default();
+        let runtime =
+            ScriptedRuntime::stopping(Ok(EffectReport::Applied), Rc::clone(&state.events));
+
+        let outcome = end_attempt(
+            &state,
+            &runtime,
+            &ending(),
+            &worker_subject(),
+            Timestamp(500),
+            &op("op-unbind"),
+        )
+        .expect("teardown runs");
+
+        assert_eq!(
+            outcome,
+            TeardownOutcome::NoRuntimeAssociation {
+                decision: StateApplied::Applied
+            },
+            "an Attempt may end before it ever launched - normal, not an error"
+        );
+        assert!(
+            state.events.borrow().is_empty(),
+            "no session exists, so no provider is contacted"
         );
     }
 
