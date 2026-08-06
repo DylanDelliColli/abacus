@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 2 — pending Codex cross-review and operator sign-off as named decider
+- **Status:** Proposed, revision 3 — pending Codex cross-review and operator sign-off as named decider
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
@@ -156,12 +156,28 @@ is data on the obligation rather than branching in the ringer.
 
 | Condition | Audience | Query |
 |---|---|---|
-| Unresolved Signal — a Directive, Report, or Request with no linked responding action | the Signal's recipient; operator once aged past threshold | `unresolved_signals()`, exists |
+| Unresolved Signal — a Directive, Report, or Request with no linked responding action | routed per body type, see below; operator once aged past threshold | `unresolved_signals(None)`, exists |
 | Pending Handoff — submitted for acceptance, neither accepted nor rejected | the deciding actor; operator once aged | `pending_handoffs()`, **new** |
 | Reclaimable lease — an Attempt whose lease expired | operator always | `reclaimable_leases(now)`, **new** |
 
 Both new queries return their records together with the durable timestamp
 §3 requires; neither exposes a mutable surface.
+
+"The Signal's recipient" is not one thing, and the module must not treat it
+as one. `unresolved_signals` takes an optional `ActorId` filter that
+deliberately returns **no Directives at all** when supplied, because a
+Directive is bound to an Attempt rather than to an actor. Deriving attention
+per-actor would therefore silently drop every unresolved Directive — the
+binding orchestrator-to-worker instruction, and the obligation class this
+module most exists to serve. The derivation calls `unresolved_signals(None)`
+once and routes by body type instead:
+
+- **Directive** → the session bound to its subject Attempt.
+- **Request** → the named recipient actor.
+- **Report** → the deciding actor of the owning Assignment.
+
+This costs nothing extra: the doorbell targets a runtime handle, and a handle
+resolves from an Attempt as readily as from an actor.
 
 Reclaimable leases are operator-class unconditionally: the presumed-dead
 worker is by definition not going to answer a doorbell, and reclamation is a
@@ -212,7 +228,7 @@ this shape:
 | Stale generations never target the wrong Attempt | The runtime seam is generation-fenced and already returns `HandleStale` |
 | Herdr or service outage catches up | The next run recomputes; nothing was queued to be lost |
 | Unresolved state keeps re-ringing despite `Submitted` | `Submitted` is never read by the derivation (§6) |
-| Resolved state stops ringing with no mutable ack | The obligation ceases to derive; there is nothing to clear |
+| Resolved state stops ringing with no mutable ack | The obligation ceases to derive; there is nothing to clear. Verified, not assumed: `unresolved_signals` computes over signals joined to their response actions with no stored flag, and `abacus-state`'s contract suite already pins this as `unresolved_signals_are_derived_from_responses` |
 
 Costs, stated honestly:
 
