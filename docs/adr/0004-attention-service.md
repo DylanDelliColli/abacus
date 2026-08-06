@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 1 — pending Codex cross-review and operator sign-off as named decider
+- **Status:** Proposed, revision 2 — pending Codex cross-review and operator sign-off as named decider
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
@@ -99,11 +99,35 @@ next run is rung again. No backoff counter exists because the interval
 already bounds the rate.
 
 **Urgency is arithmetic on durable timestamps.** Every obligation carries the
-age of the record that produced it — a Signal's commit time, a Handoff's
-submission time, a lease's expiry. When that age crosses a policy threshold
+age of the record that produced it. When that age crosses a policy threshold
 the obligation is classed for the operator instead of the worker. This is a
 pure function of `(record_timestamp, now, policy)`. No ladder, no stored
 stage, nothing to get out of sync.
+
+Where that timestamp comes from is not uniform, and revision 1 of this ADR
+was wrong to imply it was. Only `Lease` carries wall-clock time
+(`expires_at`). `Signal` carries a `Seq` — a commit *order*, not a time — and
+`HandoffRecord` carries no temporal field at all. A threshold expressed in
+minutes cannot be evaluated against a sequence number.
+
+The resolution adds no field to any immutable record, because I10 already
+guarantees the fact exists: every state-changing operation appends an audit
+event, and `AuditEvent` carries both `seq` and `at`. Commit time is therefore
+recoverable for every obligation without touching the records themselves,
+which also keeps I10's split between current state and immutable record
+intact. Concretely:
+
+- **Reclaimable lease** — `expires_at` directly. No join.
+- **Pending Handoff** — the new query returns the record together with its
+  submission time, joined from the creating audit event inside `abacus-state`.
+  `HandoffRecord` carries no `seq`, so the module has no way to bound an audit
+  query itself; doing the join in SQL is what keeps it bounded.
+- **Unresolved Signal** — the module joins in memory against one audit query
+  bounded by the minimum `seq` among the unresolved Signals it just read.
+  `Signal` carries its own `seq`, so the bound is exact and the existing
+  `unresolved_signals()` signature is left untouched.
+
+No pre-existing seam changes shape. The cost is one extra audit read per run.
 
 `AttentionPolicy` carries the thresholds as ordinary values passed to the
 derivation. It is not a new config schema and introduces no file format.
@@ -135,6 +159,9 @@ is data on the obligation rather than branching in the ringer.
 | Unresolved Signal — a Directive, Report, or Request with no linked responding action | the Signal's recipient; operator once aged past threshold | `unresolved_signals()`, exists |
 | Pending Handoff — submitted for acceptance, neither accepted nor rejected | the deciding actor; operator once aged | `pending_handoffs()`, **new** |
 | Reclaimable lease — an Attempt whose lease expired | operator always | `reclaimable_leases(now)`, **new** |
+
+Both new queries return their records together with the durable timestamp
+§3 requires; neither exposes a mutable surface.
 
 Reclaimable leases are operator-class unconditionally: the presumed-dead
 worker is by definition not going to answer a doorbell, and reclamation is a
@@ -210,6 +237,10 @@ Costs, stated honestly:
   remaining obligations rather than aborting.
 - Running the derivation twice over unchanged state produces an identical
   report, and the second run's doorbells change no workflow state.
+- Age derivation is tested per class against the audit trail (§3): a Signal
+  and a Handoff whose creating audit events sit at known times promote at the
+  threshold and not before. This is the mechanism that replaced the
+  escalation ladder, so it carries the ladder's test burden.
 
 ## Alternatives considered
 
