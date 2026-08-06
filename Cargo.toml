@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["abacus-core", "abacus-runtime", "abacus-state", "abacus-work"]
+members = [
+    "abacus-core",
+    "abacus-runtime",
+    "abacus-state",
+    "abacus-usecase-journeys",
+    "abacus-work",
+]
 
 # abacus-cli joins the workspace when its phase opens
 # (docs/migration.md, Phase 5).

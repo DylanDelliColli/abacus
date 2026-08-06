@@ -34,6 +34,8 @@ Global configuration on this machine leaks legacy SABLE machinery into this repo
 - Test-budget growth and new cross-module dependencies are ADR-level events, not conveniences.
 - Providers are pinned and checksummed (`docs/compatibility/` records; `.abacus/providers.lock.toml` once created). Never fork, vendor, or casually upgrade a provider.
 
+**Ceremony budget (the trap that killed the predecessor).** Design, review, and doctrine rounds are subject to the same law as any other work: each must gate a named deliverable, and "good enough to keep the build honest" is the bar. Meta-work is maximally seductive to capable agents — governance feels like the highest-leverage work available, reviews of governance feel rigorous, and both are infinitely extensible. Watch the ratio in your own session: **if recent activity is mostly review letters, schema debate, and bead prose while the shipped-code count has not moved, you are the pane that needs the redirect.** When a design round exceeds roughly three exchanges without landing code, freeze the design where it stands, record what it found as explicit debt on its bead, and go build the nearest real deliverable — an unresolved question that blocks nothing today is debt, not a blocker. Keep the reviews that catch defects; kill the rounds that only deepen the apparatus.
+
 ## Working agreement
 
 - Two agent lineages (Claude and Codex sessions) build and adversarially cross-review each other. Never edit a file the other is actively drafting; resolve material disagreements in the documents before writing code.

@@ -1,0 +1,19 @@
+[package]
+name = "abacus-usecase-journeys"
+version.workspace = true
+edition.workspace = true
+# Test-only leaf (ABACUS-3ju). Never published, never a dependency of any
+# production crate: the edge direction is inward only, so the production
+# module graph stays acyclic and gains no lateral edge.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+# No production surface: the crate exists to hold journey tests.
+doctest = false
+
+[dev-dependencies]
+abacus-core = { path = "../abacus-core" }
+abacus-work = { path = "../abacus-work" }
+abacus-state = { path = "../abacus-state" }
+abacus-runtime = { path = "../abacus-runtime" }
