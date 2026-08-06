@@ -18,6 +18,7 @@ pub mod contract;
 pub mod facade;
 pub mod fake;
 pub mod herdr;
+pub mod target;
 
 pub use adapter::{
     RawRunError, RawSessionIdentity, RawStartupDelivery, RawStatus, RuntimeProvider,
@@ -25,3 +26,4 @@ pub use adapter::{
 pub use facade::RuntimeFacade;
 pub use fake::{FakeFailure, FakeRuntimePeer};
 pub use herdr::{CommandError, CommandOutput, CommandRunner, HerdrPin, HerdrProvider};
+pub use target::{AgentSnapshot, TargetRefusal, resolve_target};
