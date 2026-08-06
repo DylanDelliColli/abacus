@@ -26,6 +26,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "abacus-usecase-journeys"
+version = "0.0.1"
+dependencies = [
+ "abacus-core",
+ "abacus-runtime",
+ "abacus-state",
+ "abacus-work",
+]
+
+[[package]]
 name = "abacus-work"
 version = "0.0.1"
 dependencies = [
