@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 5 — second cross-review returned four findings on revision 4; three resolved here, the fourth escalated to the operator as a scope decision that blocks acceptance (see "Open question"). Awaiting that decision, then re-review and sign-off.
+- **Status:** Proposed, revision 6 — cross-review PASS on all structural findings; operator ratified the Directive scope narrowing on 2026-08-06 and it is folded through the table, validation, backlog, and normative set. Awaiting final narrow re-review, then sign-off.
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
@@ -283,7 +283,9 @@ an observer into a decider.
 ### 6. Delivery outcomes are returned, never persisted
 
 The ring pass takes the gathered `AttentionFacts`, calls a content-free
-doorbell for each worker-audience obligation, and returns every normalized
+doorbell for each **named-actor** obligation — the audience may be an
+orchestrator as readily as a worker, since Reports and Handoffs name deciding
+actors — and returns every normalized
 outcome — submitted, not delivered, or ambiguous — **in the run's report**.
 Nothing about delivery is written anywhere.
 
@@ -336,7 +338,7 @@ this shape:
 | Required proof | How it holds |
 |---|---|
 | Crash after **Report or Request** commit, before ring, recovers on restart | No ring state exists to lose; the next run recomputes from the Ledger |
-| Crash after **Directive** commit, before ring — **OPEN, operator decision required** | **Not by this module.** With no standing Directive obligation the next run derives nothing. Recovery instead rides `FencedResponse.binding_directives`, which every fenced call *including lease renewal* returns — so an alive worker recovers within one renewal interval, by itself. That is a real bound, not a next-tick guarantee. `ABACUS-IKQ` names the crash-window proof non-negotiable, so narrowing it is a scope change requiring ratification, not an authorial call. See the open question below |
+| Crash after **Directive** commit, before ring — **narrowed by operator ratification, 2026-08-06** | **Not by this module, by design.** With no standing Directive obligation the next run derives nothing. Recovery rides `FencedResponse.binding_directives`, which every fenced call *including lease renewal* returns, so an alive worker recovers within one renewal interval by itself. A bounded self-service recovery, explicitly **not** a next-tick guarantee. The operator ratified this narrowing with its cost stated; see the resolved scope decision below |
 | Duplicate and ambiguous deliveries are harmless, and a later tick reconciles afresh | The derivation is idempotent and the nudge is content-free. A duplicate nudge is **not** literally a no-op — it can prompt an agent to act again, and that action can produce a distinct Report. The honest claim is narrower: the nudge carries no authority, and any action it provokes still passes the ordinary fencing and idempotency gates that guard every worker write |
 | Stale generations never target the wrong Attempt | The runtime seam is generation-fenced and already returns `HandleStale` |
 | Herdr or service outage catches up | The next run recomputes; nothing was queued to be lost |
@@ -381,13 +383,26 @@ Costs, stated honestly:
 - Actor-to-handle resolution (§5) is tested for its missing and ambiguous
   cases, not only the happy one: an obligation whose audience has no
   resolvable live activation is surfaced to the operator, never dropped.
+- **A Directive produces no obligation**, asserted directly rather than left
+  implicit in the absence of a test. A committed, undischarged binding
+  Directive on an Active Attempt yields an empty report from this module. That
+  case pins the operator's ratified narrowing so a later reader cannot mistake
+  the gap for a bug and quietly "fix" it back into scope.
 
-## Open question for the operator (blocks acceptance)
+## Resolved scope decision: Directives (operator, 2026-08-06)
+
+**The operator ratified the narrower scope (option 1 below).** Directives get
+the commit-time doorbell and the renewal-carried binding set; the attention
+service adds nothing for them; and the crash-window proof `ABACUS-IKQ` calls
+non-negotiable is **formally narrowed to Reports and Requests**. The record of
+the choice and its cost follows, because a narrowed promise that is not
+written down is a promise quietly broken.
 
 §5 removes the Directive obligation class on the grounds that existing
 mechanisms cover it. Cross-review accepted the lease path as an honest
 liveness bound but rejected it as a silent substitute for the crash-window
-proof `ABACUS-IKQ` calls non-negotiable, and that objection stands.
+proof, and that objection stood — which is what made this the operator's
+decision rather than the author's.
 
 One correction to how both this ADR and that review characterized the fallback,
 because it changes the size of the gap rather than the principle. Both said
@@ -407,22 +422,34 @@ between renewals, in the window where a ring was lost or a crash landed between
 commit and ring. It is not zero, and it is not the same as a next-tick
 guarantee.
 
-The operator chooses one:
+The options were:
 
-1. **Ratify the narrower scope.** Directives get the commit-time doorbell plus
-   the renewal-carried binding set, and the crash-window proof is explicitly
-   narrowed to Reports and Requests. Cheapest, ships nothing new, and accepts
+1. **Ratify the narrower scope — CHOSEN.** Directives get the commit-time
+   doorbell plus the renewal-carried binding set, and the crash-window proof is
+   explicitly narrowed to Reports and Requests. Ships nothing new, and accepts
    that a lost Directive ring costs at most one lease-renewal interval of an
    alive worker's time — recovered by the worker itself, not by the operator.
 2. **Add a binding-Directive attention read.** A fourth read-only query
-   surfaces Active Attempts carrying undischarged binding Directives, and the
-   proof holds for all three Signal types. This is not free: "binding" includes
-   Pause, and a legitimately paused worker must not ring every tick forever, so
-   the query needs a defensible rule for which binding Directives constitute an
-   unmet obligation versus a steady state. That rule is the real cost.
+   surfacing Active Attempts with undischarged binding Directives, holding the
+   proof for all three Signal types. Not free: "binding" includes Pause, and a
+   legitimately paused worker must not ring every tick forever, so the query
+   needs a defensible rule for which binding Directives constitute an unmet
+   obligation versus a steady state. That rule, not the query, was the cost.
 
-This ADR cannot be accepted until one is chosen, because option 1 changes what
-the epic promised and option 2 changes what this document specifies.
+**What the operator accepted, stated so no later reader mistakes it for an
+oversight:** there is no next-tick guarantee for Directives. If a ring is lost
+or a crash lands between commit and ring, an alive worker recovers at its next
+lease renewal and no sooner. The reason this was judged sufficient is that the
+recovery is self-service and bounded — it reaches the worker directly rather
+than paging a human — and the failure it does not cover, a worker that has
+stopped renewing entirely, is already an obligation class aimed at the right
+target. Option 2 was declined because its cost was a policy rule about which
+standing instructions count as unmet, and rules of exactly that shape are what
+accreted into the predecessor system's ceremony.
+
+If operating experience shows the renewal interval is too coarse in practice,
+option 2 remains available and this section is its starting point. Reopening it
+is an amendment with evidence, not a redesign.
 
 ## Normative amendments this ADR requires on acceptance
 
