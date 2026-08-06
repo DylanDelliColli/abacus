@@ -407,16 +407,15 @@ decision rather than the author's.
 One correction to how both this ADR and that review characterized the fallback,
 because it changes the size of the gap rather than the principle. Both said
 recovery waits on "the worker's next fenced call — which never comes if the
-worker is idle." That is wrong. `renew_lease` returns a `FencedResponse`, and
-every `FencedResponse` carries `binding_directives`. **A worker that stays
-alive must renew its lease, and every renewal hands it the current binding
-Directives.** So an idle-but-alive worker learns of a lost Directive at its
-next renewal — bounded by the renewal interval, not by lease expiry — and it
-learns directly, not via the operator.
+worker is idle." That is incomplete. `renew_lease` returns a `FencedResponse`,
+and every `FencedResponse` carries `binding_directives`, so **a responsive
+worker that continues to renew successfully is handed the current binding
+Directives on its next renewal** — directly, and without an operator in the
+loop.
 
-**That bound holds only for a worker that keeps renewing successfully, and
-revision 6 wrongly stated it as though it covered every live worker.** Renewal
-delivers binding Directives only if the worker actually invokes renewal. A
+**That covers responsive workers only, and revision 6 wrongly generalized it to
+every live worker.** Renewal delivers binding Directives only if the worker
+actually invokes renewal; being alive does not imply renewing. A
 worker that is alive but hung, starved, or stalled invokes nothing, sees
 nothing, and crosses expiry without ever learning of the Directive. Revision 6
 also asserted that "a worker that stops renewing has genuinely stopped," which
