@@ -1,5 +1,45 @@
 # ABACUS build notes
 
+## 2026-08-06 — caller identity locked, and the ceremony budget (operator decisions)
+
+Two operator decisions worth reading before touching the state seam or
+starting a design round. Both came from operator challenges, not from either
+agent lineage.
+
+**Caller identity: locked, and much smaller than revision 5.** Worker calls
+carry a non-secret Attempt locator that ABACUS's launch composition writes into
+that exact launch, plus the fencing token and operation id. Scribe resolves
+authority from durable Assignment state. **A caller says WHICH ATTEMPT it is
+acting for; it never says WHAT AUTHORITY it has** — that single distinction is
+the choke point, and it closes SABLE's contamination class (distributed
+resolvers each interpreting identity differently, one ignoring the worker
+marker) without any secret existing. Decision verbs move to a separate
+authenticated surface, made unreachable from the worker surface by a type split
+rather than a routing rule. All worker credential machinery is removed. Same-uid
+forgery is an explicitly accepted non-goal, stated rather than engineered
+around. Full shape and rejected alternatives: `ABACUS-719`; the binding text is
+ADR-0003 revision 6.
+
+Five credential designs were rejected before this one — context-held secrets,
+credential files, implicit slots, process-ancestry identity, and terminal/pane
+derivation. The last was the operator's own proposal and is the closest to
+returning: it fails today only because the Codex relay opens an inner PTY that
+is not the Herdr pane (evidence and source lines in `ABACUS-719`), and it is
+recorded as reopenable additive hardening, never as a fallback.
+
+**The ceremony budget** (`AGENTS.md`, Change discipline). Design, review, and
+doctrine rounds gate a named deliverable like any other work. The worked
+example is this session: the credential thread consumed ten design rounds, five
+rejected shapes, and two external consultations while producing **zero committed
+code**, and the hermetic vertical journey — the deliverable that would prove the
+machine composes at all — sat unstarted the entire time. The operator named it;
+the rule exists so the next session catches it earlier. Keep the reviews that
+catch defects; kill the rounds that only deepen the apparatus.
+
+That journey, once actually built, found two real defects (`ABACUS-gf6`,
+`ABACUS-8tu`) and corrected two imagined sequences in its first hour. Both
+lineages had reviewed the underlying code and missed all four.
+
 ## 2026-08-05 — external adversarial review adoptions (operator-ratified)
 
 Two rounds of adversarial review from the legacy SABLE repository assessed the ABACUS build; the operator ratified all four resulting proposals, with the reviewer's second-round guardrails incorporated. Records landed alongside this entry:
