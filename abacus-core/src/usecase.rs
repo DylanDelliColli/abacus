@@ -565,11 +565,30 @@ where
     })
 }
 
+/// Why a launch was refused BEFORE the Envelope was persisted or any
+/// provider was contacted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchRefusal {
+    /// The Assignment opening's mark-in-progress projection has not been
+    /// confirmed. Launching here is the causal path by which a defer
+    /// race or provider failure produces an active worker while the
+    /// work graph never recorded the work as started (ABACUS-jpd).
+    /// `Unresolved` is recoverable state, not permission to proceed.
+    ProjectionUnconfirmed { operation: OperationId },
+    /// A worker Attempt was launched without naming the Assignment
+    /// opening whose projection gates it. Omission is a REFUSAL rather
+    /// than a bypass: a gate a caller can skip by forgetting is not a
+    /// gate.
+    MissingWorkerOpening,
+}
+
 /// Outcome of the launch sequence (architecture §3.3–3.5): Envelope
 /// persisted, launch attempted, handle associated. Every compensation
 /// is an explicit returned outcome, never a hidden retry (I12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSequenceOutcome {
+    /// Refused before any durable write or provider contact.
+    Refused { reason: LaunchRefusal },
     /// The session is live and its handle is durably associated. The
     /// caller must still read `launched.startup_delivery`: a live,
     /// bound session whose startup material definitely or possibly
@@ -612,6 +631,7 @@ pub fn launch_subject<S, R>(
     runtime: &R,
     spec: &LaunchSpec,
     secret: EphemeralLaunchSecret,
+    worker_opening: Option<&OperationId>,
     persist_operation: &OperationId,
     bind_operation: &OperationId,
 ) -> Result<LaunchSequenceOutcome, StateError>
@@ -619,6 +639,33 @@ where
     S: WorkflowStatePort + ?Sized,
     R: RuntimePort + ?Sized,
 {
+    // A worker may not run against work the graph never confirmed as
+    // started. Checked FIRST, before the Envelope is persisted and long
+    // before any provider contact: an unconfirmed projection means a
+    // defer race or provider failure could otherwise produce an active
+    // worker while `br` still shows the bead unstarted (ABACUS-jpd).
+    if matches!(spec.subject, LaunchSubject::WorkerAttempt { .. }) {
+        let Some(opening) = worker_opening else {
+            return Ok(LaunchSequenceOutcome::Refused {
+                reason: LaunchRefusal::MissingWorkerOpening,
+            });
+        };
+        // Still in the actionable pending set means no receipt exists:
+        // the projection is unresolved, which is recoverable state, not
+        // permission to launch.
+        if state
+            .pending_applications()?
+            .iter()
+            .any(|pending| pending.operation == *opening)
+        {
+            return Ok(LaunchSequenceOutcome::Refused {
+                reason: LaunchRefusal::ProjectionUnconfirmed {
+                    operation: opening.clone(),
+                },
+            });
+        }
+    }
+
     state.persist_envelope(persist_operation, &spec.subject, &spec.envelope)?;
 
     let attempt = match runtime.launch(spec, secret) {
@@ -2254,6 +2301,113 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_launch_is_refused_while_its_opening_projection_is_unconfirmed() {
+        let state = RecordingState::default();
+        // The opening committed but its mark-in-progress never
+        // confirmed - it is still in the actionable pending set.
+        state.pending.borrow_mut().push(PendingApplication {
+            operation: op("op-assign"),
+            projection: WorkProjection::MarkInProgress,
+            ..pending_close()
+        });
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            Some(&op("op-assign")),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("the refusal is in-band");
+
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::Refused {
+                reason: LaunchRefusal::ProjectionUnconfirmed {
+                    operation: op("op-assign")
+                }
+            },
+            "an unresolved projection is recoverable state, NOT permission \
+             to run a worker against unconfirmed work"
+        );
+        assert!(
+            state.envelopes.borrow().is_empty(),
+            "refused before any durable write"
+        );
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "and long before any provider contact"
+        );
+        assert!(state.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_worker_launch_without_its_opening_is_refused_not_waved_through() {
+        let state = RecordingState::default();
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+
+        // Omitting the gating operation must not SKIP the gate. A gate a
+        // caller can bypass by forgetting is not a gate.
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            None,
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("the refusal is in-band");
+
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::Refused {
+                reason: LaunchRefusal::MissingWorkerOpening
+            }
+        );
+        assert!(runtime.launches.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_projection_permits_the_worker_launch() {
+        let state = RecordingState::default();
+        // Nothing pending: the opening's projection earned its receipt.
+        let runtime = ScriptedRuntime::new(
+            Ok(LaunchAttempt::Launched(launched_outcome())),
+            Rc::clone(&state.events),
+        );
+
+        let outcome = launch_subject(
+            &state,
+            &runtime,
+            &launch_spec(),
+            launch_secret(),
+            Some(&op("op-assign")),
+            &op("op-persist"),
+            &op("op-bind"),
+        )
+        .expect("sequence runs");
+
+        assert_eq!(
+            outcome,
+            LaunchSequenceOutcome::Launched {
+                launched: launched_outcome(),
+                bound: StateApplied::Applied,
+            },
+            "a confirmed projection is the permission to launch"
+        );
+    }
+
+    #[test]
     fn a_launch_persists_the_envelope_before_any_provider_interaction() {
         let state = RecordingState::default();
         let runtime = ScriptedRuntime::new(
@@ -2266,6 +2420,7 @@ mod tests {
             &runtime,
             &launch_spec(),
             launch_secret(),
+            Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
         )
@@ -2312,6 +2467,7 @@ mod tests {
             &runtime,
             &launch_spec(),
             launch_secret(),
+            Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
         );
@@ -2339,6 +2495,7 @@ mod tests {
             &runtime,
             &launch_spec(),
             launch_secret(),
+            Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
         )
@@ -2367,6 +2524,7 @@ mod tests {
             &runtime,
             &launch_spec(),
             launch_secret(),
+            Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
         )
@@ -2399,6 +2557,7 @@ mod tests {
             &runtime,
             &launch_spec(),
             launch_secret(),
+            Some(&op("op-assign")),
             &op("op-persist"),
             &op("op-bind"),
         )
