@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 8 — Codex cross-review PASS at revision 7; **external SABLE review then returned four blockers and three corrections, all accepted and repaired here.** That review upheld all three cuts (fixed tick over persisted backoff, run-local outcomes over a delivery store, stateless age over a ladder) and found instead that the *delivery* path could run correctly while waking nobody. Awaiting SABLE re-review, then operator sign-off. One residual question is explicitly left to the operator (§5, unresolvable-audience sink).
+- **Status:** Proposed, revision 9 — SABLE re-review of revision 8 found the repairs architecturally right but the document **split-brain**: repaired sections coexisted with live revision-7 requirements, and the implementation beads still specified the superseded design. Revision 9 removes that drift and closes the Directive discovery gap. **Every sentence below is current contract unless explicitly labelled historical.** Awaiting SABLE re-review, then operator sign-off. One decision is open (§5, the unresolvable-audience sink; SABLE recommends an explicit sink if the broad liveness-floor claim is retained).
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
@@ -134,9 +134,10 @@ crosses a policy threshold the obligation is marked **aged** in the report and
 `(record_timestamp, now, policy)`. No ladder, no stored stage, nothing to get
 out of sync.
 
-Revisions 1–7 said an aged obligation was "classed for the operator instead of"
-its named actor, and external review established that this inverted the
-feature. §5 makes operator-class obligations report-only and §6 rings only
+*(Historical, retained because the defect class is instructive.)* Revisions 1–7
+said an aged obligation was "classed for the operator instead of" its named
+actor, and external review established that this inverted the feature. Those
+revisions made operator-class obligations report-only and rang only
 named-actor obligations, so crossing the threshold moved an obligation from
 ringable to unringable: **more urgency produced less attention.** It also
 falsified the Consequences row promising that unresolved state keeps re-ringing,
@@ -237,9 +238,9 @@ is data on the obligation rather than branching in the ringer.
 
 | Condition | Defined by | Audience | Query |
 |---|---|---|---|
-| Unresolved Report | no linked responding action | the owning Assignment's decision actor; operator once aged | `unresolved_signals(None)`, exists |
-| Unresolved Request | no linked responding action | the named recipient actor; operator once aged | `unresolved_signals(None)`, exists |
-| Pending Handoff | the Attempt is currently `Submitted` | the deciding actor; operator once aged | `pending_handoffs()`, **new** |
+| Unresolved Report | no linked responding action | the owning Assignment's decision actor (aged marks severity, never reroutes) | `unresolved_signals(None)`, exists |
+| Unresolved Request | no linked responding action | the named recipient actor (aged marks severity, never reroutes) | `unresolved_signals(None)`, exists |
+| Pending Handoff | the Attempt is currently `Submitted` | the deciding actor (aged marks severity, never reroutes) | `pending_handoffs()`, **new** |
 | Reclaimable lease | the Attempt is currently `Active` **and** `now > expires_at` | the owning Assignment's `decision_actor` | `reclaimable_leases(now)`, **new** |
 
 **Directives produce no standing obligation, and this is deliberate.**
@@ -385,9 +386,20 @@ Two repairs are required, and both are **C3**:
 2. **One deterministic recipient-side discovery path.** The wake must point at a
    single facade command returning *every* obligation class owed to the caller —
    unresolved Reports and Requests, pending Handoffs awaiting the caller's
-   decision, and reclaimable leases on Assignments the caller decides for. A
-   recipient must never be told to look somewhere that structurally cannot hold
-   the thing that woke it.
+   decision, reclaimable leases on Assignments the caller decides for, **and,
+   for a worker caller, that Attempt's current binding Directives.** A recipient
+   must never be told to look somewhere that structurally cannot hold the thing
+   that woke it.
+
+   That last clause is what makes the Directive narrowing honest, and revision 8
+   still omitted it. §5 keeps Directives out of the *recurring attention
+   derivation* — that stands, and no fourth standing query is added. But the
+   commit-time bell exists precisely to shorten Directive latency, so the
+   command that bell names must surface the Directive that caused it. Otherwise
+   the same defect survives under a better string: a generic wake pointing at a
+   set that cannot contain the cause. The binding set is already computed for
+   every fenced response, so this is inclusion in a discovery view, not a new
+   derivation.
 
 This ADR does not assume an agent will helpfully run some other command after
 being told to query unresolved. If the wake and the discovery path disagree,
@@ -425,10 +437,10 @@ the module never consults a prior outcome to decide anything.
 
 ### 7. Accepted v1 non-goals
 
-- No external notification channel, and no operator ringing at all (§5).
-  Operator-class obligations appear in the run's report and nowhere else. If
-  the operator is not reading runs, nothing reaches them; that is a known
-  limit of v1 rather than an oversight.
+- No external notification channel — no email, SMS, or push. Every obligation
+  class rings a named actor (§5); the only obligations that reach no one are
+  those whose audience resolves to zero or to many live activations, and §5
+  leaves the sink for that residual to the operator.
 - No auto-launch, auto-reclaim, or any other automated recovery (§2).
 - No worker-side acknowledgement of any kind (I19).
 - No scheduling or work distribution (§5).
@@ -464,7 +476,7 @@ extra rings are costly, that is the moment to revisit — not now.
 | Required proof | How it holds |
 |---|---|
 | Crash after **Report or Request** commit, before ring, recovers on restart | No ring state exists to lose; the next run recomputes from the Ledger |
-| Crash after **Directive** commit, before ring — **narrowed by operator ratification, 2026-08-06, confirmed against the corrected cost** | **Not by this module, by design.** With no standing Directive obligation the next run derives nothing. A worker that keeps renewing successfully recovers at its next renewal via `FencedResponse.binding_directives`, bounded by its renewal cadence. A worker that is alive but **not** renewing — hung, starved, stalled — recovers not at all: it crosses expiry into a reclaimable-lease obligation that, being operator-class, is report-only and rings nobody, and the Directive is never self-delivered. Explicitly not a next-tick guarantee and, in the second case, not a bounded one |
+| Crash after **Directive** commit, before ring — **narrowed by operator ratification, 2026-08-06** | **Not by the recurring derivation, by design** (§5 adds no standing Directive obligation). Three legs now complete instead of one: the commit-time wake points at a discovery path that **includes the caller's binding Directives** (§6); a worker that keeps renewing receives them on its next renewal via `FencedResponse.binding_directives`; and if it stops renewing, expiry rings the **Assignment's decision actor**, who is authorized to Reclaim. The Directive is still not re-delivered to a dead worker — nothing can do that — but no leg now terminates in a report nobody reads. Explicitly still not a next-tick guarantee |
 | Duplicate and ambiguous deliveries are harmless, and a later tick reconciles afresh | The derivation is idempotent and the nudge is content-free. A duplicate nudge is **not** literally a no-op — it can prompt an agent to act again, and that action can produce a distinct Report. The honest claim is narrower: the nudge carries no authority, and any action it provokes still passes the ordinary fencing and idempotency gates that guard every worker write |
 | Stale generations never target the wrong Attempt | The runtime seam is generation-fenced and already returns `HandleStale` |
 | Herdr or service outage catches up | The next run recomputes; nothing was queued to be lost. Catch-up **rings**, rather than merely printing, because age no longer converts an obligation into a report (§3) |
@@ -477,7 +489,7 @@ Costs, stated honestly:
   condition clears. The nudge is content-free and the worker is stuck, so
   the noise is judged acceptable; if it proves otherwise, §3 is the thing to
   revisit, and doing so means accepting durable state we do not have today.
-- Escalation is bounded by the operator's presence (§7).
+- Escalation adds severity to an existing ring; it never reroutes one (§3).
 - The `abacus-cli` crate is contract-only today, so the command in §4 lands
   when the CLI does. The derivation does not wait on it.
 
@@ -485,7 +497,9 @@ Costs, stated honestly:
 
 - The derivation is unit-tested against fabricated state with no I/O: each
   obligation class derives when owed, does not derive when resolved, and is
-  promoted to operator-class exactly at the policy threshold.
+  marked aged exactly at the policy threshold while still naming the same
+  actor.
+
 - An integration test drives real composition — real state, fake runtime
   peer — and asserts the full run: obligations derived, doorbells attempted,
   outcomes returned, and **zero durable writes of any kind** (§2, §6). That
@@ -502,10 +516,10 @@ Costs, stated honestly:
   report, and the second run's doorbells change no workflow state.
 - Age derivation is tested per class against the audit trail (§3), including
   that a Report's age is read from `AuditClass::Report` and a Request's from
-  `AuditClass::Signal`. Promotion happens at the threshold and not before.
-  This mechanism replaced the escalation ladder, so it carries the ladder's
-  test burden — and a class-mismatch bug here silently disables promotion
-  rather than failing loudly, which is why it is tested per class.
+  `AuditClass::Signal`. The aged marker appears at the threshold and not
+  before. This mechanism replaced the escalation ladder, so it carries the
+  ladder's test burden — and a class-mismatch bug here silently disables the
+  marker rather than failing loudly, which is why it is tested per class.
 - Actor-to-handle resolution (§5) is tested for its missing and ambiguous
   cases, not only the happy one: an obligation whose audience has no
   resolvable live activation is reported, never dropped. **Regression case:** an
@@ -573,16 +587,18 @@ The honest exposure has two cases, not one:
 
 - **A continuously renewing worker** recovers at its next *successful* renewal,
   bounded by its renewal cadence, and recovers by itself.
-- **A live non-renewing worker** does not recover at all. It crosses strict
-  expiry, becomes a reclaimable-lease obligation, and — because §5 makes
-  operator-class obligations **report-only** — that obligation rings nobody. It
-  waits in a run report until the operator reads it and takes a fenced
-  decision. Nothing bounds that interval, and the Directive is never
-  self-delivered.
+- **A live non-renewing worker** does not recover by itself. It crosses strict
+  expiry and becomes a reclaimable-lease obligation which — since revision 9 —
+  **rings the Assignment's decision actor**, the one actor authorized to
+  Reclaim. The Directive is still never delivered to that worker; nothing can
+  deliver to a session that has stopped calling. What changed is that the
+  condition now reaches a named, authorized, live audience instead of a report.
 
-The second case is strictly worse than revision 6 described, and it is worse
-than it would have been before §5 removed operator ringing — an interaction
-between two separately reasonable choices that no single section made visible.
+Revisions 6–8 described that second case as terminating in a report nobody
+reads, which was true of the design at the time and was strictly worse than
+revision 6 admitted — an interaction between two separately reasonable choices
+that no single section made visible. External review closed it by observing
+that the authorized audience was already recorded on the Assignment.
 
 The options were:
 
@@ -603,12 +619,12 @@ The options were:
    obligation versus a steady state. That rule, not the query, was the cost.
 
 **What the narrowing actually costs, stated so no later reader mistakes it for
-an oversight:** there is no next-tick guarantee for Directives, and for one
-class of worker there is no guarantee at all. A worker that keeps renewing
-recovers by itself at its next renewal. A worker that is alive but not renewing
-never sees the Directive, and its expiry produces a report-only operator
-obligation that rings nobody — recovery then waits on a human reading a run
-report and issuing a fenced decision.
+an oversight:** there is no next-tick guarantee for Directives. A worker that
+keeps renewing recovers by itself at its next renewal, and the commit-time wake
+points at a discovery path that includes binding Directives. A worker that is
+alive but not renewing never sees the Directive at all — but its expiry now
+rings the Assignment's decision actor rather than filing a report, so the
+condition reaches someone authorized to act on it.
 
 Option 2 was declined because its cost was a policy rule about which standing
 instructions count as unmet versus a legitimate steady state, and rules of
@@ -637,8 +653,8 @@ is an amendment with evidence, not a redesign.
 
 This ADR is the authorized I12 crossing, but authorization does not let the
 binding documents keep asserting the opposite of what ships. Two statements in
-CONTEXT become false the moment fixed-cadence re-ringing with age promotion
-exists, and both must be amended **in the accepting commit**, not afterwards:
+CONTEXT become false the moment fixed-cadence re-ringing with additive age
+severity exists, and both must be amended **in the accepting commit**, not afterwards:
 
 - **I6** currently states that v1 "deliberately has no durable mail, inbox,
   acknowledgement, or delivery-retry machinery." Re-ringing on a cadence is
@@ -647,8 +663,9 @@ exists, and both must be amended **in the accepting commit**, not afterwards:
   queue — while naming this module's content-free, stateless re-ring as the
   authorized exception, with the I12 boundary reading as its warrant.
 - **The failure table** states that an unresolved Signal whose recipient is
-  inactive gets "no escalation machinery." Age promotion to operator-class is
-  escalation, deliberately bounded and stateless. The row must say so.
+  inactive gets "no escalation machinery." Marking an obligation aged while
+  continuing to ring its named actor is escalation - deliberately bounded,
+  stateless, and ADDITIVE rather than a reroute. The row must say so.
 
 A third gap is **pre-existing** and this ADR merely surfaces it, but it must be
 closed in the same commit because §5 now depends on it. CONTEXT line 37 and
