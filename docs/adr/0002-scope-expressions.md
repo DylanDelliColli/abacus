@@ -1,9 +1,22 @@
 # ADR-0002: Scope expressions — a label-selector algebra over declared keys
 
-- **Status:** **Accepted** (2026-08-04) — operator sign-off as named decider, following the formal Codex C2 cross-review pass at revision 4 with no remaining blockers. Resolves ADR-0001 open question 3. Revised same day for Codex C2 findings 1–6: provider label encoding (Decision §1), check-class taxonomy including worker fan-in (§3), selector satisfiability and canonical serialization (§2), subject projection and containment (§5), actor-unique routing and grant drift (§7), and lifecycle-bundle coherence (§8). Revision 3 for re-review findings A–E: singleton occupancy restricted to exclusive-grant profiles (§7), actor subjects removed in favor of recipient addressing plus the `*`-only rule for non-work-scoped targets (§5), the attempt-lifecycle bundle (§8), provider label-length and expression-size bounds (§1/§2), and work-close application authority (§8).
+- **Status:** **Partially superseded** (2026-08-07) by ADR-0006. The pinned
+  `br` label constraints and normalized `ScopeMap` adapter contract remain
+  valid provider/domain facts. Capability grants, check classes, exclusive
+  scope enforcement, profile occupancy/activation, grant drift, routing as
+  authorization, and Scribe write-time checks are withdrawn from the v1
+  target pending the necessity round.
 - **Date:** 2026-08-04
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
-- **Companions:** `CONTEXT.md` I16/I17 (policy, normative), ADR-0001 Decision §7 (profiles), `abacus-core/README.md` (grant/scope semantics ownership), `docs/architecture.md` §profiles (amended with this ADR), bead `ABACUS-XB0`
+- **Companions:** current `CONTEXT.md` I9/I16/I17, ADR-0006,
+  `abacus-work/README.md`, and bead `ABACUS-XB0`
+
+> **Supersession boundary.** Sections below are retained as design history and
+> as evidence for the provider-compatible `key:value` normalization already
+> consumed by `abacus-work`. They no longer authorize building a runtime
+> capability/scope system. `ScopeMap` does not fall merely because
+> authorization does: it also normalizes work-provider labels. Any broader
+> retention must be justified in ADR-0006's necessity round.
 
 ## Context
 

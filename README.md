@@ -4,7 +4,9 @@
 
 ABACUS is being built beside legacy SABLE, not as a rename or in-place rewrite. It extracts the durable product idea—role-guided, bead-led execution—and leaves behind infrastructure that made small changes expensive and system behavior difficult to reason about.
 
-> **Status:** architecture and contracts are being established. No production binary exists yet.
+> **Status:** library contracts and hermetic journeys exist; no production
+> `abacus` binary or live end-to-end loop exists yet. ADR-0006 reset the store
+> architecture before that first executable.
 
 ## What ABACUS is
 
@@ -28,7 +30,7 @@ Pushes, pull requests, merges, deployments, CI optimization, and universal TDD e
 ABACUS is designed around four constraints:
 
 1. **The work graph leads.** Beads hold planned work and dependencies; runtime panes do not become the source of truth.
-2. **Infrastructure is replaceable.** `br`, `bv`, Herdr, SQLite, Git, and agent providers meet ABACUS at narrow, normalized seams.
+2. **Infrastructure is replaceable.** Stock `br`, `bv`, Herdr, Git, and agent providers meet ABACUS at narrow, normalized seams. ABACUS does not add a second state substrate beside `br`.
 3. **ABACUS will change.** Each module hides substantial behavior behind a small, stable interface and owns its implementation, fixtures, and tests. Internal changes should remain internal.
 4. **The blast radius matches the interface change.** Module dependencies are acyclic, provider types do not leak, and tests follow direct dependencies. Full-system and live-provider validation is reserved for changes that actually cross those seams.
 
@@ -41,8 +43,8 @@ Each capability is a separate top-level Rust crate so it can be maintained and t
 | Module | Responsibility |
 | --- | --- |
 | [`abacus-core`](abacus-core/README.md) | Provider-neutral domain types, invariants, transitions, and use-case ports |
-| [`abacus-state`](abacus-state/README.md) | Scribe, the local service that owns Ledger writes for assignments, leases, typed coordination Signals, evidence, decisions, and audit history |
-| [`abacus-work`](abacus-work/README.md) | Normalized work-graph interface, `br` mutation adapter, optional `bv` advice |
+| [`abacus-state`](abacus-state/README.md) | Transitional pre-ADR-0006 implementation; no new contract. Removed or narrowed with the stock-`br` facade after the necessity round |
+| [`abacus-work`](abacus-work/README.md) | Normalized interface over the one shared stock-`br` work/workflow store, plus optional `bv` advice |
 | [`abacus-runtime`](abacus-runtime/README.md) | Normalized agent runtime interface and Herdr adapter |
 | [`abacus-cli`](abacus-cli/README.md) | `abacus`/`abx` commands, configuration, host discovery, and dependency composition |
 
@@ -73,17 +75,17 @@ ABACUS starts with pinned upstream releases, not forks. A fork becomes reasonabl
 
 ## State ownership
 
-There are three intentionally distinct kinds of state:
+There are two provider-owned state families:
 
 | State | Owner |
 | --- | --- |
-| Work items, dependencies, priority, ready/closed status | `br`, accessed through `abacus-work` |
-| Assignments, attempts, leases, sanitized Envelope snapshots, typed Signals (Directives, Reports, Requests), evidence, Handoff decisions/application attempts and receipts, audit events | ABACUS, persisted in the Ledger through Scribe |
-| Processes, panes, sessions, terminal output, observed agent status | Herdr, accessed through `abacus-runtime` |
+| Work items, dependencies, status, and append-only typed workflow facts | One shared stock-`br` store selected by absolute `BEADS_DIR` |
+| Processes, panes, sessions, terminal output, and observed agent status | Herdr, accessed through `abacus-runtime` |
 
-Herdr owns live agent prompting and messaging. Workflow-critical facts now include immutable, subject-bound Signals in the Ledger: Directives bind worker direction, Reports record worker progress/blockers, and Requests carry orchestrator-to-orchestrator decision asks. Every fenced worker response mechanically surfaces the Attempt's current binding Directives through the Scribe protocol. Herdr carries only transient conversation or a best-effort content-free doorbell after a Signal is durable; Signal bodies never ride prompts. Unresolved work derives from immutable call ordering and missing typed responding actions, never an inbox, `read_at`, per-Directive acknowledgement, delivery retry, or escalation-on-silence state.
-
-ABACUS durable state lives at `<git-common-dir>/abacus/state.sqlite3` in WAL mode. Clients reach it through `$XDG_RUNTIME_DIR/abacus/<repo-id>.sock`; agents do not need direct write access to `.git`.
+Herdr owns transient prompting. Critical instructions, Evidence, Handoffs, and
+decisions remain reconstructible from the shared `br` store; prompts never own
+them. Exact workflow-record encoding is held for the ADR-0006 necessity round.
+There is no second Ledger, Scribe process, state socket, or state RPC.
 
 Repository configuration lives at `.abacus/config.toml`, and environment overrides use the `ABACUS_*` namespace. New ABACUS paths must not use SABLE names.
 
@@ -122,9 +124,16 @@ cd ~/projects/my-app
 abacus init
 ```
 
-The repository does not contain buildable crates yet; this is the agreed onboarding contract for implementation. Releases may provide signed/prebuilt binaries, but they preserve the same `install once -> abacus init per project` model.
+The workspace libraries build today, but `abacus-cli` does not yet provide the
+production executable. This is the target onboarding contract for the first
+runnable slice. Releases may later provide signed/prebuilt binaries while
+preserving the same `install once -> abacus init per project` model.
 
-`abacus init` detects the Git root, remote when present, and likely base branch, then previews the configuration before writing. It creates repository-local `.abacus/` configuration and starter role cards, initializes a fresh `ABACUS-` work graph, asks Scribe to create local repository identity/Ledger state, and runs compatibility diagnostics.
+`abacus init` detects the Git root, remote when present, and likely base branch,
+then previews the configuration before writing. It creates repository-local
+`.abacus/` configuration and starter role cards, initializes a fresh
+`ABACUS-` work graph, records the absolute shared `BEADS_DIR`, and runs
+compatibility diagnostics.
 
 Initialization is idempotent and works without a remote when a base branch can be selected explicitly. It never installs global hooks, edits Claude/Codex homes, commits, pushes, or imports legacy SABLE state.
 
@@ -148,7 +157,7 @@ See [Architecture](docs/architecture.md#test-architecture) for the detailed test
 - Maintaining compatibility with Dolt-based `bd`
 - Recreating tmux pane scripts behind a new command name
 - Installing global agent hooks
-- A remote or multi-tenant Scribe service
+- A second Ledger, Scribe service, state socket, or state RPC
 - A generic mailbox, unread/acknowledgement state machine, or delivery-retry system layered over Herdr
 - Automatic push, PR, merge, or deployment
 - A mandatory testing methodology for downstream repositories
@@ -159,8 +168,8 @@ See [Architecture](docs/architecture.md#test-architecture) for the detailed test
 
 1. Agree on domain language, invariants, seams, and migration exclusions.
 2. Run bounded compatibility spikes against pinned `br`, `bv`, and Herdr versions.
-3. Implement the pure domain and local state protocol.
-4. Implement work and runtime adapters behind fixture-tested contracts.
+3. Run the ADR-0006 necessity review against the smallest runnable loop.
+4. Implement the thin shared-`br` work/workflow facade and the Herdr adapter behind fixture-tested contracts, deleting displaced state machinery in the same stack.
 5. Implement the install/init path and seed project-owned orchestrator/worker cards.
 6. Compose one vertical slice through `abacus`.
 7. Extract optional policy modules only when repeated use demonstrates a real seam.

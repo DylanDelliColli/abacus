@@ -1,5 +1,11 @@
 # Scribe socket sandbox compatibility probe
 
+> **Historical transport evidence.** ADR-0006 superseded Scribe and every
+> state-transport obligation on 2026-08-07. The Linux socket observations,
+> artifact identities, controls, and cleanup remain valid provider evidence;
+> the design conclusions below no longer authorize a socket, relay,
+> credential, or state service.
+
 Date: 2026-08-04  
 Host: Linux x86_64  
 Codex CLI: v0.146.0 (transport probes); v0.146.1 (faithful HPG.5 carriage)\

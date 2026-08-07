@@ -1,5 +1,11 @@
 # `abacus-runtime` module contract
 
+> **ADR-0006 transition (2026-08-07).** Herdr remains the runtime provider.
+> References below to Scribe/Ledger transport are superseded: durable facts use
+> the one shared stock-`br` store, and the necessity round decides whether an
+> Attempt locator or durable runtime association survives. Runtime carries no
+> state secret and never writes a second store.
+
 Status: design contract; no Rust implementation yet
 
 ## Purpose
@@ -13,7 +19,7 @@ Status: design contract; no Rust implementation yet
 - Agent start, live message/prompt delivery, inspect, wait/subscribe, bounded read, signal, and stop behavior
 - Explicit working directory and environment allowlist construction
 - Mapping of Herdr observations into normalized runtime observations
-- Runtime recovery/re-association behavior after process/Scribe restart
+- Runtime recovery/re-association behavior after provider/composition restart
 - Herdr capability/version detection and compatibility fixtures
 - Runtime-provider-specific diagnostics surfaced through `abacus doctor`
 - Namespaced capability descriptors for runtime-owned use cases
@@ -49,10 +55,19 @@ Input is an explicit launch specification containing:
 - executable/argument selection resolved by configuration;
 - absolute working directory;
 - allowlisted environment;
-- the exact canonical sanitized ABACUS Envelope snapshot already persisted through Scribe;
+- the exact canonical sanitized ABACUS Envelope rendered from durable shared-store facts;
 - startup and delivery deadlines.
 
-Output is an opaque, generation-fenced ABACUS runtime handle plus normalized launch facts. Worker launch composition writes the non-secret Attempt locator into the one reserved environment slot immediately before calling `RuntimePort::launch`; callers cannot pre-populate or override that slot. The model need not remember it, and runtime transports it without treating it as authority. The adapter delivers the sanitized Envelope as one startup submission and reports one closed startup-delivery outcome (`Submitted` = one provider API submission accepted, never proof of application; `NotDelivered(reason)` keeps the handle for stop/reconcile; `Ambiguous`). An ambiguous delivery is reconciled or stopped explicitly, never retried automatically. The adapter privately binds the Herdr workspace namespace, pane ID, and terminal/process generation; callers receive none of those provider structures separately. Runtime does not render or mutate the Envelope; persistence and delivery therefore cannot drift.
+Output is an opaque, generation-fenced ABACUS runtime handle plus normalized
+launch facts. The adapter delivers the sanitized Envelope as one startup
+submission and reports one closed startup-delivery outcome (`Submitted` = one
+provider API submission accepted, never proof of application;
+`NotDelivered(reason)` keeps the handle for explicit stop/inspection;
+`Ambiguous`). The adapter privately binds the Herdr workspace namespace, pane
+ID, and terminal/process generation; callers receive none of those provider
+structures separately. Any non-secret workflow correlation placed in a launch
+is chosen by the ADR-0006 necessity round and written by launch composition,
+never treated by runtime as authority.
 
 ### Observe
 
@@ -76,15 +91,21 @@ A watchdog is a normal spawned Herdr-managed agent session. It is not a runtime 
 - reconnect/re-associate a known handle after restart, and recover a possibly-created session after an ambiguous launch from the pre-known `(launch subject, correlation)` pair validated **together** — a correlation alone never rebinds a session to another workflow identity, and the recovered startup-delivery fact is `Ambiguous` unless the adapter holds explicit durable or provider-supplied proof of the startup submission (the provider issues no receipt for it after a lost response);
 - distinguish not found, stale handle, provider unavailable, rejected, timeout, and ambiguous outcomes.
 
-Herdr is the complete live transport. ABACUS does not add a generic inbox, acknowledgement protocol, or delivery-retry layer. A durable Directive, Report, or Request is first committed as a typed Signal through Scribe; Herdr then carries only a bounded doorbell such as “workflow signal available; query unresolved.” Prompt delivery is transient, and its result reports only the runtime operation—it never becomes proof that a Signal was read, resolved, or caused a domain transition.
+Herdr is the complete live transport. ABACUS adds no inbox, acknowledgement,
+delivery queue, or retry layer. A critical instruction is first represented as
+an append-only fact in the shared `br` store; Herdr may then carry transient
+content or a bounded doorbell. Delivery never proves the fact was read or that
+a workflow transition occurred.
 
-Runtime control does not update assignment state directly. The caller records durable workflow results through the state interface.
+Runtime control does not update workflow state directly. Composition records
+durable results through the shared-`br` work/workflow interface.
 
 ## Identity rule
 
 An ABACUS actor/attempt identity and a Herdr runtime handle are different facts.
 
-- Scribe owns the durable association in the Ledger.
+- If the necessity round retains a durable association, the shared `br` record
+  attached to the relevant work/Attempt owns it.
 - Herdr may move panes between workspaces/tabs without changing domain identity.
 - A restored pane ID with a new terminal/process generation is stale/unknown until explicit re-association; pane ID reuse cannot silently attach to another Attempt.
 - Named manager/watchdog profiles are never encoded in pane-option conventions.
@@ -110,11 +131,32 @@ The provider lock records:
 - fixture-set version;
 - status-source assumptions used by ABACUS.
 
-The initial adapter targets Herdr's high-level CLI/JSON facade, not a hand-rolled socket client: repo-scoped workspace creation plus `agent start`, `agent prompt`, `agent wait`, `agent read`, and bounded workspace/pane operations. The bundled API schema is still fingerprinted for diagnosis. Direct socket use is a later internal optimization only if evidence justifies it, with one explicit ADR-0003 exception that is **not** optional: **startup-Envelope delivery speaks the pinned Herdr socket schema directly, host-side.** Source verification of pinned v0.8.0 shows `AgentStartParams` carries no material fields and the only high-level delivery verb (`agent prompt`) requires its text in argv, so the Envelope cannot ride the high-level CLI without argv exposure. Agents still never reach Herdr; the facade's fixed-dispatch `runtime-rpc` verb accepts only a narrow use-case request carrying no execution material — the authenticated orchestrator side loads persisted Envelope and subject facts, resolves executable/args/environment only from operator-owned allowlisted configuration, and only then constructs the internal `LaunchSpec`. A client-supplied `LaunchSpec` is never accepted. Compatibility evidence for this exact startup path is a blocking gate.
+The initial adapter targets Herdr's high-level CLI/JSON facade for workspace,
+start, prompt, wait, read, and bounded pane operations. The bundled API schema
+is fingerprinted for diagnosis. Source verification shows the current
+high-level start/prompt shapes do not yet provide an argv-free startup Envelope
+path. The old ADR-0003 answer—an authenticated `runtime-rpc` composer loading
+facts from Scribe—is superseded with the state design. The exact startup path
+is therefore held for the necessity round/live pilot rather than smuggled in
+as a surviving exception. Any later host composer must be a narrow runtime
+composition justified by Herdr evidence; it cannot restore state credentials,
+caller authority, or a second store. A client-supplied arbitrary `LaunchSpec`
+remains outside an agent-facing command.
 
-**Namespace scoping (operator decision, 2026-08-05).** Each ABACUS repository confines its launched agents to a dedicated Herdr **workspace** whose label derives from the local repo ID (`abacus-workers-<repo-id>`), inside the operator's existing session. Orchestrator and operator panes live in their own workspace and are never targets of worker-scoped operations. This supersedes the earlier per-repository *named-session* namespace: nested `session attach` is disabled from inside a Herdr session, so a separate named session would make a running fleet unwatchable from where the operator actually works — containment must not cost observability.
+**Namespace scoping (operator decision, 2026-08-05; identifier derivation
+reopened by ADR-0006).** Each repository confines launched agents to a
+dedicated Herdr workspace inside the operator's existing session. Composition
+supplies a collision-resistant repository label from project configuration;
+there is no Scribe-minted repo ID. Orchestrator/operator panes live outside the
+worker workspace. A separate named session remains rejected because nested
+session attach makes the fleet unwatchable from the operator's actual session.
 
-Three consequences are binding. The label derives from repo ID so two ABACUS repositories cannot collide in one session. Teardown scopes to the workspace; ABACUS never stops, deletes, or mutates a named session, and never installs provider integrations/plugins. Session-level events — server restart, live handoff — rotate terminal generations for orchestrator and worker panes alike; that is handled by ordinary generation fencing (stale until explicit re-association), not by namespace choice. Workspace containment is an operational boundary, never an identity claim: identity remains the opaque generation-fenced handle, so a pane Herdr moves between workspaces is stale-until-reassociated rather than silently re-bound.
+Three consequences remain binding. Two repositories cannot collide in one
+session. Teardown scopes to the workspace; ABACUS never stops/deletes a named
+session or installs provider integrations/plugins. Session-level events rotate
+terminal generations; stale handles remain stale until explicit observation or
+re-association selected by the necessity round. Workspace containment is an
+operational boundary, never workflow identity.
 
 Herdr v0.7.5 did not relocate named-session state with config/socket overrides, so disposable spike lanes use an exact disposable namespace with pre/post manifests rather than claiming full path redirection.
 
@@ -126,7 +168,7 @@ The compatibility spike must verify:
 - wait/event subscription and cursor behavior;
 - bounded output reads;
 - process exit and forced stop;
-- Herdr/server and Scribe restart recovery;
+- Herdr/server and composition restart recovery;
 - pane-ID restoration with changed terminal/process generation;
 - named-session isolation, exact cleanup, and sandboxed CLI/socket access;
 - behavior when status detection is uncertain;

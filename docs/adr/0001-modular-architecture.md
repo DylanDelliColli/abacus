@@ -1,9 +1,26 @@
-# ADR-0001: Modular architecture — five capability modules, provider adapters, one facade
+# ADR-0001: Modular architecture — capability modules and provider adapters
 
-- **Status:** Proposed (Claude-drafted from binding operator decisions in `CODEX-HANDOFF.md`; pending Codex cross-review and operator sign-off)
+- **Status:** **Partially superseded** (2026-08-07) by ADR-0006. The
+  dependency-direction, provider-adapter, core-minimality, change-class, and
+  exact-commit Evidence decisions remain active. The separate `abacus-state`
+  Ledger/Scribe module, exclusive facade, two-store Acceptance saga, runtime
+  authorization, and Ledger-audit decisions are historical and impose no new
+  implementation obligation.
 - **Date:** 2026-08-04
 - **Decider:** operator (Dylan Delli Colli)
-- **Companions:** `CONTEXT.md` (vocabulary, invariants, failure semantics — normative), `docs/architecture.md` (flows), `docs/migration.md` (legacy relationship)
+- **Companions:** `CONTEXT.md` (normative), ADR-0006 (current store and trust
+  model), `docs/architecture.md` (flows), `docs/migration.md` (legacy
+  relationship)
+
+> **Supersession boundary.** This ADR records the design that produced the
+> current source and remains useful history. ADR-0006 replaced every statement
+> below that requires a second SQLite Ledger, Scribe, socket/RPC transport,
+> application attempts/receipts, an exclusive work facade, capability/scope
+> authorization at write time, or an ABACUS-owned audit index. Do not repair or
+> extend those mechanisms from this text. Their source is transitional and is
+> deleted only alongside the stock-`br` facade that replaces its live
+> consumers. Where this historical text conflicts with current `CONTEXT.md` or
+> ADR-0006, the newer documents win.
 
 ## Context
 

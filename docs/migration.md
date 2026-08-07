@@ -1,365 +1,219 @@
-# Migration from legacy SABLE to ABACUS
+# Migration from SABLE
 
-Status: staged clean-room extraction plan  
-Last updated: 2026-08-04
+Status: revised build plan after ADR-0006
+Last updated: 2026-08-07
 
 ## Objective
 
-Build ABACUS beside legacy SABLE by extracting the small set of product ideas that remain valuable and replacing infrastructure with independently maintainable modules and upstream providers.
+Extract SABLE's useful center—bead-led work, authored roles, local agents, and
+exact-commit completion evidence—without carrying forward its Dolt server,
+mail compensation stack, pane scraping, merge-seat machinery, or test-control
+system.
 
-This is not an in-place refactor, mass rename, or compatibility release. Legacy SABLE remains available under its existing name while ABACUS proves a smaller execution loop.
+ABACUS is a clean build beside SABLE. It does not migrate legacy runtime state
+or operate through legacy `bd`/Dolt services.
 
-## Why a clean extraction
+## Premise correction
 
-Legacy SABLE demonstrates useful ideas:
+The build initially treated agent identity fraud and concurrent workflow
+writers as the central risk. The operator corrected that premise after review:
+SABLE's damaging failures came from machinery accretion and honest-but-
+unreliable agents, not adversarial workers. ABACUS therefore starts with stock
+`br`, visible typed records, and one shared store. Enforcement is added only
+after a real failure proves it necessary.
 
-- dependency-aware work as durable plan and recovery state;
-- orchestrator and worker responsibilities;
-- fresh-agent-quality work descriptions;
-- isolated worker execution;
-- durable coordination and evidence;
-- explicit recovery from abandoned work.
+This correction obsoletes the proposed second Ledger, Scribe daemon, socket and
+relay, caller credentials/guards, capability/scope authorization stack, and
+two-store application/receipt reconciliation. Existing source implementing
+those ideas is transitional; it is deleted by replacement rather than ahead of
+its consumers.
 
-Those ideas are currently entangled with a large Python/shell surface:
+## Extraction matrix
 
-- many `sable-*` executables and support libraries in `bin/`;
-- direct tmux calls, pane metadata, screen scraping, registries, and warm-role topology;
-- Dolt-backed `bd` workflows and custom push/sync wrappers;
-- global Claude/Codex hooks for bead quality, TDD, messaging, and merge behavior;
-- CI gate classification, test-tier selection, cost profiles, promotion queues, and telemetry;
-- role-specific merge/push discipline;
-- broad test fixtures that couple small behavior changes to large validation runs.
-
-The result is a poor change gradient: a local one-line implementation change can cross several implicit seams and acquire a long system-wide test obligation. Porting the tree would preserve that failure mode.
-
-ABACUS therefore starts from contracts and imports behavior selectively. Nothing moves merely because it already exists.
-
-## Extraction test
-
-A SABLE concept belongs in ABACUS core only when all are true:
-
-1. It is required for the minimal bead-to-verified-commit loop.
-2. It is provider-neutral or can be isolated behind one narrow adapter.
-3. Its state has one clear owner.
-4. Its failure and recovery behavior can be stated without referring to a specific pane layout, hook, CI job, or Git remote.
-5. Its implementation and tests can live within one module or one explicit cross-module use case.
-
-Otherwise it is left behind, deferred as an optional module, or delegated to an upstream provider.
-
-## Migration matrix
-
-| Legacy capability | ABACUS treatment | Destination/reason |
-| --- | --- | --- |
-| Orchestrator and worker concepts | Extract and simplify | Authored role cards + `abacus-core`; exactly two first-class roles initially |
-| Beads as durable plan | Preserve the method, replace implementation | `abacus-work` over `br` |
-| Fresh Agent Test / actionable work descriptions | Preserve as authored policy | Orchestration instructions; validation may later live behind work interface |
-| Dependency-aware ready work | Delegate | `br`, normalized by `abacus-work` |
-| Graph centrality/critical-path planning | Add as optional advice | `bv` adapter; never authoritative |
-| Assignment, lease, typed Signal (Directive/Report/Request), evidence, decision, and audit semantics | Reimplement minimally | `abacus-state`; Scribe is the sole Ledger writer |
-| Live agent messaging, worker launch, persistence, prompt delivery, status observation | Delegate runtime mechanics | `abacus-runtime` over Herdr; Signals are durable first, then Herdr rings a best-effort doorbell; no generic inbox/ack/retry layer |
-| tmux commands, pane options, screen regexes, warm-pane registry | Leave behind | Do not wrap tmux under ABACUS names |
-| Dolt database and `sable-dolt-push` | Leave behind | Clean `br` SQLite + JSONL work graph; no history migration |
-| Worker self-push and merge queue roles | Leave behind | Completion is a verified local commit; publication is separate |
-| Global PostToolUse/PreToolUse hooks | Leave behind | No hidden global orchestration |
-| Mandatory TDD gate and `[no-test]` escape machinery | Leave behind | Downstream projects choose their verification policy |
-| CI preview/promote queues and merge latency optimization | Leave behind | A future optional module/SDK consumer only if independently valuable |
-| Test-tier selection, cost profiles, contention benchmarks | Leave behind | Keep ABACUS suites small by module design, not another optimizer |
-| Telemetry aggregation across GitHub, Git, beads, and panes | Defer | Add only from demonstrated operator questions and module-owned events |
-| Discovery capture/review skills | Evaluate individually | Port authored reasoning only if it uses ABACUS vocabulary and facade |
-| Audit/Columbo/Gaudi skills | Do not bulk-port | Review each skill for product value and external dependencies |
-| Installer that mutates user-global Claude/Codex config | Leave behind | Repository-local, explicit initialization only |
-| SABLE state, beads, and historical role registry | Do not migrate initially | Avoid compatibility complexity and ambiguous authority |
+| Legacy capability | ABACUS treatment |
+|---|---|
+| Beads, dependencies, priority, ready/closed work | Stock pinned `br`, one shared absolute `BEADS_DIR` |
+| Assignment/execution/decision history | Minimum typed append-only facts attached to the work bead; exact set chosen by necessity review |
+| Completion evidence | Keep and strengthen: wrapper-captured outcome bound to exact commit/tree |
+| Handoff | Typed record attached to work, never another bead |
+| Runtime sessions and live prompts | Herdr behind `abacus-runtime` |
+| Graph advice | Optional `bv`, deterministic fallback |
+| Dolt-backed `bd` and daemon | Do not port |
+| Scribe/Ledger/socket/relay | Withdraw; no second durable store or ABACUS daemon |
+| Durable mailbox, ack, delivery retry, escalation ladder | Do not port |
+| tmux scraping and pane metadata as authority | Do not port; runtime observations stay advisory |
+| Merge seat / automatic publication | Do not port; Publication remains separate |
+| CI-efficiency and universal TDD machinery | Do not port |
 
 ## Target repository shape
 
-During the initial build, modules remain separate top-level folders in one repository:
-
 ```text
-abacus/
-├── abacus-core/
-├── abacus-state/
-├── abacus-work/
-├── abacus-runtime/
-├── abacus-cli/
-├── roles/                 # added after contracts stabilize
-├── orchestration/         # added after contracts stabilize
-├── skills/                # selected, authored assets only
-└── docs/
+abacus-core       minimal provider-neutral domain and policy
+abacus-work       stock-br normalization plus optional bv advice
+abacus-runtime    Herdr normalization
+abacus-cli        composition, host discovery, typed convenience commands
+abacus-state      transitional pre-ADR-0006 source pending necessity decision
 ```
 
-Each module owns its interface, implementation, fixtures, tests, and change log. No module reads another module's private fixtures or internal source. This shape allows a later repository split without first untangling lateral imports.
+The target durable topology is one control checkout's `.beads` directory.
+Every process and linked worktree receives its absolute path in `BEADS_DIR`.
+Codex receives that exact directory as an additional writable root. Default
+per-worktree `br` discovery is never live coordination.
 
-## Staged implementation
+## Completed evidence and source history
 
-### Phase 0 — contracts and adversarial review
+The build has useful artifacts even where the architecture was superseded:
 
-Deliver:
+- pinned `br`/`bv` and Herdr compatibility records and fixtures;
+- pure domain rules for exact-commit Evidence/Handoff validation;
+- work-provider normalization, namespace mapping, ready selection, and atomic
+  claim evidence;
+- generation-bearing Herdr handle work and a fake runtime contract;
+- four hermetic journeys through the current production composition; and
+- adversarial findings about stale in-memory SQLite caches, ambiguous provider
+  effects, provenance, lifecycle conflation, and transport limits.
 
-- product/context documents;
-- foundational ADR;
-- system architecture and migration plan;
-- one contract per module;
-- explicit change/blast-radius and test-tier rules.
+Those are evidence, not a reason to preserve every type that carried them.
 
-Acceptance:
+## Revised staged implementation
 
-- Codex and Claude have cross-reviewed the documents;
-- every durable fact has one owner;
-- module dependencies are acyclic;
-- migration exclusions are unambiguous;
-- unresolved provider facts are listed as spikes rather than asserted.
+### Stage 0 — Binding collapse (current)
 
-Rollback: documentation only; revise or discard without runtime impact.
+- accept ADR-0006 and amend normative `CONTEXT.md` in the same landing;
+- mark ADR-0001/0002 partially superseded, ADR-0003 fully superseded, and
+  ADR-0005 withdrawn;
+- mark old state/module contracts transitional so no new work targets them;
+- prune only backlog items made unambiguously obsolete.
 
-### Phase 1 — disposable compatibility spikes
+No source is added in this stage.
 
-Run bounded spikes in temporary repositories and redirected configuration roots.
+### Stage 1 — Proven-inert subtraction
 
-`br` spike:
+After the normative landing and cross-review, remove only:
 
-- pin a candidate release/binary checksum;
-- initialize an `ABACUS-` prefix;
-- exercise create/show/ready/update/dependency/close through JSON output;
-- verify JSONL flush, locking, graph identity, and Git-worktree behavior;
-- capture minimal sanitized fixtures.
+- `ValidatedProfileSet::authorize`;
+- `AuthorizationTarget`;
+- `ActionContext`;
+- `AuthorizationRefusal`; and
+- `StateError::ScopeUnauthorized`.
 
-`bv` spike:
+These are test-only or producerless. All broader authority, scope, audit,
+fencing, and state types remain until their live consumers are replaced.
 
-- verify it reads the exact pinned `br` representation;
-- exercise only robot/non-interactive modes;
-- bind advice to graph/data hash;
-- demonstrate deterministic fallback for absent, timed-out, partial, and malformed advice.
+### Stage 2 — Necessity round
 
-Herdr spike:
+Before new source, the operator reviews every surviving concept against one of:
 
-- pin a candidate release/binary checksum;
-- launch disposable Claude and Codex sessions;
-- verify prompt delivery, generation-fenced handles, wait/events, output reads, process exit, and restart recovery;
-- validate the high-level CLI/JSON facade first; use the socket directly only if a measured gap remains;
-- isolate the provider with an exact disposable named-session namespace and pre/post manifest when its state root cannot be redirected;
-- confirm ABACUS role/assignment state remains outside Herdr.
+- a measured SABLE failure;
+- one of the four hermetic journeys; or
+- the minimum live-provider loop.
 
-Acceptance:
+The round fixes the minimum append-only record vocabulary and decides whether
+Assignment, Attempt, lease, numeric fencing, operation idempotency, Signal
+taxonomy, audit index, profile activation, decision-owner metadata, and
+runtime association remain. Existing implementation is not evidence by
+itself.
 
-- fixtures and compatibility records are sufficient for hermetic adapter tests;
-- no spike mutates live global Claude/Codex configuration;
-- failures produce an adapter-local design change, not a new cross-module dependency.
+For every proposed append-only encoding, the round first runs a disposable
+pinned-`br` proof: append multiple ordered records, export JSONL, discard and
+rebuild the database, then compare record bodies, IDs/order, and references.
+Export presence without rebuild parity does not pass.
 
-Rollback: delete temporary roots and candidate binaries; no ABACUS durable state exists yet.
+The non-negotiable floor is:
 
-Initial bounded observations are recorded under [`docs/compatibility/`](compatibility/README.md). They resolve the basic `br`/`bv` shape and Herdr headless mechanics while leaving destructive sync fixtures, real-agent prompting, and sandbox access as explicit remaining gates.
+- append-only authorization/decision history;
+- distinct claimed/launched/parked/dead/successor facts;
+- exact-commit Evidence and typed Handoff;
+- accepted completion distinct from Publication; and
+- Handoff not represented as work.
 
-### Phase 2 — `abacus-core` and `abacus-state`
+### Stage 3 — Thin shared-`br` vertical facade
 
-Implement:
+Only after Stage 2:
 
-- minimal shared identities and lifecycle invariants;
-- assignment/attempt separation, lease/fencing, sanitized Envelope snapshots, evidence, Handoff refusal/rejection, and Acceptance application rules;
-- immutable subject-bound Signals (Directives, Reports, Requests), derived unresolved queries, and stale-Directive-head fencing;
-- bead-content-hash binding, edit-scope conformance, and verification before/after workspace digests;
-- versioned Scribe protocol;
-- SQLite schema/migrations and `abacus-scribe` lifecycle;
-- in-memory/fake state implementation for use-case tests.
+- inject and validate one absolute `BEADS_DIR` everywhere;
+- use native atomic claim for initial ownership;
+- implement only the selected typed append-only record shapes over stock `br`;
+- retain provider normalization and deterministic advice fallback;
+- replace the current Assignment/Acceptance composition; and
+- delete two-store application attempts, receipts, supersession, pending
+  projection, and their consumers in the same stack.
 
-Acceptance:
+The four journeys are adapted rather than weakened. A step disappears only
+because the underlying cross-store failure mode disappears.
 
-- core tests are pure and deterministic;
-- state tests use only temporary directories/databases;
-- Scribe restart, idempotent request retry, lease expiry, stale fencing, Acceptance interruption/reconciliation, and migration failure are covered;
-- the client/server transport implements the accepted ADR-0003 two-carriage design: injected carriage selection with no fallback, relay framing, launch-written non-secret worker Attempt locators resolved by Scribe, and a separately authenticated decision surface;
-- no `br`, `bv`, Herdr, live agent, network, or user-home dependency exists;
-- module and workspace hermetic budgets are recorded.
+### Stage 4 — Herdr adapter and CLI composition
 
-Rollback: stop Scribe and remove only the explicitly initialized `<git-common-dir>/abacus/` state for the disposable test repository.
+- complete the pinned Herdr adapter behind `abacus-runtime`;
+- compose ready → claim → launch → Evidence → Handoff → Acceptance/close;
+- keep runtime output non-authoritative;
+- expose concise human and versioned machine output; and
+- install no hooks, global config, daemon, or hidden loop.
 
-### Phase 3 — `abacus-work`
+### Stage 5 — Live-provider vertical pilot
 
-Implement:
-
-- deep normalized work interface;
-- pinned `br` process adapter;
-- optional pinned `bv` advisor;
-- graph revision/hash binding;
-- provider diagnostics and compatibility checks;
-- fake provider implementation and fixture contract suite.
-
-Acceptance:
-
-- internal adapter changes run only work-module tests during the edit loop;
-- raw provider types and errors do not appear in other modules;
-- `bv` removal has no effect on correctness;
-- worker role cannot close work through the supported interface;
-- live compatibility is a separate explicit command.
-
-Rollback: keep ABACUS state; disable work provider configuration. No legacy data is modified.
-
-### Phase 4 — `abacus-runtime`
-
-Implement:
-
-- normalized launch/inspect/wait/read/signal/stop interface;
-- pinned Herdr adapter;
-- high-level CLI/JSON control with a generation-fenced session/pane/terminal handle;
-- complete live prompt/doorbell delivery through Herdr, with no generic ABACUS inbox or acknowledgement protocol;
-- explicit launch environment and working directory;
-- runtime-handle recovery and uncertainty semantics;
-- fake protocol peer and fixture contract suite.
-
-Acceptance:
-
-- runtime tests do not launch Herdr by default;
-- Herdr status cannot accept a handoff;
-- Herdr types do not leak into core, state, or authored roles;
-- one explicit live compatibility lane exercises the pinned provider;
-- a restored pane ID with a changed terminal/process generation becomes stale/unknown until explicitly re-associated;
-- a runtime implementation change does not run work/state live tests.
-
-Rollback: stop disposable Herdr sessions; durable assignments remain inspectable and recoverable.
-
-### Phase 5 — onboarding, base profiles, and one CLI vertical slice
-
-Implement the source install/enrollment contract:
-
-```bash
-git clone <repo-url> abacus
-cd abacus
-cargo install --path abacus-cli
-
-cd <target-git-repository>
-abacus init
-```
-
-`abacus init` detects Git root, optional remote, and base branch; previews all writes; seeds project-owned orchestrator/worker cards; initializes fresh providers/state; and remains idempotent. It refuses to reuse legacy state and performs no global installation or publication.
-
-Then implement only the commands required for:
-
-```text
-doctor -> ready -> assign -> spawn -> signal/doorbell/sync -> evidence -> submit -> accept/reject -> close
-```
-
-Acceptance:
-
-- a local repository with no remote can initialize with an explicit base branch;
-- re-running initialization preserves edited role cards and produces no unintended changes;
-- one disposable repository completes the full local loop;
-- deterministic operation still works with `bv` disabled;
-- worker death, Scribe restart, stale lease, dirty handoff, and provider mismatch have explicit recovery;
-- no push, PR, merge, CI, or global hook occurs;
-- the default T0–T2 workspace suite remains within budget.
-
-Rollback: stop local processes and return to legacy SABLE for existing work. ABACUS and SABLE must never share mutable state stores.
-
-### Phase 6 — authored profiles and orchestration expansion
-
-Refine the seeded orchestrator/worker cards and add named profile cards or selected skills against the proven CLI interface.
-
-Acceptance:
-
-- no raw provider command appears in authored assets;
-- each instruction corresponds to a supported, tested ABACUS outcome;
-- roles add judgment and policy rather than duplicating CLI reference material;
-- existing capabilities can move from one manager profile to another without Rust or database-schema changes;
-- a read-only watchdog profile can observe and alert without receiving graph-mutation or handoff-decision authority;
-- orchestrators query progress, encode work-shaped cross-scope blockers as dependency edges, and use typed Requests only for decision-shaped coordination;
-- every role checks its derived unresolved Signal set on session start without creating an inbox/ack protocol;
-- removing an optional skill does not break execution correctness.
-
-Rollback: roles are Markdown assets; revert independently from modules.
-
-### Phase 7 — optional extraction/SDK work
-
-Only after repeated use:
-
-- identify policies that have independent value (for example CI feedback or a testing-discipline skill);
-- define their ABACUS-facing interface;
-- place them in separate repositories/packages;
-- consume them as optional SDK clients, not core dependencies.
-
-Acceptance: ABACUS's minimal loop works identically when every optional extension is absent.
-
-An extracted module is ready for a separate repository only when it has zero imports from lateral sibling modules, a stable versioned CLI/JSON or library contract, isolated hermetic tests, and a pinned/checksummed consumption path back into ABACUS. A folder boundary alone is not an extraction seam.
-
-If publication is later added, prefer provider-native pull requests, branch protection, and merge queues consuming an already completed Handoff. Do not recreate SABLE's custom merge seat or make publication part of ABACUS completion.
-
-## Change-locality migration rules
-
-The migration must not reproduce SABLE's validation coupling.
-
-1. Port behavior, never its entire historical test harness.
-2. Place a migrated test with the module that owns the invariant it proves.
-3. Rewrite provider-facing tests as small adapter fixtures; do not retain live shell orchestration in default tests.
-4. Keep only a few hermetic vertical journeys. Do not translate every old integration test into a root end-to-end test.
-5. Do not import SABLE helper libraries to make early tests pass.
-6. Do not create a broad common fixture package.
-7. Do not make one module's private behavior observable solely so another module can test it.
-8. If a ported behavior requires tests in three unrelated modules, reconsider its owner or interface before proceeding.
-9. Record a baseline for every module and reject unexplained test-runtime growth.
-10. A breaking module interface or new lateral dependency requires an ADR.
-11. **Phase-gate budget checkpoint (operator-ratified 2026-08-05).** Every phase acceptance refreshes `docs/test-baselines.md` with the same commands under broadly comparable machine conditions and compares against the declared budgets (core under 5 seconds; adapter, state, work, runtime, and CLI module suites under 15 seconds; the full hermetic gate under 90 seconds). A breached budget is answered structurally — remove redundant tests, repair the module boundary, split the module, or move live/provider work out of the default lane — never with a test-selection subsystem that lets the underlying suite keep growing.
-12. **Phase-gate core-change log (operator-ratified 2026-08-05).** Every phase acceptance records the `abacus-core` changes landed since the prior gate with their cause: what changed (vocabulary, invariants, or only interface expressibility), why, the crates affected, and whether the trigger could reasonably have stayed outside core. Elevated C3 activity while the kernel seams are still forming is expected; recurring feature-driven core change after Phase 2 declares the execution kernel stable is the alarm this log exists to catch. Each record names the exact commit range it covers as `prior_gate_sha..current_gate_sha` (exclusive of the prior gate's commit, inclusive of the current one, per Git range semantics), and the Phase 2 acceptance record names the kernel-stable starting SHA explicitly, so the alarm boundary cannot drift.
-
-## Parallel operation with legacy SABLE
-
-ABACUS is opt-in per repository through `.abacus/config.toml`. Legacy SABLE markers, `.beads` state, hooks, and sessions do not activate ABACUS automatically.
-
-During the proving period:
-
-- use legacy SABLE only for repositories already governed by it;
-- use ABACUS only in explicit disposable/pilot repositories;
-- never point both systems at the same work graph or worker assignment;
-- do not install ABACUS global hooks to emulate SABLE behavior;
-- compare outcomes and operator effort, not feature-count parity.
-
-The success criterion is that ABACUS performs the useful loop with less machinery and lower change cost—not that every SABLE command has an equivalent.
-
-## Data policy
-
-Initial ABACUS repositories start with a new `ABACUS-` graph and empty Ledger.
-
-No initial migration of:
-
-- SABLE/Dolt bead history;
-- open/in-progress SABLE assignments;
-- SABLE role registry or pane identity;
-- messaging/reconciliation files;
-- telemetry, test-cost profiles, or merge receipts;
-- global hook state.
-
-If historical import becomes valuable, design a read-only, one-shot importer later. It must produce provenance-tagged records and cannot create a permanently dual-written system.
-
-## Upstream fork policy
-
-Begin with unmodified, pinned upstream `br`, `bv`, and Herdr releases.
-
-Consider an ABACUS-owned fork only when:
-
-- a concrete required capability is absent upstream;
-- the need has recurred or blocks the minimal loop;
-- the adapter seam cannot express a safe workaround;
-- the maintenance and security update burden is understood;
-- the fork can remain compatible with the normalized ABACUS interface;
-- an ADR compares fork, contribution, wrapper, and replacement options.
-
-SABLE-specific branding or convenience is not sufficient reason to fork.
-
-## Migration stop conditions
-
-Pause and revisit the design if any phase causes:
-
-- a provider type to appear in `abacus-core`;
-- an adapter module to depend on another adapter module;
-- live provider setup in `cargo test --workspace`;
-- a module's internal refactor to require unrelated module fixtures;
-- a global hook or user-home mutation for correctness;
-- dual authority for a mutable fact;
-- automatic push/merge becoming part of handoff acceptance;
-- a compatibility shim larger than the behavior being extracted;
-- a default hermetic suite exceeding its budget without an explicit review.
-
-These are signs that ABACUS is rebuilding the coupling it exists to remove.
+`ABACUS-2IS` is the preferred implementation-contact gate once the operator
+lifts the no-new-code hold. It runs one disposable real loop with pinned stock
+`br`, one Herdr-launched agent, and the shared-store topology. It must precede
+new recovery or attention machinery.
+
+The pilot proves at minimum:
+
+- the primary and linked worktree resolve the same `BEADS_DIR`;
+- one native claim wins;
+- launch environment carries no state secret or second-store locator;
+- exact-commit Evidence and typed Handoff survive model context loss;
+- Acceptance does not imply Publication; and
+- teardown leaves no session, temporary worktree, or global configuration.
+
+### Stage 6 — Authored roles and optional policy
+
+Seed project-owned orchestrator/worker cards only after the real loop passes.
+Additional profiles, Signals, attention, retries, automation, or publication
+policy require observed need. Parked ADR-0004 remains non-contractual until a
+real stall meets its stated trigger.
+
+## Change-locality rules
+
+- C0 changes run owning-module tests.
+- C1 seams add direct-consumer contracts.
+- C2 breaking seams/new dependencies require an ADR.
+- C3 core changes run the full hermetic workspace.
+- Live providers stay out of default tests.
+- Test-budget growth requires an ADR, never another selection service.
+
+Replacement and deletion are reviewed as one behavior-preserving stack when
+separating them would create a hole. Pure dead-code subtraction may land alone
+only when production usage is proven absent.
+
+## Data and provider policy
+
+- Stock `br` is pinned and checksummed; no fork without a measured missing
+  primitive, inability to express it as data, and upstream refusal.
+- `issues.jsonl` is portable backup/interchange, not a live merge protocol.
+- Native `br` audit events are local-only and cannot be canonical ABACUS
+  history.
+- No legacy SABLE/Dolt state is imported automatically.
+- No secrets, credentials, provider transcripts, or terminal output are stored
+  as workflow facts.
+- Herdr and `bv` remain independently pinned behind their adapters.
+
+## Stop conditions
+
+Stop and return to the operator if implementation requires:
+
+- a second durable store;
+- a daemon, socket relay, hidden loop, or auto-start service;
+- raw provider SQL or a `br` fork;
+- generic CAS/multi-record transactions not evidenced by the first loop;
+- a mailbox/ack/retry subsystem;
+- treating runtime output as completion; or
+- weakening exact-commit Evidence/Handoff binding.
+
+Each is a new architecture decision, not an implementation detail.
 
 ## Rollback principle
 
-Every phase must be independently reversible. ABACUS does not modify legacy SABLE state, so rollback means stopping ABACUS processes and ceasing use of its explicitly scoped repository state—not reconstructing SABLE from converted data.
-
-Do not create a `/home/ddc/dev-environment/sable-v2` compatibility path or symlink. The earlier live-session rename issue was solved by restarting sessions with the correct ABACUS root; retaining obsolete identity would conceal configuration leaks.
+The tracker choice remains reversible through portable JSONL. A provider fork
+or new persistent service does not. Prefer the reversible stock configuration
+until concrete use proves it inadequate.
