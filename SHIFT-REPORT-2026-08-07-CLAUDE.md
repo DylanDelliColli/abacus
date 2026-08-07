@@ -5,26 +5,88 @@ able to act from this document plus the repository without re-deriving today.
 
 ---
 
-## 0. READ THIS BEFORE YOU READ ANY SOURCE
+## 0. READ THIS BEFORE YOU READ ANY SOURCE — bounded authority inversion
 
-**The documents are current. The code is not. That gap is deliberate.**
+Today redirected ABACUS four times. That creates a **temporary, bounded
+inversion**: inside named paths, doctrine outranks source. It is **not** a
+repository-wide licence to dismiss surprising code. Outside those paths, source
+is ordinary evidence and you should trust it normally.
 
-Today did not refine ABACUS — it redirected it, four times. `CONTEXT.md`, the
-ADRs, `docs/architecture.md`, `docs/migration.md` and all five module READMEs
-were rewritten yesterday-into-today and are correct as of `dafbed3`.
+### Authoritative doctrine is a CHAIN, not one commit
 
-Roughly **24,700 lines of `abacus-core` and `abacus-state` still implement the
-superseded design**, and the four tests in `abacus-usecase-journeys` still
-exercise it. That is not rot to clean up on sight. We chose **delete by
-replacement, never by creating holes**: removing the old composition before its
-replacement exists would erase behaviour, break the journeys, and destroy the
-executable contract needed to judge the replacement against.
+No single SHA makes the documents current. Three do, in order, and each proves a
+different claim:
 
-So your normal instinct — trust the code, treat docs as aspirational — is
-**backwards here**. If source and `CONTEXT.md` disagree, `CONTEXT.md` wins and
-the source is scheduled for replacement.
+- `dafbed3` — *establishes the collapse*: `CONTEXT.md` (invariants I1–I19),
+  `docs/adr/0006-stock-br-single-store.md`, `docs/architecture.md`,
+  `docs/migration.md` and all five module READMEs describe the **single-store,
+  no-Scribe, conventions-not-enforcement** model as accepted product intent.
+- `5ad9f4d` — *applies the first subtraction*: the five-item inert authorization
+  cluster is gone from source, so doctrine and code already agree there. **It
+  also changed `abacus-core/README.md`, `abacus-state/README.md` and
+  `docs/migration.md`**, so "the docs are correct as of `dafbed3`" is false —
+  those three are only correct at `5ad9f4d` or later.
+- `b714451` — *records the remaining replacement work* as `abacus-yx3`.
+- `fb5de70` — *parks the attention service*:
+  `docs/adr/0004-attention-service.md` is **PARKED, not a contract**. Its
+  content is design history, not instruction.
 
-Do not "fix" the inconsistency. It is tracked (`abacus-yx3`) and gated.
+### Bounded stale roots — doctrine wins here
+
+Exactly these, and nothing else:
+
+| Path | Why it remains | Still valid for | No longer proves |
+|---|---|---|---|
+| `abacus-state/src/**` | replacement not built | build continuity, gate green | product intent |
+| `abacus-core/src/usecase.rs` | composes the superseded seams | executable behavioural contract | target design |
+| `abacus-core/src/ports.rs` (state port, application/receipt/supersession types) | consumed by the above | same | same |
+| `abacus-usecase-journeys/tests/*.rs` | four journeys exercise that composition | regression safety during replacement | that the product works this way |
+
+`abacus-state/README.md` line 1 self-declares `transitional contract` — that
+marker is the boundary, not this document.
+
+### Explicitly NOT stale — treat as ordinary evidence
+
+`abacus-runtime/src/**` (Herdr adapter; `ed7fb3e` and `f293eb4` are current
+work), `abacus-work/src/**` (the `br` adapter — *more* central now), and the
+remaining `abacus-core/src/*.rs` domain vocabulary. If something there surprises
+you, it is a real finding. Investigate it.
+
+### The rule, stated with both boundaries
+
+**Within** `abacus-core`, `abacus-state`, and the four journey tests, **on the
+removed Ledger / Scribe / authorization semantics tracked by `abacus-yx3`**,
+named doctrine wins until replacement lands.
+
+**Outside** that subject-and-path boundary, source remains ordinary evidence,
+and a surprising disagreement is a **defect to investigate**, not something to
+dismiss. Both halves matter: the first prevents you re-litigating settled
+decisions from stale code, the second prevents you waving away a real bug.
+
+### What ends the inversion
+
+`abacus-yx3` — staged deletions **by replacement**. The inversion ends when the
+shared-`br` facade replaces those consumers and the stale roots are removed.
+Completion is observable: `abacus-state` leaves `Cargo.toml` workspace members,
+or `abacus-yx3` closes. Until then, do not "fix" the inconsistency you will
+notice; it is deliberate and tracked.
+
+### Probes — run these, do not trust the prose
+
+Every probe below was executed and passed at authoring time. **No HEAD SHA is
+written here on purpose** — committing this file changes HEAD, which is exactly
+how the first version of §2 falsified itself (§10). Re-run these before acting.
+
+```sh
+git merge-base --is-ancestor dafbed3 HEAD && echo "doctrine contained"
+git merge-base --is-ancestor 5ad9f4d HEAD && echo "subtraction contained"
+git status --porcelain | grep -v '^??'          # expect only .gitignore
+head -1 abacus-state/README.md                  # expect: transitional contract
+br show abacus-yx3                              # open => inversion still active
+```
+
+If containment fails, HEAD moved past this report and §2 is stale — re-derive
+from `git log` rather than from this document.
 
 ---
 
@@ -67,10 +129,27 @@ two-way door since JSONL is portable; a fork is one-way).
 
 ---
 
-## 2. Where the tree is
+## 2. Where the tree is — LANDED vs PLANNED vs THIS PROSE
 
-`main == origin/main` at **`b714451`**. Clean except an unrelated modified
-`.gitignore` (Codex's, leave it), `.beads` local metadata, and shift reports.
+Three categories, deliberately not blurred:
+
+- **LANDED** — in `origin/main`, verifiable by the §0 probes. Everything in the
+  table below.
+- **PLANNED** — decided but not built: the staged deletions (`abacus-yx3`), the
+  shared-`br` facade, the acceptance gate (`abacus-w6x`). No source exists.
+- **THIS PROSE** — my summary. Where it disagrees with a probe, the probe wins.
+
+Three fixed points, none of which is "current HEAD":
+
+- **Pre-report base:** `b714451` — the last landing before this document existed.
+- **Report object:** `0296804` — the commit that introduced this file. A later
+  commit revises it; see §10.
+- **Current HEAD / origin:** *deliberately not written here.* It is a boot-time
+  probe (§0), because the act of committing this report invalidated the first
+  version of this very line.
+
+Working tree when authored: clean except an unrelated modified `.gitignore`
+(Codex's, leave it), `.beads` local metadata, and shift reports.
 
 Today's landings, newest first:
 
@@ -220,3 +299,34 @@ against ~24,700 remaining. All of the real deletion arrives as *replacement*.
 5. Do not implement anything from a bead written before `dafbed3` without
    checking it against ADR-0006 first. Several still describe the old design;
    the ones I found are annotated, but I will not have found all of them.
+
+---
+
+## 10. Corrections to this report — kept deliberately
+
+An external review read this document **after it landed** at `0296804` and found
+three fresh-agent-test defects. They are recorded rather than silently amended,
+because a handoff that looks flawless teaches the next author nothing.
+
+**1. The report invalidated its own line by existing.** §2 originally stated
+`main == origin/main at b714451`. Committing the report made that false
+immediately. *Lesson: a handoff must never write current HEAD as durable prose.*
+Fixed by splitting into pre-report base, report object, and a boot-time probe.
+
+**2. Authority was attributed to one commit when it is a chain.** §0 originally
+said the documents were correct "as of `dafbed3`". But `5ad9f4d` subsequently
+changed `abacus-core/README.md`, `abacus-state/README.md` and
+`docs/migration.md` — so for those three, `dafbed3` was already stale when I
+wrote it. *Lesson: "these docs are current at SHA X" is almost always wrong when
+work continued; state the chain and what each commit proves.* I did not catch
+this myself.
+
+**3. The inversion rule was still too global.** "If source and `CONTEXT.md`
+disagree, `CONTEXT.md` wins" makes every surprising line dismissible and fails
+the fresh-agent test. It now carries **both** a path boundary and a subject
+boundary, and explicitly says surprising disagreement *outside* those bounds is
+a defect to investigate.
+
+The pattern across all three: **unbounded confidence.** Each was a true
+statement over-scoped into a false one — the same failure mode that produced two
+of my errors in §7. Bound your claims to the evidence that supports them.
