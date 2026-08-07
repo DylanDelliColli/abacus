@@ -1,6 +1,6 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 7 — cross-review PASS on all structural findings; the Directive narrowing is ratified and re-confirmed by the operator against a corrected worst case, on the stated principle of starting simple and building a contingency only against observed evidence. Awaiting final narrow re-review, then sign-off.
+- **Status:** Proposed, revision 7 — **Codex cross-review PASS** (four adversarial rounds, ~12 material findings, all resolved). The Directive narrowing is ratified and re-confirmed by the operator against a corrected worst case, on the stated principle of starting simple and building a contingency only against observed evidence. Outstanding before sign-off: external review by the SABLE reviewer, who authored the original brief this ADR cuts three requirements from (§3 — bounded-backoff state, delivery-attempt records, the escalation ladder).
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
