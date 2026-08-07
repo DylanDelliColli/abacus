@@ -36,11 +36,10 @@ the target architecture.
 - Existing portable contracts remain regression evidence for behavior that
   survives; they are not proof every current type must survive.
 
-The only source subtraction authorized before the necessity round is the
-five-item inert authorization cluster in `abacus-core` (plus mechanical compile
-fallout if any): `ValidatedProfileSet::authorize`, `AuthorizationTarget`,
-`ActionContext`, `AuthorizationRefusal`, and producerless
-`StateError::ScopeUnauthorized`.
+The five-item inert authorization cluster authorized before the necessity
+round has been removed from `abacus-core` with no state-source fallout. No
+adjacent authority, scope, audit, fencing, or state type is thereby authorized
+for deletion.
 
 ## Transition validation
 

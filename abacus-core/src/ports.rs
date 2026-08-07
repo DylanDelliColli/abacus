@@ -1150,8 +1150,6 @@ pub enum StateError {
     NonExtendingLease,
     /// A decision call's authenticated actor is not the record's bound actor.
     ActorMismatch,
-    /// Actor's current grant does not cover the subject (I17).
-    ScopeUnauthorized,
     /// A singleton-occupancy profile is already occupied (ADR-0002 §7).
     ProfileOccupied,
     /// The activation case is invalid for the target (e.g. bootstrap

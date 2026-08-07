@@ -5,12 +5,10 @@
 //! [`validate_profiles`] returns a [`ValidatedProfileSet`], and
 //! exclusive routing plus derived singleton occupancy consume only that
 //! artifact. Caller-asserted occupancy and first-match routing are
-//! structurally impossible. Enforcement fencing at write time stays
-//! with Scribe (I17).
+//! structurally impossible.
 
 use std::collections::BTreeSet;
 
-use crate::assignment::{AuthoritySnapshot, DecisionActor};
 use crate::authority::AuthorityClass;
 use crate::content::ContentHash;
 use crate::id::{ActorId, CapabilityId, OperationId, ProfileName};
@@ -123,47 +121,11 @@ pub enum ProfileConfigError {
     },
 }
 
-/// Typed target projection for authorization (ADR-0002 §5): work
-/// subjects project to a normalized map (membership), scope subjects
-/// stay expressions (conservative containment), and non-work targets
-/// have no projection at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthorizationTarget {
-    Work(ScopeMap),
-    Scope(ScopeExpr),
-    NonWork,
-}
-
-/// Whether the authorization is for a current action or the one-time
-/// Attempt-binding check (ADR-0002 §3: fenced scope is binding-time
-/// only; fenced mutation itself is Assignment binding + token).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ActionContext {
-    CurrentAction,
-    AttemptBinding,
-}
-
-/// Distinct authorization refusals, each loud and actionable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AuthorizationRefusal {
-    UnknownCapability,
-    UnknownProfile,
-    /// The activation's snapshot no longer matches the current set:
-    /// grant/class drift, refused for explicit re-activation.
-    GrantDrift,
-    /// Fenced capabilities authorize only at Attempt binding;
-    /// exclusive/shared only as current actions.
-    ContextMismatch,
-    NotGranted,
-    /// Target kind incompatible with the capability's projection.
-    TargetMismatch,
-    ScopeUnauthorized,
-}
-
 /// Core-validated activation snapshot: constructible only from a
 /// [`ValidatedProfileSet`], so occupancy and authority class are
-/// derived facts, never caller assertions. The full grant snapshot is
-/// retained for the Ledger and consumed by [`ValidatedProfileSet::authorize`].
+/// derived facts, never caller assertions. The full grant snapshot remains
+/// part of the transitional activation record until its live state consumers
+/// are replaced under ADR-0006.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileActivation {
     pub operation: OperationId,
@@ -301,71 +263,6 @@ impl ValidatedProfileSet {
             .iter()
             .find(|p| &p.name == profile)
             .map(|p| p.class)
-    }
-
-    /// Authorize the current activation for a concrete use case and
-    /// target (core contract). Consumes the durable activation — never
-    /// caller-supplied profile/class parts — validates it against the
-    /// current set (grant drift), enforces the context/check-class
-    /// rules, and returns the exact durable [`AuthoritySnapshot`]
-    /// (actor identity plus the REAL granted scope), so a caller can
-    /// never record a wider scope than it holds.
-    pub fn authorize(
-        &self,
-        activation: &ProfileActivation,
-        capability: &CapabilityId,
-        target: &AuthorizationTarget,
-        context: ActionContext,
-    ) -> Result<AuthoritySnapshot, AuthorizationRefusal> {
-        let descriptor = self
-            .descriptor(capability)
-            .ok_or(AuthorizationRefusal::UnknownCapability)?;
-        let spec = self
-            .profiles
-            .iter()
-            .find(|p| p.name == activation.profile)
-            .ok_or(AuthorizationRefusal::UnknownProfile)?;
-        if spec.class != activation.class() || spec.grants != activation.grants {
-            return Err(AuthorizationRefusal::GrantDrift);
-        }
-        let context_ok = match descriptor.class {
-            CheckClass::Fenced => context == ActionContext::AttemptBinding,
-            CheckClass::Exclusive | CheckClass::Shared => context == ActionContext::CurrentAction,
-        };
-        if !context_ok {
-            return Err(AuthorizationRefusal::ContextMismatch);
-        }
-        let grant = activation
-            .grants
-            .iter()
-            .find(|g| &g.capability == capability)
-            .ok_or(AuthorizationRefusal::NotGranted)?;
-        match (descriptor.work_scoped, target) {
-            (false, AuthorizationTarget::NonWork) => {}
-            (false, _) | (true, AuthorizationTarget::NonWork) => {
-                return Err(AuthorizationRefusal::TargetMismatch);
-            }
-            (true, AuthorizationTarget::Work(map)) => {
-                if !grant.scope.matches(map) {
-                    return Err(AuthorizationRefusal::ScopeUnauthorized);
-                }
-            }
-            (true, AuthorizationTarget::Scope(expr)) => {
-                if !grant.scope.contains(expr) {
-                    return Err(AuthorizationRefusal::ScopeUnauthorized);
-                }
-            }
-        }
-        Ok(AuthoritySnapshot {
-            actor: DecisionActor {
-                actor: activation.actor.clone(),
-                class: activation.class(),
-                profile: activation.profile.clone(),
-                profile_hash: activation.profile_hash.clone(),
-            },
-            capability: capability.clone(),
-            scope: grant.scope.clone(),
-        })
     }
 
     /// The profile's grants, for activation snapshots.
@@ -810,151 +707,6 @@ mod tests {
                 first: name("lead-a"),
                 second: name("lead-b")
             }
-        );
-    }
-
-    #[test]
-    fn authorization_covers_every_target_projection() {
-        let profiles = vec![
-            orchestrator("front-lead", "area=frontend"),
-            worker("worker-a"),
-        ];
-        let mut registry = registry();
-        registry.push(CapabilityDescriptor {
-            id: cap("runtime:prompt"),
-            class: CheckClass::Shared,
-            bundle: None,
-            work_scoped: false,
-        });
-        let set = validate_profiles(&profiles, &registry).unwrap();
-        let hash = crate::content::ContentHash::new(&"a".repeat(64)).unwrap();
-        let lead_act = ProfileActivation::from_validated(
-            &set,
-            crate::id::OperationId::new("act-1").unwrap(),
-            crate::id::ActorId::new("lead-1").unwrap(),
-            name("front-lead"),
-            hash.clone(),
-        )
-        .unwrap();
-        let worker_act = ProfileActivation::from_validated(
-            &set,
-            crate::id::OperationId::new("act-2").unwrap(),
-            crate::id::ActorId::new("worker-1").unwrap(),
-            name("worker-a"),
-            hash.clone(),
-        )
-        .unwrap();
-        let frontend = ScopeMap::new(vec![(
-            ScopeKey::new("area").unwrap(),
-            ScopeValue::new("frontend").unwrap(),
-        )])
-        .unwrap();
-
-        // Membership over a work subject returns the EXACT granted
-        // scope in the durable snapshot — never a caller-widened one.
-        let snapshot = set
-            .authorize(
-                &lead_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Work(frontend.clone()),
-                ActionContext::CurrentAction,
-            )
-            .unwrap();
-        assert_eq!(snapshot.scope.canonical(), "area=frontend");
-        assert_eq!(snapshot.actor.profile, name("front-lead"));
-        assert_eq!(snapshot.capability, cap("state:assign"));
-
-        assert_eq!(
-            set.authorize(
-                &lead_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Work(ScopeMap::default()),
-                ActionContext::CurrentAction,
-            ),
-            Err(AuthorizationRefusal::ScopeUnauthorized)
-        );
-        // Conservative containment over a scope subject.
-        assert!(
-            set.authorize(
-                &lead_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Scope(scope("area=frontend")),
-                ActionContext::CurrentAction,
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            set.authorize(
-                &lead_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Scope(scope("area=*")),
-                ActionContext::CurrentAction,
-            ),
-            Err(AuthorizationRefusal::ScopeUnauthorized)
-        );
-        // Unknown capability is distinct.
-        assert_eq!(
-            set.authorize(
-                &lead_act,
-                &cap("state:missing"),
-                &AuthorizationTarget::NonWork,
-                ActionContext::CurrentAction,
-            ),
-            Err(AuthorizationRefusal::UnknownCapability)
-        );
-        // Not granted is distinct.
-        assert_eq!(
-            set.authorize(
-                &worker_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Work(frontend.clone()),
-                ActionContext::CurrentAction,
-            ),
-            Err(AuthorizationRefusal::NotGranted)
-        );
-        // Context rules: fenced only at Attempt binding; exclusive only
-        // as a current action.
-        assert_eq!(
-            set.authorize(
-                &worker_act,
-                &cap("state:report"),
-                &AuthorizationTarget::Work(frontend.clone()),
-                ActionContext::CurrentAction,
-            ),
-            Err(AuthorizationRefusal::ContextMismatch)
-        );
-        assert!(
-            set.authorize(
-                &worker_act,
-                &cap("state:report"),
-                &AuthorizationTarget::Work(frontend.clone()),
-                ActionContext::AttemptBinding,
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            set.authorize(
-                &lead_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Work(frontend.clone()),
-                ActionContext::AttemptBinding,
-            ),
-            Err(AuthorizationRefusal::ContextMismatch)
-        );
-        // Grant drift: the activation no longer matches a changed set.
-        let repartitioned = vec![
-            orchestrator("front-lead", "area=design"),
-            worker("worker-a"),
-        ];
-        let new_set = validate_profiles(&repartitioned, &registry).unwrap();
-        assert_eq!(
-            new_set.authorize(
-                &lead_act,
-                &cap("state:assign"),
-                &AuthorizationTarget::Work(frontend),
-                ActionContext::CurrentAction,
-            ),
-            Err(AuthorizationRefusal::GrantDrift)
         );
     }
 

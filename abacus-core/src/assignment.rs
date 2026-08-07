@@ -24,10 +24,10 @@ pub struct DecisionActor {
     pub profile_hash: ContentHash,
 }
 
-/// The single generic authority snapshot (I17, ADR-0002): who, as
-/// what, exercising which capability over which canonical scope.
-/// Produced by `ValidatedProfileSet::authorize` from the current
-/// activation — never assembled from caller-supplied parts.
+/// The transitional generic authority snapshot carried by existing decision
+/// and audit records: who, as what, exercising which capability over which
+/// canonical scope. ADR-0006 removed its unused write-time authorization
+/// producer; this record remains until its live state consumers are replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritySnapshot {
     pub actor: DecisionActor,

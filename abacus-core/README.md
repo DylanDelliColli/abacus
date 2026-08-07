@@ -102,10 +102,10 @@ Their current use in source determines deletion sequencing, not target status.
 They move only with the consumer replacement selected after the necessity
 round.
 
-## Immediate inert subtraction
+## Completed inert subtraction
 
-After the ADR-0006/`CONTEXT.md` landing, the following test-only or producerless
-cluster may be deleted as one C3 subtraction:
+After the ADR-0006/`CONTEXT.md` landing, one C3 subtraction removed the
+following test-only or producerless cluster:
 
 - `ValidatedProfileSet::authorize`;
 - `AuthorizationTarget`;
@@ -113,9 +113,9 @@ cluster may be deleted as one C3 subtraction:
 - `AuthorizationRefusal`; and
 - `StateError::ScopeUnauthorized`.
 
-`ScopeExpr`, `ScopeMap`, grants, authority snapshots, fencing, and audit are not
-included merely because they are likely future cuts; they still have live
-consumers.
+That completed subtraction does not authorize adjacent cuts. `ScopeExpr`,
+`ScopeMap`, grants, authority snapshots, fencing, and audit still have live
+consumers and move only with their replacement.
 
 ## Ports and composition
 
@@ -167,7 +167,7 @@ SQLite, `br`, `bv`, Herdr, Claude, or Codex.
 - Exact-commit Evidence/Handoff policy remains enforceable as a pure rule.
 - Runtime observations alone cannot complete work.
 - No new type is admitted solely because the old Ledger used it.
-- The five-item inert authorization cluster is removable without a production
-  consumer.
+- The five-item inert authorization cluster is absent without breaking a
+  production consumer.
 - The post-necessity public surface contains only concepts demonstrated by the
   first runnable loop or measured predecessor failure.

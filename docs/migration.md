@@ -77,7 +77,7 @@ Those are evidence, not a reason to preserve every type that carried them.
 
 ## Revised staged implementation
 
-### Stage 0 — Binding collapse (current)
+### Stage 0 — Binding collapse (complete)
 
 - accept ADR-0006 and amend normative `CONTEXT.md` in the same landing;
 - mark ADR-0001/0002 partially superseded, ADR-0003 fully superseded, and
@@ -87,9 +87,9 @@ Those are evidence, not a reason to preserve every type that carried them.
 
 No source is added in this stage.
 
-### Stage 1 — Proven-inert subtraction
+### Stage 1 — Proven-inert subtraction (complete)
 
-After the normative landing and cross-review, remove only:
+After the normative landing and cross-review, the C3 subtraction removed only:
 
 - `ValidatedProfileSet::authorize`;
 - `AuthorizationTarget`;
@@ -100,7 +100,7 @@ After the normative landing and cross-review, remove only:
 These are test-only or producerless. All broader authority, scope, audit,
 fencing, and state types remain until their live consumers are replaced.
 
-### Stage 2 — Necessity round
+### Stage 2 — Necessity round (current gate; no new source)
 
 Before new source, the operator reviews every surviving concept against one of:
 

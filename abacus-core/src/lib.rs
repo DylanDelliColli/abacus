@@ -45,9 +45,8 @@ pub use lifecycle::{
     assignment_transition, attempt_transition,
 };
 pub use profile::{
-    AuthorizationRefusal, AuthorizationTarget, Bundle, CapabilityDescriptor, CheckClass, Grant,
-    OccupancyClass, ProfileConfigError, ProfileSpec, RouteOutcome, ValidatedProfileSet,
-    validate_profiles,
+    Bundle, CapabilityDescriptor, CheckClass, Grant, OccupancyClass, ProfileConfigError,
+    ProfileSpec, RouteOutcome, ValidatedProfileSet, validate_profiles,
 };
 pub use scope::{Atom, ScopeError, ScopeExpr, ScopeKey, ScopeMap, ScopeValue, Selector};
 pub use signal::{
