@@ -1,6 +1,23 @@
 # ADR-0004: The attention service — a derivation, not a daemon
 
-- **Status:** Proposed, revision 9 — SABLE re-review of revision 8 found the repairs architecturally right but the document **split-brain**: repaired sections coexisted with live revision-7 requirements, and the implementation beads still specified the superseded design. Revision 9 removes that drift and closes the Directive discovery gap. **Every sentence below is current contract unless explicitly labelled historical.** Awaiting SABLE re-review, then operator sign-off. One decision is open (§5, the unresolvable-audience sink; SABLE recommends an explicit sink if the broad liveness-floor claim is retained).
+- **Status: PARKED (operator, 2026-08-07). Not a contract. Do not implement.**
+  Revision 9 passed its design review — every cut upheld, no durable ring state,
+  no backoff machine, no delivery store, no escalation ladder — but the operator
+  parked the whole feature. The reason is the point: this specifies a detector
+  for silent stalls in a system that **has never run and therefore has never
+  stalled**. Nine revisions and three reviewers went into a backstop for an
+  unobserved failure while the product still had no executable. That is the
+  accretion pattern that killed the predecessor, and catching it here is worth
+  more than finishing the document.
+  Unparks on **evidence**: a real stall observed in a running ABACUS. The
+  design survives intact for that day and needs no rework to be picked up.
+  **Three known residuals stay open and unfixed, deliberately** (SABLE review of
+  `cb5210f`): the promised Directive discovery view is not reachable through
+  current interfaces and would need a new C3 read seam (§6); some sentences
+  still read as current contract while assuming the un-chosen sink option (§5);
+  and the zero-activation branch falsifies several broad proofs unless a
+  configured sink is chosen. None are repaired because repairing a parked
+  document is the behaviour being corrected.
 - **Date:** 2026-08-06
 - **Decider:** operator (Dylan Delli Colli), on cross-reviewed proposal
 - **Companions:** CONTEXT I6/I10/I12/I16/I17/I19, ADR-0001 §8 (typed Signals), bead `ABACUS-IKQ`, `abacus-runtime/README.md` (doorbell verb)
